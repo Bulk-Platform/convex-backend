@@ -21,6 +21,10 @@ RUN cargo chef prepare --recipe-path recipe.json --bin convex-local-backend
 FROM lukemathwalker/cargo-chef:latest-rust-1 AS build
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+# Convex uses its own rusty_v8 fork, whose matching prebuilt archives are
+# published under get-convex rather than denoland's default release mirror.
+ENV RUSTY_V8_MIRROR=https://github.com/get-convex/rusty_v8/releases/download
+
 # Update APT configuration for Docker builds
 # Sets retry attempts, assumes yes for prompts, and configures dpkg timeout
 # Also installs a few libraries needed for building the backend
