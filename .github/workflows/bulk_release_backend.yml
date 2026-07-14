@@ -1,0 +1,83 @@
+name: Release Bulk Convex Backend
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: bulk-convex-backend-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/bulk-platform/convex-backend
+
+jobs:
+  build:
+    name: Build and publish amd64 backend
+    if:
+      github.ref_type == 'branch' && github.ref_name ==
+      github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Reclaim runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          docker system prune --all --force
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4bcd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read commit timestamp
+        run:
+          echo "COMMIT_TIMESTAMP=$(git show -s --format=%cI HEAD)" >>
+          "$GITHUB_ENV"
+
+      - name: Build and push backend
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: self-hosted/docker-build/Dockerfile.backend
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=bulk-convex-backend-amd64
+          cache-to: type=gha,mode=max,scope=bulk-convex-backend-amd64
+          provenance: false
+          build-args: |
+            VERGEN_GIT_SHA=${{ github.sha }}
+            VERGEN_GIT_COMMIT_TIMESTAMP=${{ env.COMMIT_TIMESTAMP }}
+
+      - name: Smoke-test published binary
+        run: |
+          image="${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
+          docker pull "$image"
+          docker run --rm --entrypoint /convex/convex-local-backend "$image" --help
+
+      - name: Publish immutable image reference
+        run: |
+          {
+            echo "### Bulk Convex backend"
+            echo '```text'
+            echo "${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
