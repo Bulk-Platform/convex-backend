@@ -14,3 +14,13 @@ You can increase the max concurrency on your self-hosted instance with these
 environment variables. Note that increasing concurrency will increase load on
 your system and after a certain threshold, performance will degrade. You will
 have to tune parameters based on your own hardware and workload.
+
+## `SITE_PROXY_MAX_CONCURRENT_REQUESTS`
+
+The self-hosted site port forwards public HTTP-action requests to the main
+backend through a separate proxy. This knob controls how many requests that
+proxy accepts concurrently. Its default is `4` for backward compatibility.
+
+Increase it gradually for high-concurrency HTTP actions, while keeping the
+application action limits and host memory in mind. This setting is independent
+from `HTTP_SERVER_MAX_CONCURRENT_REQUESTS`, which controls the main HTTP server.
