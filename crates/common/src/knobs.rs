@@ -304,6 +304,12 @@ pub static HTTP_SERVER_TCP_BACKLOG: LazyLock<u32> =
 pub static HTTP_SERVER_MAX_CONCURRENT_REQUESTS: LazyLock<usize> =
     LazyLock::new(|| env_config("HTTP_SERVER_MAX_CONCURRENT_REQUESTS", 1024));
 
+/// Maximum concurrent requests accepted by the self-hosted public HTTP-action
+/// proxy. Keep this separate from `HTTP_SERVER_MAX_CONCURRENT_REQUESTS`: the
+/// proxy and the main API server have different workloads and admission gates.
+pub static SITE_PROXY_MAX_CONCURRENT_REQUESTS: LazyLock<usize> =
+    LazyLock::new(|| env_config("SITE_PROXY_MAX_CONCURRENT_REQUESTS", 4));
+
 /// Max number of user writes in a transaction. Make sure to also increase
 /// `MAX_INSERT_SIZE` in mysql/src/lib.rs and postgres/src/lib.rs.
 pub static TRANSACTION_MAX_NUM_USER_WRITES: LazyLock<usize> =
