@@ -304,6 +304,12 @@ pub static HTTP_SERVER_TCP_BACKLOG: LazyLock<u32> =
 pub static HTTP_SERVER_MAX_CONCURRENT_REQUESTS: LazyLock<usize> =
     LazyLock::new(|| env_config("HTTP_SERVER_MAX_CONCURRENT_REQUESTS", 1024));
 
+/// Maximum concurrent requests accepted by the self-hosted main backend
+/// listener. This is separate from `HTTP_SERVER_MAX_CONCURRENT_REQUESTS`
+/// because `local_backend` has historically used its own limit.
+pub static LOCAL_BACKEND_MAX_CONCURRENT_REQUESTS: LazyLock<usize> =
+    LazyLock::new(|| env_config("LOCAL_BACKEND_MAX_CONCURRENT_REQUESTS", 128));
+
 /// Maximum concurrent requests accepted by the self-hosted public HTTP-action
 /// proxy. Keep this separate from `HTTP_SERVER_MAX_CONCURRENT_REQUESTS`: the
 /// proxy and the main API server have different workloads and admission gates.
