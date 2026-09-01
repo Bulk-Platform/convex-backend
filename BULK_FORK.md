@@ -70,27 +70,25 @@ on the Linux image build plus its published-binary smoke test before deployment.
 ## Build and publish
 
 For an isolated dev-slot test before merging, run the GitHub Actions workflow
-from the upgrade branch with the `dev` channel:
+from a `codex/upgrade-convex-*` branch:
 
 ```bash
 gh workflow run bulk_release_backend.yml \
   --repo Bulk-Platform/convex-backend \
-  --ref codex/upgrade-convex-YYYYMMDD \
-  -f release_channel=dev
+  --ref codex/upgrade-convex-YYYYMMDD
 ```
 
-The dev channel still publishes only the commit SHA tag and immutable digest. It
-does not update `latest` or any deployment. Pin that digest only on the selected
-disposable dev slot.
+The upgrade-branch path still publishes only the commit SHA tag and immutable
+digest. It does not update `latest` or any deployment. Pin that digest only on
+the selected disposable dev slot.
 
-After the fork pull request is merged to `main`, run the same workflow with the
-`production` channel:
+After the fork pull request is merged to `main`, run the same workflow on
+`main`:
 
 ```bash
 gh workflow run bulk_release_backend.yml \
   --repo Bulk-Platform/convex-backend \
-  --ref main \
-  -f release_channel=production
+  --ref main
 gh run list \
   --repo Bulk-Platform/convex-backend \
   --workflow bulk_release_backend.yml \
