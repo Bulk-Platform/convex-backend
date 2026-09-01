@@ -2,6 +2,7 @@ import { ConvexProvider, ConvexReactClient } from "convex/react";
 import { ConnectionState, ConvexHttpClient } from "convex/browser";
 import {
   createContext,
+  JSX,
   ReactNode,
   useCallback,
   useContext,
@@ -21,7 +22,7 @@ export const PROVISION_PROD_PAGE_NAME = "production";
 export const PROVISION_DEV_PAGE_NAME = "development";
 
 type FallbackRender = (errorData: {
-  error: Error;
+  error: unknown;
   componentStack: string;
   eventId: string;
   resetError(): void;
@@ -316,9 +317,6 @@ export type DeploymentInfo = (
   deploymentsURI: string;
   isSelfHosted: boolean;
   workosIntegrationEnabled: boolean;
-  logStreamTopicFiltersEnabled: boolean;
-  schemaPageEnabled: boolean;
-  usageLimitsEnabled: boolean;
   connectionStateCheckIntervalMs: number;
 };
 
@@ -413,14 +411,21 @@ export const ConnectedDeploymentContext = createContext<{
   },
 );
 
-const MaybeConnectedDeploymentContext = createContext<MaybeConnectedDeployment>(
-  // use a bad default value to detect being used incorrectly
-  undefined as unknown as {
-    deployment: undefined;
-    loading: false;
-    errorKind: "DoesNotExist";
-  },
-);
+export const MaybeConnectedDeploymentContext =
+  createContext<MaybeConnectedDeployment>(
+    // use a bad default value to detect being used incorrectly
+    undefined as unknown as {
+      deployment: undefined;
+      loading: false;
+      errorKind: "DoesNotExist";
+    },
+  );
+
+export function useMaybeConnectedDeployment():
+  | MaybeConnectedDeployment
+  | undefined {
+  return useContext(MaybeConnectedDeploymentContext);
+}
 
 const useConnectedDeployment = (
   deploymentName: string | undefined,

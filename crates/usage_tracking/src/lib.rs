@@ -44,7 +44,10 @@ use pb::usage::{
     CounterWithUrl as CounterWithUrlProto,
     FunctionUsageStats as FunctionUsageStatsProto,
 };
-use value::sha256::Sha256Digest;
+use value::{
+    sha256::Sha256Digest,
+    TableName,
+};
 
 mod metrics;
 
@@ -750,7 +753,7 @@ impl FunctionUsageTracker {
     pub fn track_database_ingress(
         &self,
         component_path: ComponentPath,
-        table_name: String,
+        table_name: &TableName,
         ingress: u64,
         skip_logging: bool,
     ) {
@@ -765,14 +768,14 @@ impl FunctionUsageTracker {
         }
         *state
             .database_ingress
-            .entry((component_path, table_name))
+            .entry((component_path, table_name.to_string()))
             .or_default() += ingress;
     }
 
     pub fn track_database_ingress_v2(
         &self,
         component_path: ComponentPath,
-        table_name: String,
+        table_name: &TableName,
         ingress: u64,
         skip_logging: bool,
     ) {
@@ -783,14 +786,14 @@ impl FunctionUsageTracker {
         let mut state = self.state.lock();
         *state
             .database_ingress_v2
-            .entry((component_path, table_name))
+            .entry((component_path, table_name.to_string()))
             .or_default() += ingress;
     }
 
     pub fn track_database_egress(
         &self,
         component_path: ComponentPath,
-        table_name: String,
+        table_name: &TableName,
         egress: u64,
         skip_logging: bool,
     ) {
@@ -801,14 +804,14 @@ impl FunctionUsageTracker {
         let mut state = self.state.lock();
         *state
             .database_egress
-            .entry((component_path, table_name))
+            .entry((component_path, table_name.to_string()))
             .or_default() += egress;
     }
 
     pub fn track_database_egress_v2(
         &self,
         component_path: ComponentPath,
-        table_name: String,
+        table_name: &TableName,
         egress: u64,
         skip_logging: bool,
     ) {
@@ -819,40 +822,40 @@ impl FunctionUsageTracker {
         let mut state = self.state.lock();
         *state
             .database_egress_v2
-            .entry((component_path, table_name))
+            .entry((component_path, table_name.to_string()))
             .or_default() += egress;
     }
 
     pub fn track_virtual_table_ingress(
         &self,
         component_path: ComponentPath,
-        table_name: String,
+        table_name: &TableName,
         ingress: u64,
     ) {
         let mut state = self.state.lock();
         *state
             .virtual_table_ingress
-            .entry((component_path, table_name))
+            .entry((component_path, table_name.to_string()))
             .or_default() += ingress;
     }
 
     pub fn track_virtual_table_egress(
         &self,
         component_path: ComponentPath,
-        table_name: String,
+        table_name: &TableName,
         egress: u64,
     ) {
         let mut state = self.state.lock();
         *state
             .virtual_table_egress
-            .entry((component_path, table_name))
+            .entry((component_path, table_name.to_string()))
             .or_default() += egress;
     }
 
     pub fn track_database_egress_rows(
         &self,
         component_path: ComponentPath,
-        table_name: String,
+        table_name: &TableName,
         egress_rows: u64,
         skip_logging: bool,
     ) {
@@ -863,8 +866,34 @@ impl FunctionUsageTracker {
         let mut state = self.state.lock();
         *state
             .database_egress_rows
-            .entry((component_path, table_name))
+            .entry((component_path, table_name.to_string()))
             .or_default() += egress_rows;
+    }
+
+    pub fn track_database_ingress_rows(
+        &self,
+        component_path: ComponentPath,
+        table_name: &TableName,
+        ingress_rows: u64,
+        skip_logging: bool,
+    ) {
+        if skip_logging {
+            return;
+        }
+
+        let mut state = self.state.lock();
+        *state
+            .database_ingress_rows
+            .entry((component_path, table_name.to_string()))
+            .or_default() += ingress_rows;
+    }
+
+    pub fn track_database_ingress_index_rows(&self, ingress_index_rows: u64, skip_logging: bool) {
+        if skip_logging {
+            return;
+        }
+
+        self.state.lock().database_ingress_index_rows += ingress_index_rows;
     }
 
     // Tracks the vector ingress surcharge for documents
@@ -878,7 +907,7 @@ impl FunctionUsageTracker {
     pub fn track_vector_ingress(
         &self,
         component_path: ComponentPath,
-        table_name: String,
+        table_name: &TableName,
         ingress: u64,
         ingress_v2: u64,
         skip_logging: bool,
@@ -888,7 +917,7 @@ impl FunctionUsageTracker {
         }
 
         let mut state = self.state.lock();
-        let key = (component_path, table_name);
+        let key = (component_path, table_name.to_string());
         *state.vector_ingress.entry(key.clone()).or_default() += ingress;
         *state.vector_ingress_v2.entry(key).or_default() += ingress_v2;
     }
@@ -911,13 +940,13 @@ impl FunctionUsageTracker {
     pub fn track_vector_egress(
         &self,
         component_path: ComponentPath,
-        table_name: String,
+        table_name: &TableName,
         egress: u64,
     ) {
         // Note that vector search counts as both database and vector bandwidth
         // per the comment above.
         let mut state = self.state.lock();
-        let key = (component_path, table_name);
+        let key = (component_path, table_name.to_string());
         *state.database_egress.entry(key.clone()).or_default() += egress;
         *state.vector_egress.entry(key).or_default() += egress;
     }
@@ -941,7 +970,7 @@ impl FunctionUsageTracker {
     pub fn track_text_ingress(
         &self,
         component_path: ComponentPath,
-        table_name: String,
+        table_name: &TableName,
         ingress: u64,
         skip_logging: bool,
     ) {
@@ -952,7 +981,7 @@ impl FunctionUsageTracker {
         let mut state = self.state.lock();
         *state
             .text_ingress
-            .entry((component_path, table_name))
+            .entry((component_path, table_name.to_string()))
             .or_default() += ingress;
     }
 
@@ -1039,7 +1068,7 @@ impl StorageUsageTracker for FunctionUsageTracker {
     }
 }
 
-type TableName = String;
+type TableNameString = String;
 type StorageAPI = String;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Add, Default, AddAssign)]
@@ -1077,21 +1106,26 @@ pub struct FunctionUsageStats {
     pub storage_calls: BTreeMap<(ComponentPath, StorageAPI), u64>,
     pub storage_ingress: BTreeMap<ComponentPath, u64>,
     pub storage_egress: BTreeMap<ComponentPath, u64>,
-    pub database_ingress: BTreeMap<(ComponentPath, TableName), u64>,
+    pub database_ingress: BTreeMap<(ComponentPath, TableNameString), u64>,
     /// Includes ingress for tables that have virtual tables
-    pub database_ingress_v2: BTreeMap<(ComponentPath, TableName), u64>,
-    pub database_egress: BTreeMap<(ComponentPath, TableName), u64>,
+    pub database_ingress_v2: BTreeMap<(ComponentPath, TableNameString), u64>,
+    pub database_egress: BTreeMap<(ComponentPath, TableNameString), u64>,
     /// Includes egress for tables that have virtual tables
-    pub database_egress_v2: BTreeMap<(ComponentPath, TableName), u64>,
+    pub database_egress_v2: BTreeMap<(ComponentPath, TableNameString), u64>,
     /// Ingress for virtual tables, keyed by virtual table name
-    pub virtual_table_ingress: BTreeMap<(ComponentPath, TableName), u64>,
+    pub virtual_table_ingress: BTreeMap<(ComponentPath, TableNameString), u64>,
     /// Egress for virtual tables, keyed by virtual table name
-    pub virtual_table_egress: BTreeMap<(ComponentPath, TableName), u64>,
-    pub database_egress_rows: BTreeMap<(ComponentPath, TableName), u64>,
-    pub vector_ingress: BTreeMap<(ComponentPath, TableName), u64>,
-    pub vector_ingress_v2: BTreeMap<(ComponentPath, TableName), u64>,
-    pub vector_egress: BTreeMap<(ComponentPath, TableName), u64>,
-    pub text_ingress: BTreeMap<(ComponentPath, TableName), u64>,
+    pub virtual_table_egress: BTreeMap<(ComponentPath, TableNameString), u64>,
+    pub database_egress_rows: BTreeMap<(ComponentPath, TableNameString), u64>,
+    pub database_ingress_rows: BTreeMap<(ComponentPath, TableNameString), u64>,
+    /// Entries written to user tables' database indexes. Counted per document
+    /// write, so it covers the same writes as `database_ingress_rows`, but not
+    /// broken down per table: nothing reads that breakdown for either counter.
+    pub database_ingress_index_rows: u64,
+    pub vector_ingress: BTreeMap<(ComponentPath, TableNameString), u64>,
+    pub vector_ingress_v2: BTreeMap<(ComponentPath, TableNameString), u64>,
+    pub vector_egress: BTreeMap<(ComponentPath, TableNameString), u64>,
+    pub text_ingress: BTreeMap<(ComponentPath, TableNameString), u64>,
 
     pub text_query_usage: BTreeMap<(ComponentPath, IndexName), TextIndexQueryUsage>,
     pub vector_query_usage: BTreeMap<(ComponentPath, IndexName), VectorIndexQueryUsage>,
@@ -1111,6 +1145,8 @@ impl FunctionUsageStats {
             database_io_read_bytes: self.database_egress_v2.values().sum(),
             database_io_write_bytes: self.database_ingress_v2.values().sum(),
             database_read_documents: self.database_egress_rows.values().sum(),
+            database_write_documents: self.database_ingress_rows.values().sum(),
+            database_write_index_rows: self.database_ingress_index_rows,
             storage_read_bytes: self.storage_egress.values().sum(),
             storage_write_bytes: self.storage_ingress.values().sum(),
             vector_index_read_bytes: self.vector_egress.values().sum(),
@@ -1145,6 +1181,8 @@ impl FunctionUsageStats {
             virtual_table_ingress,
             virtual_table_egress,
             database_egress_rows,
+            database_ingress_rows,
+            database_ingress_index_rows,
             vector_ingress,
             vector_ingress_v2,
             vector_egress,
@@ -1186,6 +1224,9 @@ impl FunctionUsageStats {
         for (key, egress_rows) in database_egress_rows {
             *self.database_egress_rows.entry(key.clone()).or_default() += egress_rows;
         }
+        for (key, ingress_rows) in database_ingress_rows {
+            *self.database_ingress_rows.entry(key.clone()).or_default() += ingress_rows;
+        }
         for (key, ingress) in vector_ingress {
             *self.vector_ingress.entry(key.clone()).or_default() += ingress;
         }
@@ -1208,6 +1249,7 @@ impl FunctionUsageStats {
             *self.fetch_egress.entry(key.clone()).or_default() += egress;
         }
         self.audit_log_egress += audit_log_egress;
+        self.database_ingress_index_rows += database_ingress_index_rows;
     }
 }
 
@@ -1388,6 +1430,8 @@ impl From<FunctionUsageStats> for FunctionUsageStatsProto {
             database_egress: to_by_tag_count(stats.database_egress.into_iter()),
             database_egress_v2: to_by_tag_count(stats.database_egress_v2.into_iter()),
             database_egress_rows: to_by_tag_count(stats.database_egress_rows.into_iter()),
+            database_ingress_rows: to_by_tag_count(stats.database_ingress_rows.into_iter()),
+            database_ingress_index_rows: stats.database_ingress_index_rows,
             vector_ingress: to_by_tag_count(stats.vector_ingress.into_iter()),
             vector_egress: to_by_tag_count(stats.vector_egress.into_iter()),
             text_ingress: to_by_tag_count(stats.text_ingress.into_iter()),
@@ -1416,6 +1460,8 @@ impl TryFrom<FunctionUsageStatsProto> for FunctionUsageStats {
         let database_egress = from_by_tag_count(stats.database_egress)?.collect();
         let database_egress_v2 = from_by_tag_count(stats.database_egress_v2)?.collect();
         let database_egress_rows = from_by_tag_count(stats.database_egress_rows)?.collect();
+        let database_ingress_rows = from_by_tag_count(stats.database_ingress_rows)?.collect();
+        let database_ingress_index_rows = stats.database_ingress_index_rows;
         let vector_ingress = from_by_tag_count(stats.vector_ingress)?.collect();
         let vector_egress = from_by_tag_count(stats.vector_egress)?.collect();
         let text_ingress = from_by_tag_count(stats.text_ingress)?.collect();
@@ -1434,6 +1480,8 @@ impl TryFrom<FunctionUsageStatsProto> for FunctionUsageStats {
             database_ingress,
             database_ingress_v2,
             database_egress_rows,
+            database_ingress_rows,
+            database_ingress_index_rows,
             database_egress,
             database_egress_v2,
             virtual_table_ingress,
@@ -1460,6 +1508,8 @@ pub struct AggregatedFunctionUsageStats {
     pub database_io_read_bytes: u64,
     pub database_io_write_bytes: u64,
     pub database_read_documents: u64,
+    pub database_write_documents: u64,
+    pub database_write_index_rows: u64,
     pub storage_read_bytes: u64,
     pub storage_write_bytes: u64,
     pub vector_index_read_bytes: u64,

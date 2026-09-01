@@ -23,7 +23,7 @@ import {
   METRIC_CONFIG,
   WINDOW_SUFFIX,
   LIMIT_TYPE_LABEL,
-  AMOUNT_FORMAT,
+  formatAmount,
   type UsageMetric,
   type UsageLimitWindow,
   type UsageLimitType,
@@ -108,7 +108,7 @@ export function DeploymentEventContent({
       break;
 
     case "update_usage_limit":
-      body = <UsageLimitUpdateBody event={event} />;
+      body = UsageLimitUpdateBody({ event });
       break;
 
     case "create_environment_variable":
@@ -140,6 +140,7 @@ export function DeploymentEventContent({
     case "create_table":
     case "delete_files":
     case "generate_upload_url":
+    case "create_data_sync":
     default:
       body = null;
   }
@@ -592,6 +593,19 @@ export function ActionText({ event }: { event: DeploymentAuditLogEvent }) {
         </>
       );
 
+    case "create_data_sync":
+      return (
+        <>
+          <span>started a </span>
+          <Tooltip
+            tip={<span className="font-mono">{event.metadata.sync_id}</span>}
+            maxWidthClassName="max-w-md"
+          >
+            <span className="underline decoration-dotted">data sync</span>
+          </Tooltip>
+        </>
+      );
+
     case "create_usage_limit":
       return (
         <>
@@ -677,7 +691,7 @@ function UsageLimitSummary({
       <span className="font-semibold">{metricName}</span>
       <span>
         {" ("}
-        {AMOUNT_FORMAT.format(Number(config.limit))} {unit} {windowSuffix}
+        {formatAmount(Number(config.limit))} {unit} {windowSuffix}
         {showStatus && (config.enabled ? ", enabled" : ", disabled")})
       </span>
     </>
@@ -695,8 +709,8 @@ function UsageLimitUpdateBody({
   if (previous.limit !== current.limit) {
     rows.push({
       label: "Limit",
-      from: `${AMOUNT_FORMAT.format(Number(previous.limit))} ${unit} ${windowSuffix}`,
-      to: `${AMOUNT_FORMAT.format(Number(current.limit))} ${unit} ${windowSuffix}`,
+      from: `${formatAmount(Number(previous.limit))} ${unit} ${windowSuffix}`,
+      to: `${formatAmount(Number(current.limit))} ${unit} ${windowSuffix}`,
     });
   }
   if (previous.enabled !== current.enabled) {

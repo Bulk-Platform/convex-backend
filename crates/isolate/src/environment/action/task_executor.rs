@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        OnceLock,
+    },
     time::Duration,
 };
 
@@ -24,6 +27,7 @@ use common::{
     types::{
         ConvexOrigin,
         DeploymentMetadata,
+        HttpActionRoute,
     },
 };
 use errors::ErrorMetadata;
@@ -42,7 +46,10 @@ use keybroker::{
 use parking_lot::Mutex;
 use serde_json::Value as JsonValue;
 use sync_types::CanonicalizedUdfPath;
-use tokio::sync::mpsc;
+use tokio::sync::{
+    mpsc,
+    OnceCell,
+};
 use udf::{
     ActionCallbacks,
     SyscallTrace,
@@ -89,7 +96,11 @@ pub struct TaskExecutor<RT: Runtime> {
     pub udf_path: CanonicalizedUdfPath,
     pub component_path: ComponentPath,
     pub convex_origin_override: Arc<Mutex<Option<ConvexOrigin>>>,
+    pub http_action_route: Arc<OnceLock<HttpActionRoute>>,
     pub deployment: DeploymentMetadata,
+    /// Shared across clones so concurrent `getServiceToken` calls in one action
+    /// mint once. `OnceCell` retries after a failed mint.
+    pub ai_gateway_token: Arc<OnceCell<String>>,
 }
 
 impl<RT: Runtime> TaskExecutor<RT> {
@@ -210,7 +221,7 @@ impl<RT: Runtime> TaskExecutor<RT> {
             _ => None,
         };
         if let Some(user_identity) = user_identity {
-            return user_identity.try_into();
+            return Arc::unwrap_or_clone(user_identity).try_into();
         }
         Ok(JsonValue::Null)
     }

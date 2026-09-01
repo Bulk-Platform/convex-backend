@@ -24,7 +24,11 @@ import {
 } from "./errors";
 import { findLineNumbers } from "./analyze";
 import { Syscalls, SyscallsImpl } from "./syscalls";
-import { SourcePackage, maybeDownloadAndLinkPackages } from "./source_package";
+import {
+  PackageRefcounts,
+  SourcePackage,
+  maybeDownloadAndLinkPackages,
+} from "./source_package";
 import { buildDeps, BuildDepsRequest } from "./build_deps";
 import { ConvexError, JSONValue } from "convex/values";
 import { log, logDebug, logDurationMs } from "./log";
@@ -37,6 +41,12 @@ const AWS_LAMBDA_EXECUTOR_TYPE = (
 ).endsWith("-d")
   ? "DYNAMIC"
   : "STATIC";
+
+// AWS_LAMBDA_FUNCTION_NAME is a reserved environment variable that the Lambda
+// runtime always sets and user configuration cannot override:
+// https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html
+// It must be read at module load time, before invocations replace `process.env`.
+const IS_AWS_LAMBDA = process.env.AWS_LAMBDA_FUNCTION_NAME !== undefined;
 
 const AWS_LAMBDA_FUNCTION_MEMORY_SIZE = parseInt(
   process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE ?? "512",
@@ -113,7 +123,12 @@ async function runWithEnvironmentVariables<T>(
     // Restore the initial environment when we’re done.
     // This is helpful to bypass a AWS Lambda bug affecting Node.js 24 where the lambda
     // would crash when AWS’s own env vars are missing after a second function execution.
-    process.env = savedEnv;
+    //
+    // We don’t restore when running in the local Node executor because this one accepts
+    // concurrent requests in the same JavaScript environment.
+    if (IS_AWS_LAMBDA) {
+      process.env = savedEnv;
+    }
   }
 }
 
@@ -296,68 +311,75 @@ export async function execute(
   request: ExecuteRequest,
 ): Promise<ExecuteResponse> {
   const start = performance.now();
-
-  // Download missing packages and do any necessary linking
-  const local = await maybeDownloadAndLinkPackages(request.sourcePackage);
-  const downloadTimeMs = logDurationMs("downloadTime", start);
-
-  const syscalls = new SyscallsImpl(
-    request.udfPath,
-    request.requestId,
-    request.backendAddress,
-    request.backendCallbackToken,
-    request.authHeader,
-    request.userIdentity,
-    request.executionContext,
-    request.encodedParentTrace,
-    request.deployment,
-  );
-
-  countEgressBytes(); // reset egressBytes counter
-
-  let innerResult: ExecuteResponseInner;
+  const context = new PackageRefcounts();
   try {
-    if (!local.modules.has(request.udfPath.canonicalizedPath)) {
-      throw new Error(
-        `Couldn't find module source for ${request.udfPath.canonicalizedPath}`,
-      );
-    }
-    innerResult = await executeInner(
-      request.requestId,
-      local.dir,
-      request.udfPath.canonicalizedPath,
-      request.udfPath.function ?? "default",
-      request.args,
-      request.environmentVariables,
-      request.timeoutSecs,
-      syscalls,
+    // Download missing packages and do any necessary linking
+    const local = await maybeDownloadAndLinkPackages(
+      context,
+      request.sourcePackage,
     );
-  } catch (e: any) {
-    innerResult = {
-      type: "error",
-      message: extractErrorMessage(e),
-      name: e.name,
-      exitingProcess: false,
+    const downloadTimeMs = logDurationMs("downloadTime", start);
+
+    const syscalls = new SyscallsImpl(
+      request.udfPath,
+      request.requestId,
+      request.backendAddress,
+      request.backendCallbackToken,
+      request.authHeader,
+      request.userIdentity,
+      request.executionContext,
+      request.encodedParentTrace,
+      request.deployment,
+    );
+
+    countEgressBytes(); // reset egressBytes counter
+
+    let innerResult: ExecuteResponseInner;
+    try {
+      if (!local.modules.has(request.udfPath.canonicalizedPath)) {
+        throw new Error(
+          `Couldn't find module source for ${request.udfPath.canonicalizedPath}`,
+        );
+      }
+      innerResult = await executeInner(
+        request.requestId,
+        local.dir,
+        request.udfPath.canonicalizedPath,
+        request.udfPath.function ?? "default",
+        request.args,
+        request.environmentVariables,
+        request.timeoutSecs,
+        syscalls,
+      );
+    } catch (e: any) {
+      innerResult = {
+        type: "error",
+        message: extractErrorMessage(e),
+        name: e.name,
+        exitingProcess: false,
+      };
+    } finally {
+      // The action has settled. Abort any callbacks still in flight so a dangling
+      // (un-awaited) promise can't outlive this invocation and reject into the
+      // next, unrelated one that reuses this warm process.
+      syscalls.dispose();
+    }
+
+    const totalExecutorTimeMs = logDurationMs("totalExecutorTime", start);
+    const egressBytes = countEgressBytes();
+
+    return {
+      ...innerResult,
+      numInvocations,
+      downloadTimeMs,
+      totalExecutorTimeMs,
+      syscallTrace: syscalls.syscallTrace,
+      memoryAllocatedMb: AWS_LAMBDA_BILLED_MEMORY_SIZE,
+      egressBytes,
     };
   } finally {
-    // The action has settled. Abort any callbacks still in flight so a dangling
-    // (un-awaited) promise can't outlive this invocation and reject into the
-    // next, unrelated one that reuses this warm process.
-    syscalls.dispose();
+    context.dispose();
   }
-
-  const totalExecutorTimeMs = logDurationMs("totalExecutorTime", start);
-  const egressBytes = countEgressBytes();
-
-  return {
-    ...innerResult,
-    numInvocations,
-    downloadTimeMs,
-    totalExecutorTimeMs,
-    syscallTrace: syscalls.syscallTrace,
-    memoryAllocatedMb: AWS_LAMBDA_BILLED_MEMORY_SIZE,
-    egressBytes,
-  };
 }
 
 export async function executeInner(
@@ -507,26 +529,34 @@ export async function analyze(
   return await runWithEnvironmentVariables(
     request.environmentVariables,
     async () => {
-      const local = await maybeDownloadAndLinkPackages(request.sourcePackage);
-      const modulesDir = path.join(local.dir, "modules");
-      registerPrepareStackTrace(modulesDir);
-      const modules: Record<CanonicalizedModulePath, AnalyzedFunctions> = {};
-      for (const modulePath of local.modules) {
-        try {
-          const filePath = path.join(modulesDir, modulePath);
-          modules[modulePath] = await analyzeModule(filePath);
-        } catch (e: any) {
-          // eslint-disable-next-line @typescript-eslint/no-unused-expressions
-          e.stack;
-          return {
-            type: "error",
-            message: `Failed to analyze ${modulePath}: ${extractErrorMessage(e)}`,
-            frames: e.__frameData ? JSON.parse(e.__frameData) : [],
-          };
+      const context = new PackageRefcounts();
+      try {
+        const local = await maybeDownloadAndLinkPackages(
+          context,
+          request.sourcePackage,
+        );
+        const modulesDir = path.join(local.dir, "modules");
+        registerPrepareStackTrace(modulesDir);
+        const modules: Record<CanonicalizedModulePath, AnalyzedFunctions> = {};
+        for (const modulePath of local.modules) {
+          try {
+            const filePath = path.join(modulesDir, modulePath);
+            modules[modulePath] = await analyzeModule(filePath);
+          } catch (e: any) {
+            // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+            e.stack;
+            return {
+              type: "error",
+              message: `Failed to analyze ${modulePath}: ${extractErrorMessage(e)}`,
+              frames: e.__frameData ? JSON.parse(e.__frameData) : [],
+            };
+          }
         }
-      }
 
-      return { type: "success", modules };
+        return { type: "success", modules };
+      } finally {
+        context.dispose();
+      }
     },
   );
 }

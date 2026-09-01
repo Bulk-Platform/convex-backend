@@ -69,8 +69,10 @@ export type DeploymentOp =
   | "RunInternalActions"
   | "RunTestQuery"
   | "ViewAuditLog"
+  | "ViewUsage"
   | "ViewUsageLimits"
-  | "WriteUsageLimits";
+  | "WriteUsageLimits"
+  | "UseAiGateway";
 
 export function requireOperation(
   operation: DeploymentOp | NoPermissionRequired,

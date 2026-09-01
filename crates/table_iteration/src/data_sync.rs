@@ -23,13 +23,14 @@
 //! - Each page reads at most `max_rows_read` rows and targets `page_size_limit`
 //!   emitted entries and `page_bytes_limit` bytes of emitted documents. May
 //!   occasionally go over these limits for a single large transaction.
+//! - Cursor + Page should be persisted atomically by caller
 //!
 //! # During Initial Sync phase
 //!
-//! - During initial sync, pages report [`DataSyncStatus::InProgress`]. During
+//! - During initial sync, pages report [`DataSyncStatus::Snapshotting`]. During
 //!   this phase, pages do not necessarily represent consistent snapshots.
-//! - Once initial sync is complete, the final page reports
-//!   [`DataSyncStatus::Synced`]
+//! - Once initial sync is complete, the final page reports a consistent
+//!   snapshot ([`DataSyncStatus::Stale`] or [`DataSyncStatus::UpToDate`])
 //! - Each document may be emitted more than once, at successive revisions.
 //! - Each rev of a given document will be emitted in increasing timestamp
 //!   order.
@@ -38,8 +39,9 @@
 //!
 //! - The final emitted version of every captured document is the version as of
 //!   `ts` (a consistent snapshot).
-//! - The caller may continue iterating from [`DataSyncStatus::Synced`] to
-//!   continue a streaming sync to a newer consistent snapshot.
+//! - The caller may continue iterating from [`DataSyncStatus::Stale`] or
+//!   [`DataSyncStatus::UpToDate`] to continue a streaming sync to a newer
+//!   consistent snapshot.
 //! - Transactions are not split across pages.
 //! - May switch back to Initial Sync phase if a large operation occurs
 //!   (changing the set of synced tables, or an `npx convex import` replacing a
@@ -96,6 +98,7 @@
 //! ```
 
 use std::{
+    cmp,
     collections::{
         BTreeMap,
         BTreeSet,
@@ -128,9 +131,9 @@ use common::{
         Timestamp,
     },
 };
+use errors::ErrorMetadata;
 use futures::{
     pin_mut,
-    StreamExt,
     TryStreamExt,
 };
 use value::{
@@ -250,14 +253,15 @@ impl DataSyncCursor {
 }
 
 /// Progress indicator returned while a sync is still
-/// [`DataSyncStatus::InProgress`].
+/// [`DataSyncStatus::Snapshotting`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgressStatus {
     pub num_tables_synced: u64,
     pub total_tables: u64,
     /// The table mid-traversal in the `by_id` dimension. An in-progress sync
     /// always has one: finishing a table either starts the next one or
-    /// completes the sync ([`DataSyncStatus::Synced`]).
+    /// completes the sync ([`DataSyncStatus::Stale`] or
+    /// [`DataSyncStatus::UpToDate`]).
     pub current_table: TabletId,
     /// Documents emitted so far from the current table's `by_id` traversal,
     /// across all pages of this sync.
@@ -271,17 +275,16 @@ pub struct ProgressStatus {
 /// The consistency state reported alongside a page.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DataSyncStatus {
-    /// The entries emitted so far represent a consistent snapshot at `ts`.
-    Synced {
-        ts: Timestamp,
-        /// Whether `ts` is behind the latest timestamp — i.e. the snapshot is
-        /// consistent but not fully caught up to the most recent commit.
-        /// `false` means the sync read all the way to latest. Callers use this
-        /// to decide whether to keep iterating or take a break.
-        has_more: bool,
-    },
-    /// More pages are required before the view is consistent.
-    InProgress { progress: ProgressStatus },
+    /// More pages are required before the entries form a consistent snapshot.
+    Snapshotting { progress: ProgressStatus },
+    /// The entries emitted so far represent a consistent snapshot at `ts`, but
+    /// `ts` is behind the latest timestamp — there are commits past the
+    /// snapshot still to sync.
+    Stale { ts: Timestamp },
+    /// The entries emitted so far represent a consistent snapshot at `ts` that
+    /// has read all the way to the latest commit; the caller can take a break
+    /// before iterating again.
+    UpToDate { ts: Timestamp },
 }
 
 /// A single emitted document revision, paired with its previous revision.
@@ -318,6 +321,7 @@ pub struct DataSyncIterator<RT: Runtime> {
     runtime: RT,
     persistence: Arc<dyn PersistenceReader>,
     retention_validator: Arc<dyn RetentionValidator>,
+    min_ts: RepeatableTimestamp,
     page_size_limit: usize,
     page_bytes_limit: usize,
     max_rows_read: usize,
@@ -325,6 +329,11 @@ pub struct DataSyncIterator<RT: Runtime> {
 }
 
 impl<RT: Runtime> DataSyncIterator<RT> {
+    /// `min_ts` is a floor on the snapshot each page reads at (see
+    /// [`Self::latest_ts`]); pass a fresh timestamp like
+    /// `Database::now_ts_for_reads` or a transaction's begin timestamp so the
+    /// sync doesn't lag behind the committer's persisted repeatable timestamp.
+    ///
     /// `page_size_limit` bounds entries emitted per page and `page_bytes_limit`
     /// bounds their total byte size (both soft: a single transaction is never
     /// split, so it may push a page over). `max_rows_read` bounds rows read
@@ -335,6 +344,7 @@ impl<RT: Runtime> DataSyncIterator<RT> {
         runtime: RT,
         persistence: Arc<dyn PersistenceReader>,
         retention_validator: Arc<dyn RetentionValidator>,
+        min_ts: RepeatableTimestamp,
         page_size_limit: usize,
         page_bytes_limit: usize,
         max_rows_read: usize,
@@ -351,6 +361,7 @@ impl<RT: Runtime> DataSyncIterator<RT> {
             runtime,
             persistence,
             retention_validator,
+            min_ts,
             page_size_limit,
             page_bytes_limit,
             max_rows_read,
@@ -391,6 +402,25 @@ impl<RT: Runtime> DataSyncIterator<RT> {
         self.next_page_inner(cursor, target_tables, true).await
     }
 
+    /// The timestamp each page reads at: the max of `min_ts` and the
+    /// committer's persisted repeatable timestamp, which lags live writes by a
+    /// few seconds. It bounds reads and feeds the freshness heuristic.
+    ///
+    /// The max satisfies every constraint the iterator needs:
+    ///
+    /// 1. Repeatable, since the max of two repeatable timestamps is repeatable.
+    /// 2. Weakly monotonically increasing across pages, since `min_ts` is fixed
+    ///    and the persisted repeatable timestamp only increases — so any
+    ///    `synced_ts` produced by a prior page stays `<=` it.
+    /// 3. Within retention, since the persisted repeatable timestamp is and the
+    ///    max is at least as recent.
+    async fn latest_ts(&self) -> anyhow::Result<RepeatableTimestamp> {
+        Ok(cmp::max(
+            self.min_ts,
+            new_static_repeatable_recent(self.persistence.as_ref()).await?,
+        ))
+    }
+
     async fn next_page_inner(
         &self,
         cursor: Option<DataSyncCursor>,
@@ -402,10 +432,7 @@ impl<RT: Runtime> DataSyncIterator<RT> {
             .wait("data_sync_before_page")
             .await;
 
-        // The latest repeatable timestamp bounds reads and is used by the
-        // freshness heuristic. It increases monotonically, so any `synced_ts`
-        // produced by a prior page is `<= latest`.
-        let latest = new_static_repeatable_recent(self.persistence.as_ref()).await?;
+        let latest = self.latest_ts().await?;
 
         // Cold start, or reconcile an existing cursor against `target_tables`.
         let mut cursor = match cursor {
@@ -425,6 +452,14 @@ impl<RT: Runtime> DataSyncIterator<RT> {
             },
         };
 
+        anyhow::ensure!(
+            cursor.synced_ts <= *latest,
+            ErrorMetadata::bad_request(
+                "InvalidDataSyncCursor",
+                "data sync cursor is ahead of the deployment's latest timestamp",
+            )
+        );
+
         let use_by_id = match &cursor.table_cursor {
             // Nothing left to traverse in the ID dimension; only the `ts`
             // dimension can make progress (or hold us at a consistent snapshot).
@@ -433,7 +468,7 @@ impl<RT: Runtime> DataSyncIterator<RT> {
                 false
             },
             TableCursor::InProgress { .. } => {
-                // `latest >= synced_ts` always holds, so this subtraction is safe.
+                // `synced_ts <= latest` is enforced above, so this subtraction is safe.
                 let lag = *latest - cursor.synced_ts;
                 let fresh = lag < self.by_id_freshness;
                 if !fresh {
@@ -491,24 +526,20 @@ impl<RT: Runtime> DataSyncIterator<RT> {
             index_key: current_id
                 .map(|id| CursorPosition::After(IndexKey::new(vec![], id).to_bytes())),
         };
-        let stream = snapshot.index_scan(
+        let mut stream = snapshot.index_scan(
             by_id,
             current_table,
             &scan_cursor.interval(),
             Order::Asc,
             self.page_size_limit,
         );
-        let page: Vec<_> = stream.take(self.page_size_limit).try_collect().await?;
-        let count_limited = page.len() >= self.page_size_limit;
-        if page.is_empty() {
-            cover!(coverage::BY_ID_EMPTY_PAGE);
-        }
+        let mut count_limited = false;
 
-        let mut entries = Vec::with_capacity(page.len());
+        let mut entries = Vec::with_capacity(self.page_size_limit);
         let mut new_current_id = current_id;
         let mut page_bytes = 0usize;
         let mut bytes_limited = false;
-        for (_key, latest_doc) in page {
+        while let Some((_key, latest_doc)) = stream.try_next().await? {
             let value = latest_doc.value;
             page_bytes += value.size();
             let id = value.id_with_table_id();
@@ -531,10 +562,20 @@ impl<RT: Runtime> DataSyncIterator<RT> {
                 bytes_limited = true;
                 break;
             }
+            if entries.len() >= self.page_size_limit {
+                count_limited = true;
+                break;
+            }
         }
 
-        cursor.num_docs_synced += entries.len() as u64;
-        cursor.current_table_docs_synced += entries.len() as u64;
+        if entries.is_empty() {
+            cover!(coverage::BY_ID_EMPTY_PAGE);
+        }
+
+        cursor.num_docs_synced = cursor.num_docs_synced.saturating_add(entries.len() as u64);
+        cursor.current_table_docs_synced = cursor
+            .current_table_docs_synced
+            .saturating_add(entries.len() as u64);
 
         // The table is exhausted only if we emitted the whole fetched page and it
         // wasn't a full page. If either limit stopped us, there is more to read.
@@ -589,8 +630,22 @@ impl<RT: Runtime> DataSyncIterator<RT> {
         if let Some(start) = cursor.synced_ts.succ_opt()
             && start <= *latest
         {
-            let stream = repeatable_persistence
-                .load_documents(TimestampRange::new(start..=*latest), Order::Asc);
+            let range = TimestampRange::new(start..=*latest);
+            let single_table = if target_tables.len() == 1 {
+                target_tables.first_key_value().map(|(tablet, _)| tablet)
+            } else {
+                None
+            };
+            let stream = match single_table {
+                Some(&tablet) => {
+                    cover!(coverage::TS_SINGLE_TABLE_FILTER);
+                    repeatable_persistence.load_documents_from_table(tablet, range, Order::Asc)
+                },
+                None => {
+                    cover!(coverage::TS_MULTI_TABLE_SCAN);
+                    repeatable_persistence.load_documents(range, Order::Asc)
+                },
+            };
             pin_mut!(stream);
 
             let mut rows_read = 0usize;
@@ -684,7 +739,7 @@ impl<RT: Runtime> DataSyncIterator<RT> {
         }
 
         cursor.synced_ts = new_synced_ts;
-        cursor.num_docs_synced += entries.len() as u64;
+        cursor.num_docs_synced = cursor.num_docs_synced.saturating_add(entries.len() as u64);
         // Every re-emitted document is captured, so its predecessor was already
         // emitted by this iterator — attach it (when requested) so consumers
         // can compute deltas.
@@ -754,13 +809,15 @@ impl<RT: Runtime> DataSyncIterator<RT> {
 
 fn status(cursor: &DataSyncCursor, latest: Timestamp, total_tables: u64) -> DataSyncStatus {
     match &cursor.table_cursor {
-        TableCursor::Synced => DataSyncStatus::Synced {
+        // `synced_ts <= latest` always holds; if it's strictly behind there are
+        // commits past the snapshot still to sync.
+        TableCursor::Synced if cursor.synced_ts < latest => DataSyncStatus::Stale {
             ts: cursor.synced_ts,
-            // `synced_ts <= latest` always holds; if it's strictly behind there
-            // are commits past the snapshot still to sync.
-            has_more: cursor.synced_ts < latest,
         },
-        TableCursor::InProgress { current_table, .. } => DataSyncStatus::InProgress {
+        TableCursor::Synced => DataSyncStatus::UpToDate {
+            ts: cursor.synced_ts,
+        },
+        TableCursor::InProgress { current_table, .. } => DataSyncStatus::Snapshotting {
             progress: ProgressStatus {
                 num_tables_synced: cursor.synced_tables.len() as u64,
                 total_tables,

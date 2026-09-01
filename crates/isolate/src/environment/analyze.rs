@@ -62,7 +62,6 @@ use model::{
             AnalyzedHttpRoutes,
             AnalyzedModule,
             AnalyzedSourcePosition,
-            FullModuleSource,
             Visibility,
         },
         user_error::{
@@ -101,7 +100,9 @@ use crate::{
             },
         },
         AsyncOpRequest,
-        IsolateEnvironment,
+        JsEnvironment,
+        OpProvider,
+        SyscallProvider,
     },
     execution_scope::ExecutionScope,
     helpers::{
@@ -114,15 +115,17 @@ use crate::{
         log_source_map_origin_in_separate_module,
         log_source_map_token_lookup_failed,
     },
+    module_cache::V8ModuleSource,
     request_scope::RequestScope,
     strings::{
         self,
     },
     timeout::Timeout,
+    ConcurrencyPermit,
 };
 
 pub struct AnalyzeEnvironment {
-    modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<FullModuleSource>>>,
+    modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<V8ModuleSource>>>,
     // This is used to lazily cache the result of sourcemap::SourceMap::from_slice across
     // modules and functions. There are certain source maps whose source origin we don't
     // need to construct during analysis (i.e. if all of the UDFs it defines have function
@@ -136,7 +139,7 @@ pub struct AnalyzeEnvironment {
     collected_logs: VecDeque<String>,
 }
 
-impl<RT: Runtime> IsolateEnvironment<RT> for AnalyzeEnvironment {
+impl OpProvider for AnalyzeEnvironment {
     fn trace(&mut self, _level: LogLevel, messages: Vec<String>) -> anyhow::Result<()> {
         // These logs are only shown to the pusher on error.
         let log_message = messages.join(" ");
@@ -188,12 +191,14 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AnalyzeEnvironment {
             "Getting the table mapping unsupported at import time"
         ))
     }
+}
 
+impl<RT: Runtime> SyscallProvider<RT> for AnalyzeEnvironment {
     async fn lookup_source(
         &mut self,
         path: &str,
         _timeout: &mut Timeout<RT>,
-    ) -> anyhow::Result<Option<(Arc<FullModuleSource>, ModuleCodeCacheResult)>> {
+    ) -> anyhow::Result<Option<(Arc<V8ModuleSource>, ModuleCodeCacheResult)>> {
         let p = ModulePath::from_str(path)?.canonicalize();
         let result = self.modules.get(&p).cloned();
         Ok(result.map(|m| (m, ModuleCodeCacheResult::noop())))
@@ -212,12 +217,21 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AnalyzeEnvironment {
             )),
         }
     }
+}
+
+impl<RT: Runtime> JsEnvironment<RT> for AnalyzeEnvironment {
+    type AsyncResolver = v8::Global<v8::PromiseResolver>;
+    type SyscallProvider = Self;
+
+    fn syscall_provider(&mut self) -> &mut Self::SyscallProvider {
+        self
+    }
 
     fn start_async_syscall(
         &mut self,
         name: String,
         _args: JsonValue,
-        _resolver: v8::Global<v8::PromiseResolver>,
+        _resolver: Self::AsyncResolver,
     ) -> anyhow::Result<()> {
         anyhow::bail!(ErrorMetadata::bad_request(
             format!("No{}DuringImport", syscall_name_for_error(&name)),
@@ -231,7 +245,7 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AnalyzeEnvironment {
     fn start_async_op(
         &mut self,
         request: AsyncOpRequest,
-        _resolver: v8::Global<v8::PromiseResolver>,
+        _resolver: Self::AsyncResolver,
     ) -> anyhow::Result<()> {
         anyhow::bail!(ErrorMetadata::bad_request(
             format!("No{}DuringImport", request.name_for_error()),
@@ -256,12 +270,12 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AnalyzeEnvironment {
 impl AnalyzeEnvironment {
     #[fastrace::trace]
     pub async fn analyze<RT: Runtime>(
-        client_id: String,
         isolate: &mut Isolate<RT>,
         context_cache: &mut ContextCache,
+        permit: ConcurrencyPermit,
         isolate_clean: &mut bool,
         udf_config: UdfConfig,
-        modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<FullModuleSource>>>,
+        modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<V8ModuleSource>>>,
         to_analyze: CanonicalizedModulePath,
         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
     ) -> anyhow::Result<Result<AnalyzedModule, JsError>> {
@@ -276,9 +290,8 @@ impl AnalyzeEnvironment {
             environment_variables,
             collected_logs: VecDeque::new(),
         };
-        let client_id = Arc::new(client_id);
         let (handle, state, mut timeout) = isolate
-            .start_request(context_cache, client_id, environment)
+            .start_request(context_cache, permit, environment)
             .await?;
         scope!(let handle_scope, isolate.isolate());
         let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
@@ -309,7 +322,7 @@ impl AnalyzeEnvironment {
         drop(timeout);
 
         // Suppress the original error if the isolate was forcibly terminated.
-        if let Err(e) = handle.take_termination_error(None, "analyze")? {
+        if let Err(e) = handle.take_termination_error("analyze")? {
             return Ok(Err(e));
         }
 
@@ -336,8 +349,7 @@ impl AnalyzeEnvironment {
                     .get(path)
                     .context("could not find module config in environment")?;
                 let source_map = module_config
-                    .source_map
-                    .as_ref()
+                    .source_map()
                     .and_then(|m| source_map_from_slice(m.as_bytes()));
 
                 // cache it

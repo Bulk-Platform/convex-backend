@@ -104,6 +104,7 @@ pub enum ResourceKind {
     Billing,
     OauthApplication,
     Sso,
+    DirectorySync,
     Integration,
     DefaultEnvironmentVariable,
 }
@@ -123,6 +124,7 @@ pub(crate) enum ResourceSegment {
     Billing,
     OauthApplication,
     Sso,
+    DirectorySync,
     Integration,
     DefaultEnvironmentVariable,
 }
@@ -140,6 +142,7 @@ impl ResourceSegment {
             ResourceSegment::Billing => ResourceKind::Billing,
             ResourceSegment::OauthApplication => ResourceKind::OauthApplication,
             ResourceSegment::Sso => ResourceKind::Sso,
+            ResourceSegment::DirectorySync => ResourceKind::DirectorySync,
             ResourceSegment::Integration => ResourceKind::Integration,
             ResourceSegment::DefaultEnvironmentVariable => ResourceKind::DefaultEnvironmentVariable,
         }
@@ -322,6 +325,12 @@ pub enum RolePolicyAction {
     DisableSSO,
     UpdateSSO,
     ViewSSO,
+    // Directory Sync
+    EnableDirectorySync,
+    DisableDirectorySync,
+    UpdateDirectorySyncGroupMapping,
+    DeleteDirectorySyncGroupMapping,
+    ViewDirectorySync,
     // Custom Roles
     CreateCustomRole,
     UpdateCustomRole,
@@ -418,6 +427,12 @@ impl RolePolicyAction {
             P::EnableSSO | P::DisableSSO | P::UpdateSSO | P::ViewSSO => {
                 Path::Singleton(ResourceKind::Sso)
             },
+            // Directory Sync singletons.
+            P::EnableDirectorySync
+            | P::DisableDirectorySync
+            | P::UpdateDirectorySyncGroupMapping
+            | P::DeleteDirectorySyncGroupMapping
+            | P::ViewDirectorySync => Path::Singleton(ResourceKind::DirectorySync),
             // Team Integration singletons.
             P::ViewTeamIntegrations
             | P::CreateTeamIntegrations
@@ -639,6 +654,11 @@ impl RolePolicyAction {
             P::DisableSSO => S::DisableSSO,
             P::UpdateSSO => S::UpdateSSO,
             P::ViewSSO => S::ViewSSO,
+            P::EnableDirectorySync => S::EnableDirectorySync,
+            P::DisableDirectorySync => S::DisableDirectorySync,
+            P::UpdateDirectorySyncGroupMapping => S::UpdateDirectorySyncGroupMapping,
+            P::DeleteDirectorySyncGroupMapping => S::DeleteDirectorySyncGroupMapping,
+            P::ViewDirectorySync => S::ViewDirectorySync,
             P::ViewCustomRoles => S::ViewCustomRoles,
             P::CreateCustomRole | P::UpdateCustomRole | P::DeleteCustomRole => return None,
             P::ViewTeamIntegrations => S::ViewTeamIntegrations,
@@ -887,6 +907,22 @@ pub enum RoleStatementAction {
     #[serde(rename = "sso:view")]
     #[strum(serialize = "sso:view")]
     ViewSSO,
+    // Directory Sync
+    #[serde(rename = "directorySync:enable")]
+    #[strum(serialize = "directorySync:enable")]
+    EnableDirectorySync,
+    #[serde(rename = "directorySync:disable")]
+    #[strum(serialize = "directorySync:disable")]
+    DisableDirectorySync,
+    #[serde(rename = "directorySync:updateGroupMapping")]
+    #[strum(serialize = "directorySync:updateGroupMapping")]
+    UpdateDirectorySyncGroupMapping,
+    #[serde(rename = "directorySync:deleteGroupMapping")]
+    #[strum(serialize = "directorySync:deleteGroupMapping")]
+    DeleteDirectorySyncGroupMapping,
+    #[serde(rename = "directorySync:view")]
+    #[strum(serialize = "directorySync:view")]
+    ViewDirectorySync,
     // Custom Roles
     #[serde(rename = "customRole:view")]
     #[strum(serialize = "customRole:view")]
@@ -963,6 +999,12 @@ pub enum RoleStatementAction {
     #[serde(rename = "deployment:usage:view")]
     #[strum(serialize = "deployment:usage:view")]
     ViewDeploymentUsage,
+    /// Mint an AI gateway credential from an action running on the
+    /// deployment. Only checked for identities that carry an op set: deploy
+    /// keys and dashboard members.
+    #[serde(rename = "deployment:aiGateway:use")]
+    #[strum(serialize = "deployment:aiGateway:use")]
+    UseAiGateway,
 }
 
 impl RoleStatementAction {
@@ -989,6 +1031,12 @@ impl RoleStatementAction {
             | A::GenerateOAuthClientSecret => ResourceKind::OauthApplication,
             // SSO
             A::EnableSSO | A::DisableSSO | A::UpdateSSO | A::ViewSSO => ResourceKind::Sso,
+            // Directory Sync
+            A::EnableDirectorySync
+            | A::DisableDirectorySync
+            | A::UpdateDirectorySyncGroupMapping
+            | A::DeleteDirectorySyncGroupMapping
+            | A::ViewDirectorySync => ResourceKind::DirectorySync,
             // Team Integrations
             A::ViewTeamIntegrations
             | A::CreateTeamIntegrations
@@ -1050,7 +1098,8 @@ impl RoleStatementAction {
             | A::ViewAuditLog
             | A::ViewUsageLimits
             | A::WriteUsageLimits
-            | A::ViewDeploymentUsage => ResourceKind::Deployment,
+            | A::ViewDeploymentUsage
+            | A::UseAiGateway => ResourceKind::Deployment,
             // Member
             A::InviteMember
             | A::CancelMemberInvitation
@@ -1318,6 +1367,7 @@ pub enum ConcreteSegment {
     Billing,
     OauthApplication,
     Sso,
+    DirectorySync,
     Integration,
     DefaultEnvironmentVariable,
 }
@@ -1338,6 +1388,7 @@ impl ConcreteSegment {
             ConcreteSegment::Billing => ResourceKind::Billing,
             ConcreteSegment::OauthApplication => ResourceKind::OauthApplication,
             ConcreteSegment::Sso => ResourceKind::Sso,
+            ConcreteSegment::DirectorySync => ResourceKind::DirectorySync,
             ConcreteSegment::Integration => ResourceKind::Integration,
             ConcreteSegment::DefaultEnvironmentVariable => ResourceKind::DefaultEnvironmentVariable,
         }
@@ -1388,6 +1439,7 @@ impl ConcreteSegment {
             | ConcreteSegment::Billing
             | ConcreteSegment::OauthApplication
             | ConcreteSegment::Sso
+            | ConcreteSegment::DirectorySync
             | ConcreteSegment::Integration
             | ConcreteSegment::DefaultEnvironmentVariable => None,
         }

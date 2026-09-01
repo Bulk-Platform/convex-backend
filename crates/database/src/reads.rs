@@ -1,6 +1,9 @@
 //! Read set tracking for an active transaction
 use std::{
+    any::Any,
     collections::BTreeMap,
+    mem,
+    ops::Bound,
     sync::LazyLock,
 };
 
@@ -30,7 +33,7 @@ use common::{
 use errors::ErrorMetadata;
 use imbl::{
     OrdMap,
-    Vector,
+    OrdSet,
 };
 use search::QueryReads as SearchQueryReads;
 use usage_tracking::FunctionUsageTracker;
@@ -53,6 +56,7 @@ use crate::{
     execution_size::TransactionLimits,
     stack_traces::StackTrace,
     write_log::{
+        ArcWriteInIndex,
         PackedDocumentUpdate,
         WriteSource,
     },
@@ -223,19 +227,13 @@ impl ReadSet {
     }
 
     /// Check whether any writes in the given index maps in the timestamp
-    /// range `[from, to]` conflict with this read set. More efficient than
+    /// range `(from, to]` conflict with this read set. More efficient than
     /// `writes_overlap_docs` because it looks up only indexes that were read.
     #[fastrace::trace]
-    pub fn writes_overlap_by_index(
+    pub(crate) fn writes_overlap_by_index(
         &self,
-        by_database_index: &OrdMap<
-            TabletIndexName,
-            OrdMap<Timestamp, (WithHeapSize<Vector<DatabaseIndexWrite>>, WriteSource)>,
-        >,
-        by_search_index: &OrdMap<
-            TabletIndexName,
-            OrdMap<Timestamp, (WithHeapSize<Vector<TextIndexWrite>>, WriteSource)>,
-        >,
+        by_database_index: &OrdMap<TabletIndexName, OrdSet<ArcWriteInIndex<DatabaseIndexWrite>>>,
+        by_search_index: &OrdMap<TabletIndexName, OrdSet<ArcWriteInIndex<TextIndexWrite>>>,
         from: Timestamp,
         to: Timestamp,
     ) -> Option<ConflictingReadWithWriteSource> {
@@ -252,8 +250,8 @@ impl ReadSet {
             let Some(updates) = by_database_index.get(index) else {
                 continue;
             };
-            for (ts, (doc_updates, write_source)) in updates.range(from..=to) {
-                for update in doc_updates.iter() {
+            for write in updates.range((Bound::Excluded(from), Bound::Included(to))) {
+                for update in &write.index_updates {
                     for index_key in update.update.iter() {
                         if intervals.contains(index_key) {
                             let stack_traces = stack_traces.as_ref().map(|st| {
@@ -273,8 +271,8 @@ impl ReadSet {
                                     id: update.document_id,
                                     stack_traces,
                                 },
-                                write_source: write_source.clone(),
-                                write_ts: *ts,
+                                write_source: write.write_source.clone(),
+                                write_ts: write.ts,
                             });
                         }
                     }
@@ -286,8 +284,8 @@ impl ReadSet {
             let Some(updates) = by_search_index.get(index) else {
                 continue;
             };
-            for (ts, (doc_updates, write_source)) in updates.range(from..=to) {
-                for update in doc_updates.iter() {
+            for write in updates.range((Bound::Excluded(from), Bound::Included(to))) {
+                for update in &write.index_updates {
                     for value in update.update.iter() {
                         if search_reads.overlaps_search_index_key_value(value) {
                             return Some(ConflictingReadWithWriteSource {
@@ -296,8 +294,8 @@ impl ReadSet {
                                     id: update.document_id,
                                     stack_traces: None,
                                 },
-                                write_source: write_source.clone(),
-                                write_ts: *ts,
+                                write_source: write.write_source.clone(),
+                                write_ts: write.ts,
                             });
                         }
                     }
@@ -368,7 +366,7 @@ impl TransactionReadSet {
         &mut self,
         index_name: TabletIndexName,
         fields: IndexedFields,
-        intervals: impl IntoIterator<Item = Interval>,
+        mut intervals: impl IntoIterator<Item = Interval> + 'static,
     ) -> (usize, usize) {
         self.read_set.indexed.mutate_entry_or_insert_with(
             index_name.clone(),
@@ -390,11 +388,24 @@ impl TransactionReadSet {
                 );
 
                 let range_num_intervals_before = range_set.len();
-                for interval in intervals {
+                if range_set.is_empty()
+                    && let Some(intervals) =
+                        (&mut intervals as &mut dyn Any).downcast_mut::<IntervalSet>()
+                {
+                    // optimization: reuse the existing IntervalSet
+                    *range_set = mem::take(intervals);
                     if let Some(stack_traces) = stack_traces.as_mut() {
-                        stack_traces.push((interval.clone(), StackTrace::new()));
+                        for interval in range_set.iter() {
+                            stack_traces.push((interval, StackTrace::new()));
+                        }
                     }
-                    range_set.add(interval);
+                } else {
+                    for interval in intervals {
+                        if let Some(stack_traces) = stack_traces.as_mut() {
+                            stack_traces.push((interval.clone(), StackTrace::new()));
+                        }
+                        range_set.add(interval);
+                    }
                 }
                 let range_num_intervals_after = range_set.len();
 
@@ -426,7 +437,7 @@ impl TransactionReadSet {
     ) {
         let (index_reads, search_reads) = reads.consume();
         for (index_name, index_reads) in index_reads {
-            self._record_indexed(index_name, index_reads.fields, index_reads.intervals.iter());
+            self._record_indexed(index_name, index_reads.fields, index_reads.intervals);
         }
         for (index_name, search_reads) in search_reads {
             self.record_search(index_name, search_reads);
@@ -450,13 +461,13 @@ impl TransactionReadSet {
         let skip_logging_usage = table_name.is_system();
         usage_tracker.track_database_egress(
             component_path.clone(),
-            table_name.to_string(),
+            &table_name,
             document_size as u64,
             skip_logging_usage,
         );
         usage_tracker.track_database_egress_v2(
             component_path.clone(),
-            table_name.to_string(),
+            &table_name,
             document_size as u64,
             table_name.is_system(),
         );
@@ -465,13 +476,13 @@ impl TransactionReadSet {
         {
             usage_tracker.track_virtual_table_egress(
                 component_path.clone(),
-                virtual_table_name.to_string(),
+                virtual_table_name,
                 document_size as u64,
             );
         }
         usage_tracker.track_database_egress_rows(
             component_path,
-            table_name.to_string(),
+            &table_name,
             1,
             skip_logging_usage,
         );

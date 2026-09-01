@@ -105,6 +105,15 @@ fn strip_pii(err: &mut anyhow::Error) {
             }
         }
     }
+    // Strip in place so the rebuild below doesn't fire and discard the marker.
+    if let Some(recaptured) = err.downcast_mut::<AlreadyReported>() {
+        for (regex, replacement) in PII_REPLACEMENTS.iter() {
+            match regex.replace_all(&recaptured.0, *replacement) {
+                Cow::Borrowed(b) if b == recaptured.0 => (),
+                cow => recaptured.0 = cow.into_owned(),
+            }
+        }
+    }
 
     let s = format!("{err:#}");
     let mut transformed = s.clone();
@@ -112,34 +121,40 @@ fn strip_pii(err: &mut anyhow::Error) {
         transformed = regex.replace_all(&transformed, *replacement).to_string();
     }
     if s != transformed {
-        struct WithBacktrace(String, anyhow::Error);
-        impl Error for WithBacktrace {
-            fn provide<'a>(&'a self, request: &mut std::error::Request<'a>) {
-                request.provide_ref(self.1.backtrace());
-            }
-        }
-        impl Display for WithBacktrace {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(&self.0)
-            }
-        }
-        impl Debug for WithBacktrace {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(&self.0)
-            }
-        }
         let em = err.downcast_ref::<ErrorMetadata>().cloned();
-        let mut transformed_error = anyhow::Error::new(WithBacktrace(
+        let mut transformed_error = error_with_backtrace(
             transformed,
             // this is not ideal as the anyhow! itself takes a backtrace that we
             // then throw away
             mem::replace(err, anyhow::anyhow!("")),
-        ));
+        );
         if let Some(em) = em {
             transformed_error = transformed_error.context(em);
         }
         *err = transformed_error;
     }
+}
+
+/// Creates an error from `msg` with the backtrace from `err`. No other
+/// properties of `err` are preserved, including its message or ErrorMetadata.
+pub fn error_with_backtrace(msg: String, err: anyhow::Error) -> anyhow::Error {
+    struct WithBacktrace(String, anyhow::Error);
+    impl Error for WithBacktrace {
+        fn provide<'a>(&'a self, request: &mut std::error::Request<'a>) {
+            request.provide_ref(self.1.backtrace());
+        }
+    }
+    impl Display for WithBacktrace {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+    impl Debug for WithBacktrace {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+    anyhow::Error::new(WithBacktrace(msg, err))
 }
 
 /// Log an error to Sentry.
@@ -190,6 +205,7 @@ fn report_error_sync_no_tracing(err: &mut anyhow::Error) -> Option<Uuid> {
         if let Some(counter) = e.custom_metric() {
             log_counter(counter, 1);
         }
+        e.log_sampled_client_error();
         // Set the source of this error to the service name if it's not already set,
         // denoting that this error has been reported and downstream callers that
         // receive this error need not re-report it.
@@ -202,6 +218,12 @@ fn report_error_sync_no_tracing(err: &mut anyhow::Error) -> Option<Uuid> {
                 e.source = Some(SERVICE_NAME.clone());
             },
         }
+    }
+    // Checked after the block above so the counters there still fire on a
+    // repeat report, matching how the `source` guard behaves.
+    if err.is::<AlreadyReported>() {
+        tracing::debug!("Not reporting above error: already reported where it was recaptured");
+        return None;
     }
 
     let Some(sentry_client) = sentry::Hub::current().client() else {
@@ -274,16 +296,48 @@ fn event_from_error(err: &anyhow::Error) -> sentry::protocol::Event<'static> {
 ///
 /// See https://docs.rs/anyhow/latest/anyhow/struct.Error.html#display-representations
 pub async fn recapture_stacktrace(mut err: anyhow::Error) -> anyhow::Error {
-    let new_error = recapture_stacktrace_noreport(&err);
-    report_error(&mut err).await; // report original error, mutating it to strip pii
-    new_error
+    // Recapture before reporting: reporting strips PII from `err` in place, and
+    // the recaptured error is developer-facing, so it must keep the original
+    // message.
+    let mut new_err = with_error_metadata_of(
+        &err,
+        anyhow::Error::new(AlreadyReported(format!("{err:#}"))),
+    );
+    report_error(&mut err).await;
+    // Carry over the `source` that reporting stamped, or the dedup guard in
+    // `report_error_sync_no_tracing` reports the recaptured error a second time.
+    if let Some(reported) = err.downcast_ref::<ErrorMetadata>()
+        && let Some(recaptured) = new_err.downcast_mut::<ErrorMetadata>()
+    {
+        recaptured.source = reported.source.clone();
+    }
+    new_err
 }
 
 pub fn recapture_stacktrace_noreport(err: &anyhow::Error) -> anyhow::Error {
-    let new_error = anyhow::anyhow!("Orig Error: {err:#}.");
+    with_error_metadata_of(err, anyhow::anyhow!("Orig Error: {err:#}."))
+}
+
+fn with_error_metadata_of(err: &anyhow::Error, new_err: anyhow::Error) -> anyhow::Error {
     match err.downcast_ref::<ErrorMetadata>() {
-        Some(em) => new_error.context(em.clone()),
-        None => new_error,
+        Some(em) => new_err.context(em.clone()),
+        None => new_err,
+    }
+}
+
+/// Root of the error `recapture_stacktrace` hands back. Its presence means the
+/// original was already reported to Sentry, which is how errors that carry no
+/// `ErrorMetadata` — and so have no `source` field to stamp — are deduped.
+/// Confined to one process: `tonic::Status` carries only `ErrorMetadata`.
+#[derive(thiserror::Error)]
+#[error("Orig Error: {0}.")]
+struct AlreadyReported(String);
+
+impl Debug for AlreadyReported {
+    // Sentry derives the exception type from `Debug` output, and only yields
+    // "Error" when it renders as the quoted `Display` string.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Debug::fmt(&self.to_string(), f)
     }
 }
 

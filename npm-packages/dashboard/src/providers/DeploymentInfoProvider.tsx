@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { JSX, useEffect, useLayoutEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/router";
 import {
@@ -135,13 +135,7 @@ export function DeploymentInfoProvider({
   useEffect(() => {
     accessTokenRef.current = accessToken;
   }, [accessToken]);
-  const {
-    workOsEnvironmentProvisioningDashboardUi,
-    connectionStateCheckIntervalMs,
-    logStreamTopicFilters,
-    schemaPage,
-    usageLimits,
-  } = useLaunchDarkly();
+  const { connectionStateCheckIntervalMs } = useLaunchDarkly();
   const selectedTeamSlug = router.query.team as string;
   const projectSlug = router.query.project as string;
   const teamsURI = `/t/${selectedTeamSlug}`;
@@ -220,10 +214,7 @@ export function DeploymentInfoProvider({
         projectsURI,
         deploymentsURI,
         isSelfHosted: false,
-        workosIntegrationEnabled: workOsEnvironmentProvisioningDashboardUi,
-        logStreamTopicFiltersEnabled: logStreamTopicFilters,
-        schemaPageEnabled: schemaPage,
-        usageLimitsEnabled: usageLimits,
+        workosIntegrationEnabled: true,
         connectionStateCheckIntervalMs,
       });
     };
@@ -240,10 +231,6 @@ export function DeploymentInfoProvider({
     deploymentsURI,
     projectsURI,
     teamsURI,
-    workOsEnvironmentProvisioningDashboardUi,
-    logStreamTopicFilters,
-    schemaPage,
-    usageLimits,
     connectionStateCheckIntervalMs,
   ]);
 

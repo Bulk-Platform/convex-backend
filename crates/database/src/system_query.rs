@@ -27,10 +27,7 @@ use common::{
     runtime::Runtime,
 };
 use indexing::{
-    in_memory_indexes::{
-        LazyDocument,
-        MemoryDocument,
-    },
+    in_memory_indexes::LazyDocument,
     index_reader::RangeRequest,
 };
 use value::{
@@ -282,21 +279,21 @@ impl<RT: Runtime, T: SystemTable> SystemQuery<'_, '_, RT, T> {
             page_range,
             &self.tx.limits,
         )?;
-        for (_, doc, _) in &page {
-            // NOTE: since this is a system read, we don't bother tracking usage;
-            // we only update `system_tx_size` for stats
+        if !page.is_empty() {
             let component_path = self
                 .tx
-                .component_path_for_document_id(doc.id())?
+                .component_path_for_tablet_id(self.tablet_id)?
                 .unwrap_or_default();
-            self.tx.reads.record_read_document(
-                component_path,
-                T::TABLE_NAME.clone(),
-                doc.size(),
-                &self.tx.usage_tracker,
-                &self.tx.virtual_system_mapping,
-                &self.tx.limits,
-            )?;
+            for (_, doc, _) in &page {
+                self.tx.reads.record_read_document(
+                    component_path.clone(),
+                    T::TABLE_NAME.clone(),
+                    doc.size(),
+                    &self.tx.usage_tracker,
+                    &self.tx.virtual_system_mapping,
+                    &self.tx.limits,
+                )?;
+            }
         }
 
         Ok((
@@ -306,11 +303,8 @@ impl<RT: Runtime, T: SystemTable> SystemQuery<'_, '_, RT, T> {
                         LazyDocument::Memory(doc) if !T::FOR_MIGRATION => {
                             doc.force::<T::Metadata>()?
                         },
-                        LazyDocument::Memory(MemoryDocument {
-                            packed_document: doc,
-                            ..
-                        })
-                        | LazyDocument::Packed(doc) => Arc::new(doc.parse()?),
+                        LazyDocument::Memory(doc) => Arc::new(doc.parse_uncached()?),
+                        LazyDocument::Packed(doc) => Arc::new(doc.parse()?),
                     })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?,

@@ -11,7 +11,6 @@ use std::{
 use anyhow::Context as _;
 use common::{
     knobs::{
-        FUNRUN_INITIAL_PERMIT_TIMEOUT,
         ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE,
         ISOLATE_MAX_USER_HEAP_SIZE,
     },
@@ -25,7 +24,6 @@ use derive_more::{
     Add,
     AddAssign,
 };
-use errors::ErrorMetadata;
 use fastrace::{
     local::LocalSpan,
     Event,
@@ -39,21 +37,25 @@ use itertools::Itertools as _;
 
 use crate::{
     array_buffer_allocator::ArrayBufferMemoryLimit,
-    concurrency_limiter::ConcurrencyLimiter,
+    client::SharedIsolateHeapStats,
     context_cache::ContextCache,
-    environment::IsolateEnvironment,
+    environment::V8IsolateEnvironment,
     helpers::pump_message_loop,
     metrics::{
         create_isolate_timer,
         destroy_isolate_timer,
         log_heap_statistics,
+        rejected_before_execution_error,
+        RejectedBeforeExecutionReason,
     },
     request_scope::RequestState,
     strings,
     termination::{
-        IsolateHandle,
+        ExecutionHandle,
         IsolateTerminationReason,
     },
+    timeout::start_request_on_handle,
+    ConcurrencyPermit,
     Timeout,
 };
 
@@ -66,14 +68,13 @@ pub const SETUP_URL: &str = "convex:/_system/setup.js";
 pub struct Isolate<RT: Runtime> {
     rt: RT,
     v8_isolate: ManuallyDrop<v8::OwnedIsolate>,
-    handle: IsolateHandle,
+    handle: ExecutionHandle,
     // Typically, the user timeout is configured based on environment. This
     // allows us to set an upper bound to it that we use for tests.
     max_user_timeout: Option<Duration>,
     // The heap limit callback takes ownership of this `Box` allocation, which
     // we reclaim after removing the callback.
     heap_ctx_ptr: *mut HeapContext,
-    limiter: ConcurrencyLimiter,
     array_buffer_memory_limit: Arc<ArrayBufferMemoryLimit>,
     max_user_heap_size: usize,
 
@@ -157,12 +158,7 @@ impl IsolateHeapStats {
 }
 
 impl<RT: Runtime> Isolate<RT> {
-    pub fn new(
-        rt: RT,
-        max_user_timeout: Option<Duration>,
-        limiter: ConcurrencyLimiter,
-        max_user_heap_size: usize,
-    ) -> Self {
+    pub fn new(rt: RT, max_user_timeout: Option<Duration>, max_user_heap_size: usize) -> Self {
         let _timer = create_isolate_timer();
         let (array_buffer_memory_limit, array_buffer_allocator) =
             crate::array_buffer_allocator::limited_array_buffer_allocator(
@@ -193,7 +189,7 @@ impl<RT: Runtime> Isolate<RT> {
 
         v8_isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
 
-        let handle = IsolateHandle::new(v8_isolate.thread_safe_handle());
+        let handle = ExecutionHandle::new(v8_isolate.thread_safe_handle());
 
         // Pass ownership of the HeapContext struct to the heap limit callback, which
         // we'll take back in the `Isolate`'s destructor.
@@ -227,7 +223,6 @@ impl<RT: Runtime> Isolate<RT> {
             handle,
             heap_ctx_ptr,
             max_user_timeout,
-            limiter,
             array_buffer_memory_limit,
             max_user_heap_size,
         }
@@ -291,17 +286,15 @@ impl<RT: Runtime> Isolate<RT> {
         // The heap should have enough memory available.
         let stats = self.v8_isolate.get_heap_statistics();
         log_heap_statistics(&stats);
-        if stats.total_available_size() < *ISOLATE_MAX_USER_HEAP_SIZE {
-            if !context_cache.report_memory_pressure(true) {
-                self.handle
-                    .terminate(IsolateTerminationReason::OutOfMemory.into());
-                return Err(IsolateNotClean::TooMuchMemoryCarryOver(
-                    stats.total_available_size().format_size(BINARY),
-                    stats.heap_size_limit().format_size(BINARY),
-                ));
-            }
-        } else {
-            context_cache.report_memory_pressure(false);
+        if stats.total_available_size() < *ISOLATE_MAX_USER_HEAP_SIZE
+            && !context_cache.has_saved_context()
+        {
+            self.handle
+                .terminate(IsolateTerminationReason::OutOfMemory.into());
+            return Err(IsolateNotClean::TooMuchMemoryCarryOver(
+                stats.total_available_size().format_size(BINARY),
+                stats.heap_size_limit().format_size(BINARY),
+            ));
         }
         if stats.number_of_detached_contexts() > 0 {
             return Err(IsolateNotClean::DetachedContext(
@@ -312,48 +305,25 @@ impl<RT: Runtime> Isolate<RT> {
         Ok(())
     }
 
-    pub async fn start_request<E: IsolateEnvironment<RT>>(
+    pub async fn start_request<E: V8IsolateEnvironment<RT>>(
         &mut self,
         context_cache: &mut ContextCache,
-        client_id: Arc<String>,
+        permit: ConcurrencyPermit,
         environment: E,
-    ) -> anyhow::Result<(IsolateHandle, RequestState<RT, E>, Timeout<RT>)> {
+    ) -> anyhow::Result<(ExecutionHandle, RequestState<RT, E>, Timeout<RT>)> {
         // Double check that the isolate is clean.
         // It's unexpected to encounter this error, since we are supposed to
         // have already checked after the last request finished, but in practice
         // it does happen - so make this error retryable.
-        self.check_isolate_clean(context_cache).context(
-            ErrorMetadata::rejected_before_execution(
-                "IsolateNotClean",
-                "Selected isolate was not clean",
-            ),
-        )?;
-        // Acquire a concurrency permit without counting it against the timeout.
-        let permit = tokio::select! {
-            biased;
-            permit = self.limiter.acquire(client_id) => permit,
-            // Do not apply a timeout for subfunctions that can't be retried
-            () = self.rt.wait(*FUNRUN_INITIAL_PERMIT_TIMEOUT),
-                    if !environment.is_nested_function() => {
-                anyhow::bail!(ErrorMetadata::rejected_before_execution(
-                    "InitialPermitTimeoutError",
-                    "Couldn't acquire a permit on this funrun",
-                ));
-            }
-        };
-        let context_id = self.handle.push_context(false /* nested */);
-        let mut user_timeout = environment.user_timeout();
-        if let Some(max_user_timeout) = self.max_user_timeout {
-            // We apply the minimum between the timeout from the environment
-            // and the max_user_timeout, that is set from tets.
-            user_timeout = user_timeout.min(max_user_timeout);
-        }
-        let timeout = Timeout::new(
+        self.check_isolate_clean(context_cache).with_context(|| {
+            rejected_before_execution_error(RejectedBeforeExecutionReason::IsolateNotClean)
+        })?;
+        let (context_id, timeout) = start_request_on_handle(
             self.rt.clone(),
-            self.handle.clone(),
-            Some(user_timeout),
-            Some(environment.system_timeout()),
+            &self.handle,
             permit,
+            &environment,
+            self.max_user_timeout,
         );
         let state = RequestState::new(self.rt.clone(), environment, context_id);
         Ok((self.handle.clone(), state, timeout))
@@ -365,6 +335,10 @@ impl<RT: Runtime> Isolate<RT> {
 
     pub fn created(&self) -> &tokio::time::Instant {
         &self.created
+    }
+
+    pub fn set_heap_stats_handle(&mut self, heap_stats: SharedIsolateHeapStats) {
+        self.handle.set_heap_stats_handle(heap_stats);
     }
 }
 
@@ -395,7 +369,7 @@ impl<RT: Runtime> Drop for Isolate<RT> {
 }
 
 struct HeapContext {
-    handle: IsolateHandle,
+    handle: ExecutionHandle,
 }
 
 extern "C" fn near_heap_limit_callback(

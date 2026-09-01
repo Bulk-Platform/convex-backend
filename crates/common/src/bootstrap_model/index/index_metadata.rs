@@ -44,6 +44,7 @@ use crate::{
         GenericIndexName,
         IndexDescriptor,
         IndexTableIdentifier,
+        PersistenceIndexId,
     },
 };
 
@@ -84,6 +85,7 @@ impl<T: IndexTableIdentifier> IndexMetadata<T> {
                     retention_started: false,
                     staged,
                 }),
+                persistence_index_id: None,
             },
         }
     }
@@ -184,8 +186,23 @@ impl<T: IndexTableIdentifier> IndexMetadata<T> {
             config: IndexConfig::Database {
                 spec: DatabaseIndexSpec { fields },
                 on_disk_state: DatabaseIndexState::Enabled,
+                persistence_index_id: None,
             },
         }
+    }
+
+    pub fn assign_persistence_index_id(&mut self, persistence_index_id: PersistenceIndexId) {
+        let IndexConfig::Database {
+            persistence_index_id: current_id,
+            ..
+        } = &mut self.config
+        else {
+            panic!("persistence index IDs only apply to database indexes")
+        };
+        assert!(
+            current_id.replace(persistence_index_id).is_none(),
+            "persistence index ID is already assigned"
+        );
     }
 
     pub fn is_database_index(&self) -> bool {

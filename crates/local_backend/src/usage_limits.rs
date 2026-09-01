@@ -1,11 +1,15 @@
 use std::collections::BTreeMap;
 
-use application::app_metric_seed::SeedStatus;
+use ::usage_limits::{
+    SeedStatus,
+    UsageMeter,
+};
 use axum::{
     extract::FromRef,
     response::IntoResponse,
 };
 use common::{
+    execution_context::RequestMetadata,
     http::{
         extract::{
             Json,
@@ -54,10 +58,9 @@ use crate::{
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageLimitConfigRequest {
-    name: Option<String>,
-    metric: String,
-    window: String,
-    limit_type: String,
+    metric: UsageLimitMetric,
+    window: UsageLimitWindow,
+    limit_type: UsageLimitType,
     #[schema(minimum = 1)]
     limit: u64,
     enabled: bool,
@@ -66,10 +69,9 @@ pub struct UsageLimitConfigRequest {
 impl UsageLimitConfigRequest {
     fn into_usage_limit_config(self) -> anyhow::Result<UsageLimitConfig> {
         let config = UsageLimitConfig {
-            name: self.name,
-            metric: parse_usage_limit_metric(self.metric)?,
-            window: parse_usage_limit_window(self.window)?,
-            limit_type: parse_usage_limit_type(self.limit_type)?,
+            metric: self.metric,
+            window: self.window,
+            limit_type: self.limit_type,
             limit: self.limit,
             enabled: self.enabled,
         };
@@ -81,14 +83,13 @@ impl UsageLimitConfigRequest {
 #[derive(Serialize, Deserialize, ToSchema, PartialEq, Eq, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageLimitConfigResponse {
-    id: String,
-    name: Option<String>,
-    metric: String,
-    window: String,
-    limit_type: String,
+    pub id: String,
+    pub metric: UsageLimitMetric,
+    pub window: UsageLimitWindow,
+    pub limit_type: UsageLimitType,
     #[schema(minimum = 1)]
-    limit: u64,
-    enabled: bool,
+    pub limit: u64,
+    pub enabled: bool,
 }
 
 impl From<common::document::ParsedDocument<UsageLimitConfig>> for UsageLimitConfigResponse {
@@ -97,10 +98,9 @@ impl From<common::document::ParsedDocument<UsageLimitConfig>> for UsageLimitConf
         let config = doc.into_value();
         Self {
             id,
-            name: config.name,
-            metric: config.metric.to_string(),
-            window: config.window.to_string(),
-            limit_type: config.limit_type.to_string(),
+            metric: config.metric,
+            window: config.window,
+            limit_type: config.limit_type,
             limit: config.limit,
             enabled: config.enabled,
         }
@@ -116,7 +116,7 @@ pub struct ListUsageLimitsResponse {
 #[derive(Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageLimitResponse {
-    usage_limit: UsageLimitConfigResponse,
+    pub usage_limit: UsageLimitConfigResponse,
 }
 
 /// Current-window usage for a single metric.
@@ -171,11 +171,9 @@ pub struct GetCurrentUsageResponse {
 
 /// Get current usage
 ///
-/// Get the current usage for each metric, in each in-progress window (the
-/// current day and calendar month), along with the status of the
-/// historical-usage backfill.
+/// Get the values for each usage metric for the current day and month (UTC)
 ///
-/// The reported usage is only guaranteed to reflect the full window once
+/// The reported usage is only guaranteed to reflect the full window when
 /// `seedStatus` is `complete`. A `pending` or `partial` status means the
 /// backfill is still in progress and the returned usage may understate actual
 /// usage, so retry later for an accurate total.
@@ -281,10 +279,21 @@ pub async fn create_usage_limit(
     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     Json(req): Json<UsageLimitConfigRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
+    let usage_limit = create_usage_limit_handler(st, identity, request_metadata, req).await?;
+    Ok(Json(UsageLimitResponse { usage_limit }))
+}
+
+pub async fn create_usage_limit_handler(
+    st: LocalAppState,
+    identity: keybroker::Identity,
+    request_metadata: RequestMetadata,
+    req: UsageLimitConfigRequest,
+) -> Result<UsageLimitConfigResponse, HttpResponseError> {
     identity.require_operation(keybroker::DeploymentOp::WriteUsageLimits)?;
 
     let mut tx = st.application.begin(identity).await?;
     let config = req.into_usage_limit_config()?;
+    validate_limit_above_current_usage(&st, &config)?;
     let id = UsageLimitsModel::new(&mut tx).create(config).await?;
     let created = UsageLimitsModel::new(&mut tx)
         .get(id)
@@ -300,7 +309,7 @@ pub async fn create_usage_limit(
         .commit_with_audit_log_events(tx, audit_events, request_metadata, "create_usage_limit")
         .await?;
 
-    Ok(Json(UsageLimitResponse { usage_limit }))
+    Ok(usage_limit)
 }
 
 /// Update usage limit
@@ -329,6 +338,17 @@ pub async fn update_usage_limit(
     Path(id): Path<String>,
     Json(req): Json<UsageLimitConfigRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
+    let usage_limit = update_usage_limit_handler(st, identity, request_metadata, id, req).await?;
+    Ok(Json(UsageLimitResponse { usage_limit }))
+}
+
+pub async fn update_usage_limit_handler(
+    st: LocalAppState,
+    identity: keybroker::Identity,
+    request_metadata: RequestMetadata,
+    id: String,
+    req: UsageLimitConfigRequest,
+) -> Result<UsageLimitConfigResponse, HttpResponseError> {
     identity.require_operation(keybroker::DeploymentOp::WriteUsageLimits)?;
 
     let mut tx = st.application.begin(identity).await?;
@@ -343,6 +363,7 @@ pub async fn update_usage_limit(
         .ok_or_else(|| anyhow::anyhow!(usage_limit_not_found()))?
         .into_value();
     let config = req.into_usage_limit_config()?;
+    validate_limit_above_current_usage(&st, &config)?;
     UsageLimitsModel::new(&mut tx).replace(id, config).await?;
     let updated = UsageLimitsModel::new(&mut tx)
         .get(id)
@@ -360,7 +381,7 @@ pub async fn update_usage_limit(
         .commit_with_audit_log_events(tx, audit_events, request_metadata, "update_usage_limit")
         .await?;
 
-    Ok(Json(UsageLimitResponse { usage_limit }))
+    Ok(usage_limit)
 }
 
 /// Delete usage limit
@@ -387,6 +408,16 @@ pub async fn delete_usage_limit(
     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
+    delete_usage_limit_handler(st, identity, request_metadata, id).await?;
+    Ok(StatusCode::OK)
+}
+
+pub async fn delete_usage_limit_handler(
+    st: LocalAppState,
+    identity: keybroker::Identity,
+    request_metadata: RequestMetadata,
+    id: String,
+) -> Result<UsageLimitConfigResponse, HttpResponseError> {
     identity.require_operation(keybroker::DeploymentOp::WriteUsageLimits)?;
 
     let mut tx = st.application.begin(identity).await?;
@@ -400,48 +431,65 @@ pub async fn delete_usage_limit(
     };
     let audit_events = vec![DeploymentAuditLogEvent::DeleteUsageLimit {
         id: String::from(DeveloperDocumentId::from(id)),
-        config,
+        config: config.clone(),
     }];
 
     st.application
         .commit_with_audit_log_events(tx, audit_events, request_metadata, "delete_usage_limit")
         .await?;
 
-    Ok(StatusCode::OK)
+    Ok(UsageLimitConfigResponse {
+        id: String::from(DeveloperDocumentId::from(id)),
+        metric: config.metric,
+        window: config.window,
+        limit_type: config.limit_type,
+        limit: config.limit,
+        enabled: config.enabled,
+    })
 }
 
 fn usage_limit_not_found() -> ErrorMetadata {
     ErrorMetadata::not_found("UsageLimitNotFound", "The usage limit couldn't be found.")
 }
 
-fn parse_usage_limit_metric(metric: String) -> anyhow::Result<UsageLimitMetric> {
-    metric.parse().map_err(|_| {
-        ErrorMetadata::bad_request(
-            "InvalidUsageLimitMetric",
-            format!("Invalid usage limit metric: {metric}"),
+/// Reject an enabled limit set below the usage already accrued in its current
+/// window. Such a limit trips the instant it's saved (enforcement is
+/// `total >= limit`), warning or disabling the deployment immediately, which
+/// is almost never intended. Disabled limits enforce nothing, so they're
+/// allowed regardless.
+fn validate_limit_above_current_usage(
+    st: &LocalAppState,
+    config: &UsageLimitConfig,
+) -> anyhow::Result<()> {
+    if !config.enabled {
+        return Ok(());
+    }
+    let meter: &UsageMeter = st.application.usage_meter();
+    let now = st.application.runtime().system_time();
+    let current = meter
+        .usage_snapshot(now)?
+        .into_iter()
+        .find(|(metric, _)| *metric == config.metric)
+        .map(|(_, usage)| match config.window {
+            UsageLimitWindow::Day => usage.current_day,
+            UsageLimitWindow::Month => usage.current_month,
+        })
+        .unwrap_or(0.0);
+    if config.metric.limit_in_raw_units(config.limit) < current {
+        return Err(ErrorMetadata::bad_request(
+            "UsageLimitBelowCurrentUsage",
+            format!(
+                "Usage limit of {limit} is below the current {window} usage of {current_usage} \
+                 for {metric}. Set the limit at or above the current usage.",
+                limit = config.limit,
+                window = config.window,
+                current_usage = config.metric.usage_in_display_units(current),
+                metric = config.metric,
+            ),
         )
-        .into()
-    })
-}
-
-fn parse_usage_limit_window(window: String) -> anyhow::Result<UsageLimitWindow> {
-    window.parse().map_err(|_| {
-        ErrorMetadata::bad_request(
-            "InvalidUsageLimitWindow",
-            format!("Invalid usage limit window: {window}"),
-        )
-        .into()
-    })
-}
-
-fn parse_usage_limit_type(limit_type: String) -> anyhow::Result<UsageLimitType> {
-    limit_type.parse().map_err(|_| {
-        ErrorMetadata::bad_request(
-            "InvalidUsageLimitType",
-            format!("Invalid usage limit type: {limit_type}"),
-        )
-        .into()
-    })
+        .into());
+    }
+    Ok(())
 }
 
 pub fn platform_router<S>() -> OpenApiRouter<S>

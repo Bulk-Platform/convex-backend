@@ -1,10 +1,14 @@
 import { Meta, StoryObj } from "@storybook/nextjs";
 import { PlatformDeploymentResponse } from "@convex-dev/platform/managementApi";
 import { ProjectDetails } from "generatedApi";
-import { AggregatedFunctionMetrics } from "hooks/usageMetrics";
+import {
+  AggregatedFunctionMetrics,
+  REST_OF_FUNCTIONS,
+} from "hooks/usageMetrics";
 import { rootComponentPath } from "api/usage";
 import { Sheet } from "@ui/Sheet";
 import {
+  FunctionBreakdownMetric,
   FunctionBreakdownMetricCalls,
   FunctionBreakdownMetricCompute,
   FunctionBreakdownMetricDatabaseIO,
@@ -110,7 +114,7 @@ const deployments: PlatformDeploymentResponse[] = [
 const rows: AggregatedFunctionMetrics[] = [
   {
     projectId: 42,
-    deploymentName: "wandering-fish-513",
+    deploymentType: "prod",
     function: "module.js:getLeague",
     callCount: 1,
     databaseIngressSize: 349567,
@@ -121,11 +125,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0,
     actionComputeNodeTime: 0,
     dataEgress: 0,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 42,
-    deploymentName: "wandering-fish-513",
+    deploymentType: "prod",
     function: "folder/module.js:setProfile",
     callCount: 10_000,
     databaseIngressSize: 67,
@@ -136,11 +141,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0,
     actionComputeNodeTime: 0,
     dataEgress: 0,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 42,
-    deploymentName: "wandering-fish-513",
+    deploymentType: "prod",
     function: "module.js:thisFunctionHasAReallyLongName",
     callCount: 2_000,
     databaseIngressSize: 34567,
@@ -151,11 +157,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0,
     actionComputeNodeTime: 0,
     dataEgress: 0,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 42,
-    deploymentName: "happy-capybara-123",
+    deploymentType: "custom",
     function: "module.js:thisFunctionHasAReallyLongName",
     callCount: 23_456,
     databaseIngressSize: 34567,
@@ -166,11 +173,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0,
     actionComputeNodeTime: 0,
     dataEgress: 5678,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 42,
-    deploymentName: "wandering-fish-513",
+    deploymentType: "prod",
     function: "module.js:setAvatar",
     callCount: 9_000,
     databaseIngressSize: 34567,
@@ -181,11 +189,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0,
     actionComputeNodeTime: 0,
     dataEgress: 0,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 42,
-    deploymentName: "friendly-dog-64",
+    deploymentType: "dev",
     function: "module.js:getBalls",
     callCount: 1_000,
     databaseIngressSize: 34567,
@@ -196,11 +205,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0,
     actionComputeNodeTime: 0,
     dataEgress: 0,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 42,
-    deploymentName: "friendly-dog-64",
+    deploymentType: "dev",
     function: "/api/endpoint",
     callCount: 12345,
     databaseIngressSize: 34567,
@@ -211,11 +221,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0,
     actionComputeNodeTime: 0,
     dataEgress: 98765,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 42,
-    deploymentName: "fabulous-goldfish-42",
+    deploymentType: "dev",
     function: "devMerge.js:example",
     callCount: 40,
     databaseIngressSize: 34567,
@@ -226,11 +237,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0,
     actionComputeNodeTime: 0,
     dataEgress: 0,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 42,
-    deploymentName: "wandering-fish-513",
+    deploymentType: "prod",
     function: "folder/module.js:setScore",
     callCount: 16_000,
     databaseIngressSize: 34567,
@@ -241,11 +253,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0,
     actionComputeNodeTime: 0,
     dataEgress: 0,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 42,
-    deploymentName: "wandering-fish-513",
+    deploymentType: "prod",
     function: "module.js:default",
     callCount: 21_034,
     databaseIngressSize: 34567,
@@ -256,11 +269,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0,
     actionComputeNodeTime: 0,
     dataEgress: 0,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 42,
-    deploymentName: "friendly-dog-64",
+    deploymentType: "dev",
     function: "devMerge.js:example",
     callCount: 2,
     databaseIngressSize: 34567,
@@ -271,11 +285,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0,
     actionComputeNodeTime: 0,
     dataEgress: 0,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 2,
-    deploymentName: "former-deployment-31",
+    deploymentType: "preview",
     function: "former_project_function.js:default",
     callCount: 22_022,
     databaseIngressSize: 34567,
@@ -286,11 +301,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0,
     actionComputeNodeTime: 0,
     dataEgress: 0,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 42,
-    deploymentName: "wandering-fish-513",
+    deploymentType: "prod",
     function: "module.js:getBalls",
     callCount: 25_431,
     databaseIngressSize: 34567,
@@ -301,11 +317,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0,
     actionComputeNodeTime: 0,
     dataEgress: 0,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 42,
-    deploymentName: "wandering-fish-513",
+    deploymentType: "prod",
     function: "module.js:getBall",
     callCount: 30_000,
     databaseIngressSize: 34567,
@@ -316,11 +333,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0.0011,
     actionComputeNodeTime: 0,
     dataEgress: 0,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 42,
-    deploymentName: "wandering-fish-513",
+    deploymentType: "prod",
     function: "folder/module.js:getScore",
     callCount: 20_000,
     databaseIngressSize: 34567,
@@ -331,11 +349,12 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 0.02,
     actionComputeNodeTime: 0.003,
     dataEgress: 0,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
   {
     projectId: 42,
-    deploymentName: "friendly-dog-64",
+    deploymentType: "dev",
     function: "folder/module.js:getScore",
     callCount: 200,
     databaseIngressSize: 34567,
@@ -346,9 +365,42 @@ const rows: AggregatedFunctionMetrics[] = [
     actionComputeConvexTime: 10.0,
     actionComputeNodeTime: 10.0456778,
     dataEgress: 0,
+    aiGatewayCost: 0,
+    componentPath: rootComponentPath,
+  },
+  // The roll-up of the functions below the query's per-project cut-off. It is
+  // the tail of a skewed distribution, so in practice it lands well under the
+  // busiest individual function.
+  {
+    projectId: 42,
+    deploymentType: null,
+    function: REST_OF_FUNCTIONS,
+    callCount: 4_800,
+    databaseIngressSize: 12_000,
+    databaseEgressSize: 9_500,
+    textSearchGb: 4,
+    vectorSearchGb: 11,
+    queryMutationComputeTime: 1.4,
+    actionComputeConvexTime: 0.9,
+    actionComputeNodeTime: 0.7,
+    dataEgress: 21_000,
+    aiGatewayCost: 0,
     componentPath: rootComponentPath,
   },
 ];
+
+const maxValueFor = (
+  metric: FunctionBreakdownMetric,
+  forRows: AggregatedFunctionMetrics[] = rows,
+) => Math.max(...forRows.map(metric.getTotal));
+
+// Search usage can live entirely in functions below the query's per-project
+// cut-off, leaving the roll-up as the only row with a value.
+const rowsWithSearchOnlyInRest: AggregatedFunctionMetrics[] = rows.map((row) =>
+  row.function === REST_OF_FUNCTIONS
+    ? row
+    : { ...row, textSearchGb: 0, vectorSearchGb: 0 },
+);
 
 export const Default: Story = {
   args: {
@@ -356,7 +408,7 @@ export const Default: Story = {
     team,
     project,
     deployments,
-    maxValue: Math.max(...rows.map(FunctionBreakdownMetricCalls.getTotal)),
+    maxValue: maxValueFor(FunctionBreakdownMetricCalls),
     metric: FunctionBreakdownMetricCalls,
   },
 };
@@ -367,7 +419,7 @@ export const ForDeletedProject: Story = {
     team,
     project: null,
     deployments: [],
-    maxValue: Math.max(...rows.map(FunctionBreakdownMetricCalls.getTotal)),
+    maxValue: maxValueFor(FunctionBreakdownMetricCalls),
     metric: FunctionBreakdownMetricCalls,
   },
 };
@@ -378,7 +430,7 @@ export const DatabaseIO: Story = {
     team,
     project,
     deployments,
-    maxValue: Math.max(...rows.map(FunctionBreakdownMetricDatabaseIO.getTotal)),
+    maxValue: maxValueFor(FunctionBreakdownMetricDatabaseIO),
     metric: FunctionBreakdownMetricDatabaseIO,
   },
 };
@@ -389,7 +441,7 @@ export const Compute: Story = {
     team,
     project,
     deployments,
-    maxValue: Math.max(...rows.map(FunctionBreakdownMetricCompute.getTotal)),
+    maxValue: maxValueFor(FunctionBreakdownMetricCompute),
     metric: FunctionBreakdownMetricCompute,
   },
 };
@@ -400,7 +452,7 @@ export const Search: Story = {
     team,
     project,
     deployments,
-    maxValue: Math.max(...rows.map(FunctionBreakdownMetricSearch.getTotal)),
+    maxValue: maxValueFor(FunctionBreakdownMetricSearch),
     metric: FunctionBreakdownMetricSearch,
   },
 };
@@ -411,7 +463,21 @@ export const DataEgress: Story = {
     team,
     project,
     deployments,
-    maxValue: Math.max(...rows.map(FunctionBreakdownMetricDataEgress.getTotal)),
+    maxValue: maxValueFor(FunctionBreakdownMetricDataEgress),
     metric: FunctionBreakdownMetricDataEgress,
+  },
+};
+
+export const OnlyRestHasUsage: Story = {
+  args: {
+    rows: rowsWithSearchOnlyInRest,
+    team,
+    project,
+    deployments,
+    maxValue: maxValueFor(
+      FunctionBreakdownMetricSearch,
+      rowsWithSearchOnlyInRest,
+    ),
+    metric: FunctionBreakdownMetricSearch,
   },
 };

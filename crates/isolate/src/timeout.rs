@@ -23,16 +23,20 @@ use futures::{
         self,
         Either,
     },
+    pin_mut,
     Future,
+    FutureExt,
 };
 use parking_lot::Mutex;
 use tokio::select;
 
 use crate::{
     concurrency_limiter::SuspendedPermit,
+    environment::JsEnvironment,
     metrics,
     termination::{
-        IsolateHandle,
+        ContextId,
+        ExecutionHandle,
         IsolateTerminationReason,
         TerminationReason,
     },
@@ -46,15 +50,8 @@ pub const SYSTEM_TIMEOUT_ERROR_MESSAGE: &str =
 pub enum PauseReason {
     DatabaseSyscall { name: String },
     ConcurrencyPermitReacquire,
-    LoadComponentArgs,
-    LoadUdfConfig,
-    LoadEnvironmentVariables,
-    LoadSystemEnvironmentVariables,
-    LoadModuleMetadata,
-    LoadModuleSource,
-    LoadSourcePackage,
-    LoadCanonicalUrls,
-    LoadResources,
+    UdfInitialize,
+    LoadModule,
 }
 
 impl PauseReason {
@@ -62,21 +59,14 @@ impl PauseReason {
         match self {
             Self::DatabaseSyscall { name } => format!("database_syscall({name})"),
             Self::ConcurrencyPermitReacquire => "concurrency_permit_reacquire".to_string(),
-            Self::LoadComponentArgs => "load_component_args".to_string(),
-            Self::LoadUdfConfig => "load_udf_config".to_string(),
-            Self::LoadEnvironmentVariables => "load_environment_variables".to_string(),
-            Self::LoadSystemEnvironmentVariables => "load_system_environment_variables".to_string(),
-            Self::LoadModuleMetadata => "load_module_metadata".to_string(),
-            Self::LoadModuleSource => "load_module_source".to_string(),
-            Self::LoadSourcePackage => "load_source_package".to_string(),
-            Self::LoadCanonicalUrls => "load_canonical_urls".to_string(),
-            Self::LoadResources => "load_resources".to_string(),
+            Self::UdfInitialize => "udf_initialize".to_string(),
+            Self::LoadModule => "load_module".to_string(),
         }
     }
 }
 
 /// A `Timeout` is an asynchronous background job that terminates an
-/// `IsolateHandle` after some time has passed. The holder of a `Timeout` can
+/// `ExecutionHandle` after some time has passed. The holder of a `Timeout` can
 /// temporarily pause the termination countdown with [`Timeout::pause`] and then
 /// resume time tracking by dropping the returned guard.
 ///
@@ -189,7 +179,7 @@ impl<RT: Runtime> Drop for Timeout<RT> {
 impl<RT: Runtime> Timeout<RT> {
     pub fn new(
         rt: RT,
-        handle: IsolateHandle,
+        handle: ExecutionHandle,
         timeout: Option<Duration>,
         max_time_paused: Option<Duration>,
         permit: ConcurrencyPermit,
@@ -275,6 +265,10 @@ impl<RT: Runtime> Timeout<RT> {
         self.handle.shutdown();
     }
 
+    pub fn finish_with_permit(mut self) -> anyhow::Result<ConcurrencyPermit> {
+        self.permit.take().context("lost the permit")
+    }
+
     // Similar to releasing the GIL in Python, it's advisable to drop the
     // ConcurrencyPermit when entering async code on the V8 thread. This helper also
     // integrates with our user time tracking to not count async code against the
@@ -334,12 +328,18 @@ impl<RT: Runtime> Timeout<RT> {
         reason: PauseReason,
         f: impl Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
+        pin_mut!(f);
+        // If the future completes without blocking, don't pause.
+        // This is useful if `f` is just reading from caches.
+        if let Some(r) = f.as_mut().now_or_never() {
+            return r;
+        }
         self.with_release_permit_regainable(reason, async move |_| f.await)
             .await
     }
 
     async fn go(
-        handle: IsolateHandle,
+        handle: ExecutionHandle,
         inner: Arc<Mutex<TimeoutInner<RT>>>,
         done_tx: async_broadcast::Sender<()>,
     ) {
@@ -369,6 +369,50 @@ impl<RT: Runtime> Timeout<RT> {
     }
 }
 
+/// Starts a request on `handle`, arming a `Timeout` against the environment's
+/// user and system timeouts. `max_user_timeout` is an upper bound set by tests.
+///
+/// The caller is responsible for popping the returned `ContextId`.
+pub fn start_request_on_handle<RT: Runtime, E: JsEnvironment<RT>>(
+    rt: RT,
+    handle: &ExecutionHandle,
+    permit: ConcurrencyPermit,
+    environment: &E,
+    max_user_timeout: Option<Duration>,
+) -> (ContextId, Timeout<RT>) {
+    let context_id = handle.push_context(false /* nested */);
+    let mut user_timeout = environment.user_timeout();
+    if let Some(max_user_timeout) = max_user_timeout {
+        user_timeout = user_timeout.min(max_user_timeout);
+    }
+    let timeout = Timeout::new(
+        rt,
+        handle.clone(),
+        Some(user_timeout),
+        Some(environment.system_timeout()),
+        permit,
+    );
+    (context_id, timeout)
+}
+
+/// Starts a request on a fresh handle for an engine with no V8 isolate behind
+/// it. The timeout can only record its reason, so the engine must poll
+/// [`ExecutionHandle::check_terminated`] between steps to notice it.
+/// TODO(runtime): Replace this when we have an impl that uses epoch
+/// interruption in wasm
+pub fn start_cooperative_request<RT: Runtime, E: JsEnvironment<RT>>(
+    rt: RT,
+    permit: ConcurrencyPermit,
+    environment: &E,
+    max_user_timeout: Option<Duration>,
+) -> (ExecutionHandle, ContextId, Timeout<RT>) {
+    let handle = ExecutionHandle::cooperative();
+    let (context_id, timeout) =
+        start_request_on_handle(rt, &handle, permit, environment, max_user_timeout);
+    (handle, context_id, timeout)
+}
+
+#[derive(Debug)]
 pub struct FunctionExecutionTime {
     pub elapsed: Duration,
     pub limit: Duration,

@@ -17,6 +17,7 @@ import { SelfHostedDisconnectOverlay } from "@common/features/disconnectOverlay/
 import { Menu, MenuItem } from "@ui/Menu";
 import { ThemeProvider } from "next-themes";
 import React, {
+  JSX,
   useCallback,
   useContext,
   useEffect,
@@ -320,11 +321,6 @@ const deploymentInfo: Omit<DeploymentInfo, "deploymentUrl" | "adminKey"> = {
   deploymentsURI: "",
   isSelfHosted: true,
   workosIntegrationEnabled: false,
-  logStreamTopicFiltersEnabled: true,
-  schemaPageEnabled: true,
-  // Gated off until the usage limits feature ships; self-hosted has no
-  // LaunchDarkly, so flip this to true at launch.
-  usageLimitsEnabled: false,
   connectionStateCheckIntervalMs: 2500,
 };
 

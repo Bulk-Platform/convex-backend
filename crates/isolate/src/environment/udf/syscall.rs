@@ -35,17 +35,17 @@ use value::{
     TabletIdAndTableNumber,
 };
 
-use super::{
-    async_syscall::AsyncSyscallProvider,
-    DatabaseUdfEnvironment,
-};
-use crate::environment::helpers::{
-    parse_version,
-    with_argument_error,
-    ArgName,
+use super::DatabaseUdfSyscallProvider;
+use crate::{
+    environment::helpers::{
+        parse_version,
+        with_argument_error,
+        ArgName,
+    },
+    metrics::log_normalize_id_old_format,
 };
 
-pub trait SyscallProvider<RT: Runtime> {
+pub trait SyscallProviderInternal<RT: Runtime> {
     fn table_filter(&self) -> TableFilter;
 
     fn lookup_table(&mut self, name: &TableName) -> anyhow::Result<Option<TabletIdAndTableNumber>>;
@@ -58,7 +58,7 @@ pub trait SyscallProvider<RT: Runtime> {
     fn require_operation(&mut self, op: DeploymentOp) -> anyhow::Result<()>;
 }
 
-impl<RT: Runtime> SyscallProvider<RT> for DatabaseUdfEnvironment<RT> {
+impl<RT: Runtime> SyscallProviderInternal<RT> for DatabaseUdfSyscallProvider<RT> {
     fn table_filter(&self) -> TableFilter {
         if self.path.udf_path.is_system() {
             TableFilter::IncludePrivateSystemTables
@@ -92,8 +92,8 @@ impl<RT: Runtime> SyscallProvider<RT> for DatabaseUdfEnvironment<RT> {
     }
 
     fn start_query(&mut self, query: Query, version: Option<Version>) -> anyhow::Result<u32> {
-        let table_filter = SyscallProvider::<RT>::table_filter(self);
-        let component = self.component()?;
+        let table_filter = SyscallProviderInternal::<RT>::table_filter(self);
+        let component = self.phase.component()?;
         let tx = self.phase.tx()?;
         // TODO: Are all invalid query pipelines developer errors? These could be bugs
         // in convex/server.
@@ -114,7 +114,7 @@ impl<RT: Runtime> SyscallProvider<RT> for DatabaseUdfEnvironment<RT> {
     }
 }
 
-pub fn syscall_impl<RT: Runtime, P: SyscallProvider<RT>>(
+pub fn syscall_impl<RT: Runtime, P: SyscallProviderInternal<RT>>(
     provider: &mut P,
     name: &str,
     args: JsonValue,
@@ -139,7 +139,7 @@ pub fn syscall_impl<RT: Runtime, P: SyscallProvider<RT>>(
     }
 }
 
-fn syscall_normalize_id<RT: Runtime, P: SyscallProvider<RT>>(
+fn syscall_normalize_id<RT: Runtime, P: SyscallProviderInternal<RT>>(
     provider: &mut P,
     args: JsonValue,
 ) -> anyhow::Result<JsonValue> {
@@ -173,6 +173,7 @@ fn syscall_normalize_id<RT: Runtime, P: SyscallProvider<RT>>(
             {
                 Some(id_v6)
             } else if let Ok(internal_id) = InternalId::from_developer_str(&id_string) {
+                log_normalize_id_old_format(if id_string.len() > 22 { "v4" } else { "v5" });
                 let id_v6 = DeveloperDocumentId::new(table_number, internal_id);
                 Some(id_v6)
             } else {
@@ -187,7 +188,7 @@ fn syscall_normalize_id<RT: Runtime, P: SyscallProvider<RT>>(
     }
 }
 
-fn syscall_component_argument<RT: Runtime, P: SyscallProvider<RT>>(
+fn syscall_component_argument<RT: Runtime, P: SyscallProviderInternal<RT>>(
     provider: &mut P,
     args: JsonValue,
 ) -> anyhow::Result<JsonValue> {
@@ -206,7 +207,7 @@ fn syscall_component_argument<RT: Runtime, P: SyscallProvider<RT>>(
     Ok(result)
 }
 
-fn syscall_query_stream<RT: Runtime, P: SyscallProvider<RT>>(
+fn syscall_query_stream<RT: Runtime, P: SyscallProviderInternal<RT>>(
     provider: &mut P,
     args: JsonValue,
 ) -> anyhow::Result<JsonValue> {
@@ -233,7 +234,7 @@ fn syscall_query_stream<RT: Runtime, P: SyscallProvider<RT>>(
     Ok(serde_json::to_value(QueryStreamResult { query_id })?)
 }
 
-fn syscall_query_cleanup<RT: Runtime, P: SyscallProvider<RT>>(
+fn syscall_query_cleanup<RT: Runtime, P: SyscallProviderInternal<RT>>(
     provider: &mut P,
     args: JsonValue,
 ) -> anyhow::Result<JsonValue> {
@@ -250,7 +251,7 @@ fn syscall_query_cleanup<RT: Runtime, P: SyscallProvider<RT>>(
     Ok(serde_json::to_value(cleaned_up)?)
 }
 
-fn syscall_require_operation<RT: Runtime, P: SyscallProvider<RT>>(
+fn syscall_require_operation<RT: Runtime, P: SyscallProviderInternal<RT>>(
     provider: &mut P,
     args: JsonValue,
 ) -> anyhow::Result<JsonValue> {

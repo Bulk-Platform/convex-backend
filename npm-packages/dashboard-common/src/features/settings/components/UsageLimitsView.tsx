@@ -1,5 +1,4 @@
-import { useContext, useEffect } from "react";
-import { useRouter } from "next/router";
+import { useContext } from "react";
 import { DeploymentSettingsLayout } from "@common/layouts/DeploymentSettingsLayout";
 import {
   DeploymentInfoContext,
@@ -16,6 +15,7 @@ import {
 } from "@common/features/settings/components/UsageLimits";
 import {
   useUsageLimits,
+  useCurrentUsage,
   useCreateUsageLimit,
   useUpdateUsageLimit,
   useDeleteUsageLimit,
@@ -24,27 +24,13 @@ import {
 export function UsageLimitsView() {
   const { useIsOperationAllowed } = useContext(PermissionsContext);
   const canView = useIsOperationAllowed("ViewUsageLimits");
+  const canViewUsage = useIsOperationAllowed("ViewUsage");
   const canWrite = useIsOperationAllowed("WriteUsageLimits");
-
-  // Usage limits is feature-flagged; if it's off, don't render it even when
-  // reached by a direct URL — send the user back to deployment settings.
-  const router = useRouter();
-  const { usageLimitsEnabled, deploymentsURI } = useContext(
-    DeploymentInfoContext,
-  );
-  useEffect(() => {
-    if (!usageLimitsEnabled) {
-      void router.replace(`${deploymentsURI}/settings`);
-    }
-  }, [usageLimitsEnabled, deploymentsURI, router]);
-  if (!usageLimitsEnabled) {
-    return null;
-  }
 
   return (
     <DeploymentSettingsLayout page="usage-limits">
       {canView ? (
-        <UsageLimitsContent canWrite={canWrite} />
+        <UsageLimitsContent canWrite={canWrite} canViewUsage={canViewUsage} />
       ) : (
         <Sheet className="max-w-3xl py-12">
           <NoPermissionMessage
@@ -57,10 +43,15 @@ export function UsageLimitsView() {
   );
 }
 
-function UsageLimitsContent({ canWrite }: { canWrite: boolean }) {
-  const { useCurrentDeployment, useCurrentTeam, useTeamPlanType } = useContext(
-    DeploymentInfoContext,
-  );
+function UsageLimitsContent({
+  canWrite,
+  canViewUsage,
+}: {
+  canWrite: boolean;
+  canViewUsage: boolean;
+}) {
+  const { useCurrentDeployment, useCurrentTeam, useTeamPlanType, teamsURI } =
+    useContext(DeploymentInfoContext);
   const deployment = useCurrentDeployment();
   const team = useCurrentTeam();
   const planType = useTeamPlanType(team?.id ?? null);
@@ -75,8 +66,13 @@ function UsageLimitsContent({ canWrite }: { canWrite: boolean }) {
     deployment?.kind === "cloud"
       ? computeUnbilledMetrics({ isBusinessPlan, isDedicated })
       : {};
+  // Billing lives on the team settings page, which only exists for cloud
+  // deployments; self-hosted deployments have no billing, so no billing notes.
+  const billingUri =
+    deployment?.kind === "cloud" ? `${teamsURI}/settings/billing` : undefined;
 
   const { usageLimits, isLoading } = useUsageLimits();
+  const { currentUsage, seedStatus } = useCurrentUsage(canViewUsage);
   const createUsageLimit = useCreateUsageLimit();
   const updateUsageLimit = useUpdateUsageLimit();
   const deleteUsageLimit = useDeleteUsageLimit();
@@ -93,7 +89,11 @@ function UsageLimitsContent({ canWrite }: { canWrite: boolean }) {
         />
       }
       unbilledMetrics={unbilledMetrics}
+      currentUsage={currentUsage}
+      seedStatus={seedStatus}
+      deploymentCreateTime={deployment?.createTime}
       deploymentType={deployment?.deploymentType}
+      billingUri={billingUri}
       onCreate={createUsageLimit}
       onUpdate={updateUsageLimit}
       onDelete={deleteUsageLimit}

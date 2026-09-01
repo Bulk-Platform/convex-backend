@@ -102,6 +102,7 @@ impl ResourceSegment {
             (ResourceSegment::Billing, ConcreteSegment::Billing) => true,
             (ResourceSegment::OauthApplication, ConcreteSegment::OauthApplication) => true,
             (ResourceSegment::Sso, ConcreteSegment::Sso) => true,
+            (ResourceSegment::DirectorySync, ConcreteSegment::DirectorySync) => true,
             (ResourceSegment::Integration, ConcreteSegment::Integration) => true,
             (
                 ResourceSegment::DefaultEnvironmentVariable,
@@ -220,6 +221,7 @@ pub const ALL_DEPLOYMENT_OPS: &[DeploymentOp] = &[
     DeploymentOp::ViewUsageLimits,
     DeploymentOp::WriteUsageLimits,
     DeploymentOp::ViewUsage,
+    DeploymentOp::UseAiGateway,
 ];
 
 /// Authoritative mapping from a keybroker [`DeploymentOp`] to the
@@ -253,6 +255,7 @@ pub fn deployment_op_action(op: DeploymentOp) -> Option<RoleStatementAction> {
         O::ViewUsageLimits => A::ViewUsageLimits,
         O::WriteUsageLimits => A::WriteUsageLimits,
         O::ViewUsage => A::ViewDeploymentUsage,
+        O::UseAiGateway => A::UseAiGateway,
         O::Unknown => return None,
     })
 }
@@ -279,7 +282,7 @@ impl RequireDeploymentOp for Identity {
             let action = deployment_op_action(operation)
                 .map_or_else(|| format!("{operation:?}"), |action| action.to_string());
             anyhow::bail!(ErrorMetadata::forbidden(
-                "Unauthorized",
+                "OperationNotPermitted",
                 format!("You do not have permission to perform this operation ({action})."),
             ));
         }

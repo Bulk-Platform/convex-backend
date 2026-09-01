@@ -14,6 +14,7 @@ export const Primary: Story = {
     hasSubscription: true,
     showEntitlements: true,
     isBusinessPlan: false,
+    aiGatewayCost: 1.2345,
     summary: [
       {
         deploymentClass: "s16",
@@ -28,7 +29,11 @@ export const Primary: Story = {
         fileStorage: 12 * 1024,
         searchStorage: 0,
         dataEgress: 8,
+        auditLogBandwidth: 4,
         searchQueries: 0,
+        deploymentCount: 10,
+        pausedDeploymentCount: 2,
+        idleDeploymentCount: 3,
       },
       {
         deploymentClass: "s16",
@@ -43,10 +48,13 @@ export const Primary: Story = {
         fileStorage: 3 * 1024,
         searchStorage: 0,
         dataEgress: 2,
+        auditLogBandwidth: 0,
         searchQueries: 0,
+        deploymentCount: 2,
+        pausedDeploymentCount: 0,
+        idleDeploymentCount: 1,
       },
     ],
-    deploymentCount: 12,
     entitlements: {
       teamMaxDatabaseBandwidth: 1024 * 1024 * 1024,
       teamMaxDatabaseStorage: 512 * 1024 * 1024, // 512 MB in bytes
@@ -60,6 +68,7 @@ export const Primary: Story = {
       maxTeamMembers: 50000,
       logStreamingEnabled: true,
       customDomainsEnabled: true,
+      maxCustomDomains: 100,
       customRolesEnabled: true,
       customAuditLogsInLogStreamsConfigEnabled: true,
       streamingExportEnabled: true,
@@ -67,6 +76,7 @@ export const Primary: Story = {
       maxCloudBackups: 50,
       maxChefTokens: 8500000,
       ssoEnabled: false,
+      directorySyncEnabled: false,
       auditLogRetentionDays: 90,
       maxDeployments: 40,
       managementApiEnabled: true,

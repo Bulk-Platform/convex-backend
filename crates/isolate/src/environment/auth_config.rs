@@ -54,16 +54,20 @@ use crate::{
             syscall_name_for_error,
         },
         AsyncOpRequest,
-        IsolateEnvironment,
+        JsEnvironment,
+        OpProvider,
+        SyscallProvider,
     },
     helpers,
     isolate::{
         Isolate,
         CONVEX_SCHEME,
     },
+    module_cache::V8ModuleSource,
     request_scope::RequestScope,
     strings,
     timeout::Timeout,
+    ConcurrencyPermit,
 };
 
 pub struct AuthConfigEnvironment {
@@ -72,7 +76,7 @@ pub struct AuthConfigEnvironment {
     environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
 }
 
-impl<RT: Runtime> IsolateEnvironment<RT> for AuthConfigEnvironment {
+impl OpProvider for AuthConfigEnvironment {
     fn trace(&mut self, _level: LogLevel, messages: Vec<String>) -> anyhow::Result<()> {
         tracing::warn!(
             "Unexpected Console access when evaluating auth config file: {}",
@@ -142,12 +146,14 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AuthConfigEnvironment {
             "Getting the table mapping unsupported when evaluating auth config file"
         ))
     }
+}
 
+impl<RT: Runtime> SyscallProvider<RT> for AuthConfigEnvironment {
     async fn lookup_source(
         &mut self,
         path: &str,
         _timeout: &mut Timeout<RT>,
-    ) -> anyhow::Result<Option<(Arc<FullModuleSource>, ModuleCodeCacheResult)>> {
+    ) -> anyhow::Result<Option<(Arc<V8ModuleSource>, ModuleCodeCacheResult)>> {
         if path != AUTH_CONFIG_FILE_NAME {
             anyhow::bail!(ErrorMetadata::bad_request(
                 "NoImportModuleDuringAuthConfig",
@@ -155,10 +161,10 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AuthConfigEnvironment {
             ))
         }
         Ok(Some((
-            Arc::new(FullModuleSource {
+            Arc::new(V8ModuleSource::new(FullModuleSource {
                 source: self.auth_config_bundle.clone(),
                 source_map: self.source_map.clone(),
-            }),
+            })),
             ModuleCodeCacheResult::noop(),
         )))
     }
@@ -169,12 +175,21 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AuthConfigEnvironment {
             format!("Syscall {name} unsupported when evaluating auth config file")
         ))
     }
+}
+
+impl<RT: Runtime> JsEnvironment<RT> for AuthConfigEnvironment {
+    type AsyncResolver = v8::Global<v8::PromiseResolver>;
+    type SyscallProvider = Self;
+
+    fn syscall_provider(&mut self) -> &mut Self::SyscallProvider {
+        self
+    }
 
     fn start_async_syscall(
         &mut self,
         name: String,
         _args: JsonValue,
-        _resolver: v8::Global<v8::PromiseResolver>,
+        _resolver: Self::AsyncResolver,
     ) -> anyhow::Result<()> {
         anyhow::bail!(ErrorMetadata::bad_request(
             format!("No{}DuringAuthConfig", syscall_name_for_error(&name)),
@@ -188,7 +203,7 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AuthConfigEnvironment {
     fn start_async_op(
         &mut self,
         request: AsyncOpRequest,
-        _resolver: v8::Global<v8::PromiseResolver>,
+        _resolver: Self::AsyncResolver,
     ) -> anyhow::Result<()> {
         anyhow::bail!(ErrorMetadata::bad_request(
             format!("No{}DuringAuthConfig", request.name_for_error()),
@@ -210,9 +225,9 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AuthConfigEnvironment {
 
 impl AuthConfigEnvironment {
     pub async fn evaluate_auth_config<RT: Runtime>(
-        client_id: String,
         isolate: &mut Isolate<RT>,
         context_cache: &mut ContextCache,
+        permit: ConcurrencyPermit,
         auth_config_bundle: ModuleSource,
         source_map: Option<SourceMap>,
         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
@@ -222,9 +237,8 @@ impl AuthConfigEnvironment {
             source_map,
             environment_variables,
         };
-        let client_id = Arc::new(client_id);
         let (handle, state, mut timeout) = isolate
-            .start_request(context_cache, client_id, environment)
+            .start_request(context_cache, permit, environment)
             .await?;
         scope!(let handle_scope, isolate.isolate());
         let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
@@ -244,7 +258,7 @@ impl AuthConfigEnvironment {
         drop(isolate_context);
         drop(timeout);
 
-        handle.take_termination_error(None, "auth")??;
+        handle.take_termination_error("auth")??;
         result
     }
 

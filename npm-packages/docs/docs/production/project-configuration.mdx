@@ -183,49 +183,29 @@ Let us know if you run into any issues or have any feedback!
 
 ### Configuring the TypeScript compiler
 
-By default, Convex will use the `tsc` binary installed in your project for
-typechecking. If you would like to use the TypeScript 7 native preview instead,
-you can set the `typescriptCompiler` option to `tsgo`. Note that
-`@typescript/native-preview` must be installed in your project to use `tsgo`.
+By default, Convex uses the `tsc` binary installed in your project for
+typechecking. This works with TypeScript 6 and TypeScript 7 without any
+additional `convex.json` configuration.
 
-<Admonition type="info" title="Convex version requirement">
+To use TypeScript 7, install it as your project's TypeScript version:
 
-To use the TypeScript 7 native preview, you must use the `convex` NPM package
-version 1.31.1 or later.
-
-</Admonition>
-
-```json title="convex.json"
-{
-  "$schema": "./node_modules/convex/schemas/convex.schema.json",
-  "typescriptCompiler": "tsgo"
-}
+```sh
+npm install --save-dev typescript@^7
 ```
 
-### Configuring bundler options
+TypeScript 7.0 does not include a JavaScript API, so if other tools in your
+project import it, follow TypeScript's
+[side-by-side installation](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/#running-side-by-side-with-typescript-6.0)
+instructions. Convex picks up TypeScript 7 in that setup too.
 
-Convex includes sourcemaps when bundling your source code to provide stack
-traces and to display your code on the dashboard. If your code bundle is
-especially large, you can improve CLI upload times by excluding the source code
-content from the bundle. Set the `includeSourcesContent` property to `false` in
-the `bundler` options. Stack traces will continue to function as usual, but you
-will no longer be able to view your source code in the dashboard.
+<Admonition type="info" title="Migrating from the TypeScript 7 preview">
 
-<Admonition type="info" title="Convex version requirement">
-
-This configuration option is only available in version 1.31.3 or later of the
-`convex` NPM package.
+If you previously installed `@typescript/native-preview` and set
+`"typescriptCompiler": "tsgo"`, replace the preview package with stable
+TypeScript 7 and remove the `typescriptCompiler` setting. Stable TypeScript 7
+uses Convex's default `tsc` selection.
 
 </Admonition>
-
-```json title="convex.json"
-{
-  "$schema": "./node_modules/convex/schemas/convex.schema.json",
-  "bundler": {
-    "includeSourcesContent": false
-  }
-}
-```
 
 ### Configuring WorkOS AuthKit integration
 
