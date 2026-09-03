@@ -247,17 +247,14 @@ function PrepaidCreditsContainer({ team }: { team: TeamResponse }) {
   const { promos } = useLaunchDarkly();
   // A null team id pauses the query, so an unflagged team costs no Orb call.
   const creditsResult = useListCredits(promos ? team.id : null);
-  if (!promos) {
+  if (
+    !promos ||
+    creditsResult.status !== "ok" ||
+    creditsResult.data.length === 0
+  ) {
     return null;
   }
-  return (
-    <PrepaidCredits
-      credits={creditsResult.status === "ok" ? creditsResult.data : []}
-      isLoading={creditsResult.status === "loading"}
-      teamId={team.id}
-      onPromoRedeemed={creditsResult.refreshCredits}
-    />
-  );
+  return <PrepaidCredits credits={creditsResult.data} />;
 }
 
 function SpendingLimitsSectionContainer({

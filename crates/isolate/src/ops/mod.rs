@@ -52,7 +52,7 @@ use rand_chacha::ChaCha12Rng;
 use sourcemap::SourceMap;
 use structured_clone::op_structured_clone;
 use uuid::Uuid;
-use validate_returns::op_validate_returns;
+use validate_returns::op_validate_returns_call;
 use value::{
     heap_size::WithHeapSize,
     NamespacedTableMapping,
@@ -67,10 +67,10 @@ use self::{
         op_console_trace,
     },
     crypto::{
-        op_crypto_get_random_values,
-        op_crypto_random_uuid,
+        op_crypto_get_random_values_call,
+        op_crypto_random_uuid_call,
     },
-    database::op_get_table_mapping,
+    database::op_get_table_mapping_call,
     environment_variables::op_environment_variables_get_call,
     errors::{
         op_error_stack,
@@ -108,11 +108,11 @@ use self::{
     },
     time::{
         async_op_sleep,
-        op_now,
-        op_performance_now,
-        op_performance_time_origin,
+        op_now_call,
+        op_performance_now_call,
+        op_performance_time_origin_call,
     },
-    validate_args::op_validate_args,
+    validate_args::op_validate_args_call,
 };
 use crate::{
     environment::{
@@ -395,7 +395,15 @@ macro_rules! op_table {
 op_table! {
     dual: {
         "random" => op_random,
+        "now" => op_now,
+        "performance_now" => op_performance_now,
+        "performance_time_origin" => op_performance_time_origin,
+        "crypto/randomUUID" => op_crypto_random_uuid,
+        "crypto/getRandomValues" => op_crypto_get_random_values,
         "environmentVariables/get" => op_environment_variables_get,
+        "getTableMapping" => op_get_table_mapping,
+        "validateArgs" => op_validate_args,
+        "validateReturns" => op_validate_returns,
     },
     v8: {
         "throwUncatchableDeveloperError" => op_throw_uncatchable_developer_error,
@@ -405,11 +413,6 @@ op_table! {
         "console/timeLog" => op_console_time_log,
         "console/timeEnd" => op_console_time_end,
         "error/stack" => op_error_stack,
-        "now" => op_now,
-        "performance_now" => op_performance_now,
-        "performance_time_origin" => op_performance_time_origin,
-        "crypto/randomUUID" => op_crypto_random_uuid,
-        "crypto/getRandomValues" => op_crypto_get_random_values,
         "url/getUrlInfo" => op_url_get_url_info,
         "url/getUrlSearchParamPairs" => op_url_get_url_search_param_pairs,
         "url/stringifyUrlSearchParams" => op_url_stringify_url_search_params,
@@ -427,9 +430,6 @@ op_table! {
         "atob" => op_atob,
         "btoa" => op_btoa,
         "structuredClone" => op_structured_clone,
-        "getTableMapping" => op_get_table_mapping,
-        "validateArgs" => op_validate_args,
-        "validateReturns" => op_validate_returns,
         "crypto/subtle/decrypt" => subtle_crypto::op_crypto_subtle_decrypt,
         "crypto/subtle/deriveBits" => subtle_crypto::op_crypto_subtle_derive_bits,
         "crypto/subtle/deriveKey" => subtle_crypto::op_crypto_subtle_derive_key,
