@@ -1,4 +1,5 @@
 import { BusinessPlanSummary } from "components/billing/PlanSummary";
+import { useLaunchDarkly } from "hooks/useLaunchDarkly";
 import { Sheet } from "@ui/Sheet";
 import { Spinner } from "@ui/Spinner";
 import { Button } from "@ui/Button";
@@ -37,6 +38,7 @@ import {
   DATABASE_IO_CATEGORIES,
   COMPUTE_CATEGORIES,
   DEPLOYMENT_CLASS_CATEGORIES,
+  DEPLOYMENT_STATUS_CATEGORIES,
 } from "./lib/teamUsageCategories";
 import {
   FunctionBreakdownMetric,
@@ -46,6 +48,7 @@ import {
   FunctionBreakdownMetricCompute,
   FunctionBreakdownMetricSearch,
   FunctionBreakdownMetricDataEgress,
+  FunctionBreakdownMetricAiGateway,
   TeamUsageByFunctionChart,
 } from "./TeamUsageByFunctionChart";
 import { UsageBarChart, UsageStackedBarChart } from "./UsageBarChart";
@@ -61,11 +64,15 @@ import {
   GroupBy,
   BusinessGroupBy,
   BusinessDatabaseGroupBy,
+  DeploymentGroupBy,
   GroupBySelector,
   GROUP_BY_OPTIONS,
   DATABASE_GROUP_BY_OPTIONS,
   BUSINESS_GROUP_BY_OPTIONS,
   BUSINESS_DATABASE_GROUP_BY_OPTIONS,
+  DEPLOYMENT_GROUP_BY_OPTIONS,
+  AI_GATEWAY_GROUP_BY_OPTIONS,
+  AiGatewayGroupBy,
 } from "./GroupBySelector";
 import { ProjectLink } from "./ProjectLink";
 import {
@@ -80,12 +87,16 @@ import {
   useFileStoragePerDayByProject,
   useSearchStoragePerDayByProject,
   useDataEgressPerDayByProject,
+  useAuditLogBandwidthPerDayByProject,
+  useAiGatewayCostPerDayByModel,
+  useAiGatewayCostPerDayByProject,
   useSearchQueriesPerDayByProject,
   useDeploymentsByClassAndRegion,
   useComputePerDayByProjectSelfServe,
   useUsageTeamDocumentsPerDayByProject,
   useUsageTeamDeploymentCountPerDayByProject,
   useUsageTeamDeploymentCountByType,
+  useUsageTeamDeploymentCountByStatus,
   DailyMetric,
   DailyMetricByProject,
   DailyPerTagMetrics,
@@ -93,12 +104,21 @@ import {
   DailyPerTagMetricsByProjectAndClass,
 } from "hooks/usageMetrics";
 
+// Status breakdown data only exists starting on this date. Earlier days are
+// rendered as empty bars, never with real (nonexistent) values.
+const DEPLOYMENT_STATUS_DATA_START = "2026-07-23";
+
+// Matches the `LIMIT` on the function breakdown Databricks query, which returns
+// only the highest-usage projects to keep its result under the 25MB inline cap.
+const MAX_PROJECTS_IN_BREAKDOWN = 250;
+
 const FUNCTION_BREAKDOWN_TABS_ = [
   FunctionBreakdownMetricCalls,
   FunctionBreakdownMetricDatabaseIO,
   FunctionBreakdownMetricCompute,
   FunctionBreakdownMetricSearch,
   FunctionBreakdownMetricDataEgress,
+  FunctionBreakdownMetricAiGateway,
 ];
 
 export type UsageSectionId =
@@ -112,7 +132,9 @@ export type UsageSectionId =
   | "databaseIO"
   | "searchStorage"
   | "searchQueries"
-  | "dataEgress";
+  | "dataEgress"
+  | "auditLogBandwidth"
+  | "aiGatewayCost";
 
 export function TeamUsage({ team }: { team: TeamResponse }) {
   const canViewUsage = useHasCustomRolePermission(
@@ -158,6 +180,8 @@ function TeamUsageContents({ team }: { team: TeamResponse }) {
     searchStorage: "Search Storage",
     searchQueries: "Search Queries",
     dataEgress: "Data Egress",
+    auditLogBandwidth: "Audit Log Bandwidth",
+    aiGatewayCost: "AI Gateway",
   };
 
   const summaryHref = (() => {
@@ -191,6 +215,23 @@ function TeamUsageContents({ team }: { team: TeamResponse }) {
     ? { from: shownBillingPeriod.from, to: shownBillingPeriod.to }
     : null;
 
+  const { data: aiGatewayCostByDay, error: aiGatewayCostError } =
+    useAiGatewayCostPerDayByProject(
+      team.id,
+      dateRange,
+      projectId,
+      componentPrefix,
+    );
+  // TODO: consolidate into one query. The (v2) Summary query has no AI
+  // column, so the nav card totals the per-day rows this section's own query
+  // already returns. Adding the column to the Summary query in
+  // databricks-workbooks (like Function Breakdown gained one in #35) would let
+  // this card read AI cost like every other metric and delete this reduce.
+  const aiGatewayCost = aiGatewayCostByDay?.reduce(
+    (sum, row) => sum + row.value,
+    0,
+  );
+
   const { data: summary, error: summaryError } = useUsageTeamSummary(
     team?.id,
     billingPeriodRange,
@@ -198,30 +239,7 @@ function TeamUsageContents({ team }: { team: TeamResponse }) {
     componentPrefix,
   );
 
-  const { data: deploymentCountData } =
-    useUsageTeamDeploymentCountPerDayByProject(
-      team?.id,
-      dateRange,
-      componentPrefix,
-    );
-
-  // Get the latest deployment count (highest date)
-  const latestDeploymentCount = useMemo(() => {
-    if (deploymentCountData === undefined) {
-      return undefined;
-    }
-    if (deploymentCountData.length === 0) {
-      return 0;
-    }
-    // Sort by date descending and get the first item's value, then sum across all projects
-    const latestDate = deploymentCountData.reduce(
-      (max, item) => (item.ds > max ? item.ds : max),
-      deploymentCountData[0].ds,
-    );
-    return deploymentCountData
-      .filter((item) => item.ds === latestDate)
-      .reduce((sum, item) => sum + item.value, 0);
-  }, [deploymentCountData]);
+  const { showAiGatewayUsage } = useLaunchDarkly();
 
   const entitlements = useTeamEntitlements(team?.id);
 
@@ -305,8 +323,10 @@ function TeamUsageContents({ team }: { team: TeamResponse }) {
               >
                 <BusinessPlanSummary
                   summary={summary}
-                  deploymentCount={latestDeploymentCount}
                   error={summaryError}
+                  aiGatewayCost={aiGatewayCost}
+                  showAiGatewayUsage={showAiGatewayUsage}
+                  aiGatewayCostError={aiGatewayCostError}
                   isBusinessPlan={isBusinessPlanType}
                   entitlements={entitlements}
                   hasSubscription={hasSubscription}
@@ -375,6 +395,7 @@ function TeamUsageContents({ team }: { team: TeamResponse }) {
                     dateRange={dateRange}
                     projectId={projectId}
                     componentPrefix={componentPrefix}
+                    shownBillingPeriod={shownBillingPeriod}
                   />
                 )}
 
@@ -417,6 +438,24 @@ function TeamUsageContents({ team }: { team: TeamResponse }) {
 
                 {section === "dataEgress" && (
                   <DataEgressUsage
+                    team={team}
+                    dateRange={dateRange}
+                    projectId={projectId}
+                    componentPrefix={componentPrefix}
+                  />
+                )}
+
+                {section === "auditLogBandwidth" && (
+                  <AuditLogBandwidthUsage
+                    team={team}
+                    dateRange={dateRange}
+                    projectId={projectId}
+                    componentPrefix={componentPrefix}
+                  />
+                )}
+
+                {section === "aiGatewayCost" && showAiGatewayUsage && (
+                  <AiGatewayCostUsage
                     team={team}
                     dateRange={dateRange}
                     projectId={projectId}
@@ -485,7 +524,11 @@ function FunctionUsageBreakdown({
   team: TeamResponse;
 }) {
   const maxValue = useMemo(
-    () => Math.max(...metricsByDeployment.map(metric.getTotal)),
+    () =>
+      metricsByDeployment.reduce(
+        (max, row) => Math.max(max, metric.getTotal(row)),
+        0,
+      ),
     [metricsByDeployment, metric],
   );
 
@@ -568,16 +611,20 @@ function DeploymentCountUsage({
   dateRange,
   projectId,
   componentPrefix,
-}: DetailSectionProps) {
-  const [storedViewMode, setViewMode] = useGlobalLocalStorage<BusinessGroupBy>(
-    "usageViewMode_businessDeploymentCount",
-    "byType",
-  );
-  // The by-deployment-class data is only available team-wide, so it isn't a
-  // valid view when filtered to a single project — fall back to by-type.
-  const classDisabled = projectId !== null;
+  shownBillingPeriod,
+}: DetailSectionProps & { shownBillingPeriod: Period }) {
+  const [storedViewMode, setViewMode] =
+    useGlobalLocalStorage<DeploymentGroupBy>(
+      "usageViewMode_businessDeploymentCount",
+      "byType",
+    );
+  // The by-deployment-class and by-status data are only available team-wide, so
+  // they aren't valid views when filtered to a single project — fall back to
+  // by-type.
+  const teamWideDisabled = projectId !== null;
   const viewMode =
-    classDisabled && storedViewMode === "byDeploymentClass"
+    teamWideDisabled &&
+    (storedViewMode === "byDeploymentClass" || storedViewMode === "byStatus")
       ? "byType"
       : storedViewMode;
 
@@ -585,6 +632,55 @@ function DeploymentCountUsage({
 
   const { data: deploymentsByClassAndRegion, error: deploymentsByClassError } =
     useDeploymentsByClassAndRegion(team.id, dateRange);
+
+  const {
+    data: rawDeploymentCountByStatus,
+    error: deploymentCountByStatusError,
+  } = useUsageTeamDeploymentCountByStatus(team.id, dateRange);
+  // Status data doesn't exist before DEPLOYMENT_STATUS_DATA_START, so drop any
+  // earlier rows the query returns.
+  const deploymentCountByStatus = useMemo(
+    () =>
+      rawDeploymentCountByStatus?.filter(
+        (row) => row.ds >= DEPLOYMENT_STATUS_DATA_START,
+      ),
+    [rawDeploymentCountByStatus],
+  );
+  const statusRangeBeforeCutoff =
+    shownBillingPeriod.from < DEPLOYMENT_STATUS_DATA_START;
+  const statusCutoffNote = (
+    <p className="text-center text-sm text-content-secondary">
+      The deployment status breakdown is only available from July 23, 2026
+      onwards.
+    </p>
+  );
+  // Anchor the x-axis at the start of the viewed period with an empty day so
+  // the status chart spans the same range as the other deployment views; the
+  // chart gap-fills the pre-cutoff days as empty bars, avoiding the axis (and
+  // bar widths) shifting when toggling to the status breakdown.
+  const deploymentCountByStatusChartRows = useMemo(() => {
+    if (
+      deploymentCountByStatus === undefined ||
+      deploymentCountByStatus.length === 0 ||
+      !statusRangeBeforeCutoff
+    ) {
+      return deploymentCountByStatus;
+    }
+    return [
+      {
+        ds: shownBillingPeriod.from,
+        metrics: [
+          { tag: "active", value: 0 },
+          { tag: "paused", value: 0 },
+        ],
+      },
+      ...deploymentCountByStatus,
+    ];
+  }, [
+    deploymentCountByStatus,
+    statusRangeBeforeCutoff,
+    shownBillingPeriod.from,
+  ]);
 
   const { data: deploymentCountByType, error: deploymentCountByTypeError } =
     useUsageTeamDeploymentCountByType(
@@ -660,12 +756,14 @@ function DeploymentCountUsage({
           <GroupBySelector
             value={viewMode}
             onChange={setViewMode}
-            options={BUSINESS_GROUP_BY_OPTIONS}
+            options={DEPLOYMENT_GROUP_BY_OPTIONS}
             disabledOptions={
-              classDisabled
+              teamWideDisabled
                 ? {
                     byDeploymentClass:
                       "Deployment class breakdown isn't available when filtered to a single project.",
+                    byStatus:
+                      "Status breakdown isn't available when filtered to a single project.",
                   }
                 : undefined
             }
@@ -701,6 +799,36 @@ function DeploymentCountUsage({
               setSelectedDate={setSelectedDate}
               isGauge
             />
+          )
+        ) : viewMode === "byStatus" ? (
+          deploymentCountByStatusError ? (
+            <UsageDataError entity="Deployments" />
+          ) : deploymentCountByStatus === undefined ? (
+            <ChartLoading />
+          ) : (
+            <div className="flex flex-col gap-2">
+              {deploymentCountByStatus.length === 0 &&
+              statusRangeBeforeCutoff ? (
+                // The whole selected range predates the status data — there are
+                // no bars to render, so reserve the chart's space; the message
+                // explains why it's blank. A post-cutoff range with no rows
+                // falls through to the chart's own no-data state instead.
+                <>
+                  <div className="h-56" />
+                  {statusCutoffNote}
+                </>
+              ) : (
+                <UsageStackedBarChart
+                  rows={deploymentCountByStatusChartRows!}
+                  categories={DEPLOYMENT_STATUS_CATEGORIES}
+                  selectedDate={selectedDate}
+                  setSelectedDate={setSelectedDate}
+                  isGauge
+                  showEmptyCategories
+                  note={statusRangeBeforeCutoff ? statusCutoffNote : undefined}
+                />
+              )}
+            </div>
           )
         ) : deploymentsByClassError ? (
           <UsageDataError entity="Deployments" />
@@ -751,6 +879,13 @@ function FunctionBreakdownSection({
     FUNCTION_BREAKDOWN_TABS_[0];
   const usageByProject = useUsageByProject(metricsByFunction, metric);
 
+  // Counted over every returned row, not `usageByProject`, which drops projects
+  // with no usage of the currently selected metric.
+  const isProjectListTruncated =
+    metricsByFunction !== undefined &&
+    new Set(metricsByFunction.map((row) => row.projectId)).size >=
+      MAX_PROJECTS_IN_BREAKDOWN;
+
   const {
     visibleItems: visibleProjects,
     totalPages,
@@ -796,13 +931,23 @@ function FunctionBreakdownSection({
             />
           </div>
 
-          {totalPages > 1 && (
-            <div className="flex justify-end">
-              <PaginationControls
-                currentPage={currentPage}
-                totalPages={totalPages}
-                onPageChange={setCurrentPage}
-              />
+          {(totalPages > 1 || isProjectListTruncated) && (
+            <div className="flex items-center justify-between gap-4">
+              {isProjectListTruncated ? (
+                <p className="text-xs text-content-secondary">
+                  Showing the {MAX_PROJECTS_IN_BREAKDOWN} highest-usage
+                  projects. Select a project above to see its full breakdown.
+                </p>
+              ) : (
+                <div />
+              )}
+              {totalPages > 1 && (
+                <PaginationControls
+                  currentPage={currentPage}
+                  totalPages={totalPages}
+                  onPageChange={setCurrentPage}
+                />
+              )}
             </div>
           )}
         </div>
@@ -1515,6 +1660,127 @@ function FileStorageUsage({
         )}
       </div>
     </TeamUsageSection>
+  );
+}
+
+function AuditLogBandwidthUsage({
+  team,
+  dateRange,
+  projectId,
+  componentPrefix,
+}: DetailSectionProps) {
+  const [selectedDate, setSelectedDate] = useState<number | null>(null);
+  const { data, error } = useAuditLogBandwidthPerDayByProject(
+    team.id,
+    dateRange,
+    projectId,
+    componentPrefix,
+  );
+
+  return (
+    <TeamUsageSection header={<h3 className="py-2">Audit Log Bandwidth</h3>}>
+      <div className="px-4">
+        {error ? (
+          <UsageDataError entity="Audit log bandwidth" />
+        ) : data === undefined ? (
+          <ChartLoading />
+        ) : (
+          <UsageByProjectChart
+            rows={data}
+            team={team}
+            selectedDate={selectedDate}
+            setSelectedDate={setSelectedDate}
+            quantityType="storage"
+          />
+        )}
+      </div>
+    </TeamUsageSection>
+  );
+}
+
+// There's no fixed list of models — whatever shows up in the data gets a
+// chart color, reusing the palette when there are more models than colors.
+function modelCategories(rows: DailyPerTagMetrics[]) {
+  const models = [
+    ...new Set(rows.flatMap(({ metrics }) => metrics.map(({ tag }) => tag))),
+  ].sort();
+  return Object.fromEntries(
+    models.map((model, i) => [
+      model,
+      { name: model, color: `fill-chart-line-${(i % 8) + 1}` },
+    ]),
+  );
+}
+
+function AiGatewayCostUsage({
+  team,
+  dateRange,
+  projectId,
+  componentPrefix,
+}: DetailSectionProps) {
+  const [viewMode, setViewMode] = useGlobalLocalStorage<AiGatewayGroupBy>(
+    "usageViewMode_aiGateway",
+    "byProject",
+  );
+  const [selectedDate, setSelectedDate] = useState<number | null>(null);
+  const { data, error } = useAiGatewayCostPerDayByProject(
+    team.id,
+    dateRange,
+    projectId,
+    componentPrefix,
+  );
+  const { data: byModel, error: byModelError } = useAiGatewayCostPerDayByModel(
+    team.id,
+    dateRange,
+    viewMode === "byModel" ? projectId : null,
+    componentPrefix,
+  );
+
+  return (
+    <div data-testid="ai-gateway-usage">
+      <TeamUsageSection
+        header={
+          <>
+            <h3 className="py-2">AI Gateway</h3>
+            <GroupBySelector
+              value={viewMode}
+              onChange={setViewMode}
+              options={AI_GATEWAY_GROUP_BY_OPTIONS}
+            />
+          </>
+        }
+      >
+        <div className="px-4">
+          {viewMode === "byModel" ? (
+            byModelError ? (
+              <UsageDataError entity="AI gateway spend" />
+            ) : byModel === undefined ? (
+              <ChartLoading />
+            ) : (
+              <UsageStackedBarChart
+                rows={byModel}
+                categories={modelCategories(byModel)}
+                quantityType="currency"
+                selectedDate={selectedDate}
+                setSelectedDate={setSelectedDate}
+              />
+            )
+          ) : error ? (
+            <UsageDataError entity="AI gateway spend" />
+          ) : data === undefined ? (
+            <ChartLoading />
+          ) : (
+            <UsageByProjectChart
+              rows={data}
+              team={team}
+              selectedDate={selectedDate}
+              setSelectedDate={setSelectedDate}
+              quantityType="currency"
+            />
+          )}
+        </div>
+      </TeamUsageSection>
+    </div>
   );
 }
 

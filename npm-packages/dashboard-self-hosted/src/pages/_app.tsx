@@ -17,6 +17,7 @@ import { SelfHostedDisconnectOverlay } from "@common/features/disconnectOverlay/
 import { Menu, MenuItem } from "@ui/Menu";
 import { ThemeProvider } from "next-themes";
 import React, {
+  JSX,
   useCallback,
   useContext,
   useEffect,
@@ -45,7 +46,12 @@ import { z } from "zod";
 import { UIProvider } from "@ui/UIContext";
 import Link from "next/link";
 
-if (process.env.NEXT_PUBLIC_LOAD_MONACO_INTERNALLY === "true") {
+// Monaco only runs in the browser, and pulling it into the server bundle makes
+// it fail to evaluate there.
+if (
+  typeof window !== "undefined" &&
+  process.env.NEXT_PUBLIC_LOAD_MONACO_INTERNALLY === "true"
+) {
   import("../lib/monacoInternalLoader").then((a) => a).catch(console.error);
 }
 
@@ -320,11 +326,6 @@ const deploymentInfo: Omit<DeploymentInfo, "deploymentUrl" | "adminKey"> = {
   deploymentsURI: "",
   isSelfHosted: true,
   workosIntegrationEnabled: false,
-  logStreamTopicFiltersEnabled: true,
-  schemaPageEnabled: true,
-  // Gated off until the usage limits feature ships; self-hosted has no
-  // LaunchDarkly, so flip this to true at launch.
-  usageLimitsEnabled: false,
   connectionStateCheckIntervalMs: 2500,
 };
 

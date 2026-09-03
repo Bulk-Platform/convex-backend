@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "LicenseRef-FSL-1.1-Apache-2.0"
 
+[package.metadata.cargo-machete]
+ignored = ["convex_macro"]
+
 [features]
 testing = [
     "common/testing",
@@ -45,6 +48,7 @@ proptest-http = { workspace = true, optional = true }
 rand = { workspace = true }
 roles = { workspace = true }
 semver = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sync_types = { workspace = true }
 tokio = { workspace = true }

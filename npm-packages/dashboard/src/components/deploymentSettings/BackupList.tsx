@@ -1,8 +1,7 @@
-import { TeamResponse } from "generatedApi";
 import { PlatformDeploymentResponse } from "@convex-dev/platform/managementApi";
 import { ArchiveIcon } from "@radix-ui/react-icons";
 import { useState } from "react";
-import { useGetZipExport } from "hooks/deploymentApi";
+import { useDownloadZipExport } from "hooks/deploymentApi";
 import { BackupResponse, useListCloudBackupsIfAvailable } from "api/backups";
 import { Loading } from "@ui/Loading";
 import { EmptySection } from "@common/elements/EmptySection";
@@ -14,14 +13,12 @@ import { useLatestRestore } from "./BackupRestoreStatus";
 
 export function BackupList({
   targetDeployment,
-  team,
   canCreate,
   canImport,
   canDelete,
   maxCloudBackups,
 }: {
   targetDeployment: PlatformDeploymentResponse; // = deployment the settings page is open for
-  team: TeamResponse;
   canCreate: boolean;
   canImport: boolean;
   canDelete: boolean;
@@ -52,7 +49,6 @@ export function BackupList({
         <BackupDeploymentSelector
           selectedDeployment={selectedDeployment}
           onChange={setSelectedDeployment}
-          team={team}
           targetDeployment={targetDeployment}
         />
       </div>
@@ -108,7 +104,7 @@ function BackupListForDeployment({
       (backup) => backup.state === "requested" || backup.state === "inProgress",
     );
 
-  const getZipExportUrl = useGetZipExport({
+  const downloadZipExport = useDownloadZipExport({
     format: "zip",
     include_storage: true,
   });
@@ -135,7 +131,7 @@ function BackupListForDeployment({
           someRestoreInProgress={restoringBackupId !== null}
           latestBackupInTargetDeployment={latestBackupInTargetDeployment}
           targetDeployment={targetDeployment}
-          getZipExportUrl={getZipExportUrl}
+          downloadZipExport={downloadZipExport}
           canCreate={canCreate}
           canImport={canImport}
           canDelete={canDelete}

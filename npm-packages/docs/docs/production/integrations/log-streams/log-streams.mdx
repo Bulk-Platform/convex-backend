@@ -269,12 +269,39 @@ Schema:
   - `job_id`: the job within the
     [`_scheduled_functions`](/scheduling/scheduled-functions#retrieving-scheduled-function-status)
     table
+- `run_reason`: string, why this function ran. One of:
+  - `"initialSubscription"`: the first run of a query a client subscribed to
+    over the WebSocket sync protocol.
+  - `"dataChange"`: a rerun of a query whose subscription was invalidated by a
+    write.
+  - `"identityChange"`: a rerun of a query caused by the client's auth identity
+    changing.
+  - `"webSocket"`: a mutation or action called by a client over the WebSocket
+    sync protocol.
+  - `"httpApi"`: called over the HTTP API, e.g. by `ConvexHttpClient`.
+  - `"httpEndpoint"`: an [HTTP action](/functions/http-actions.mdx) serving an
+    incoming request to a route in `http.ts`.
+  - `"cron"`: called by a [cron job](/scheduling/cron-jobs.mdx).
+  - `"scheduler"`: called by the
+    [scheduler](/scheduling/scheduled-functions.mdx).
+  - `"action"`: called from another function via `ctx.runQuery`,
+    `ctx.runMutation`, or `ctx.runAction`.
+  - `"tester"`: a one-off query run via the dashboard's
+    [custom query](/dashboard/deployments/data.mdx#writing-custom-queries)
+    tester or `npx convex run --inline-query`.
 - `usage`:
   - `database_io_read_bytes`: number
   - `database_io_write_bytes`: number, this and `database_io_read_bytes` make up
     the Database I/O used by the function
   - `database_read_documents`: number, the number of documents read by the
     function
+  - `database_write_documents`: number, the number of documents inserted,
+    updated, or deleted by the function
+  - `database_write_index_rows`: number, the number of index entries written by
+    the documents counted in `database_write_documents`. Each document write
+    costs one entry per database index on its table, counting the built-in
+    `by_id` and `by_creation_time` indexes, and changing an indexed field costs
+    a second entry to remove the stale one
   - `text_search_query_bytes`: number
   - `text_search_write_query_bytes`: number, these two fields together track
     text search query usage
@@ -290,9 +317,16 @@ Schema:
   - `network_egress_bytes`: number, the bytes sent to clients or external
     services. This contributes to Data egress alongside
     [`storage_api_bandwidth`](#storage_api_bandwidth-events) events.
+  - `audit_log_egress_bytes`: number, the bytes egressed delivering
+    [audit logs](/production/integrations/audit-logging.mdx) to S3 (if
+    configured for a D1024 deployment).
   - `action_memory_used_mb`: optional number (actions and HTTP actions only),
     the memory used in MiB. This combined with `execution_time_ms` makes up
     Action compute.
+  - `function_args_bytes`: optional number, the size of the arguments the
+    function was called with. Absent for HTTP actions.
+  - `function_returns_bytes`: optional number, the size of the value the
+    function returned. Absent for HTTP actions and for failed executions.
 
 Example event for a query:
 
@@ -307,18 +341,24 @@ Example event for a query:
       "type": "query"
     },
     "status": "success",
+    "run_reason": "initialSubscription",
     "timestamp": 1715973841548,
     "topic": "function_execution",
     "usage": {
       "database_io_read_bytes": 1077,
       "database_io_write_bytes": 0,
       "database_read_documents": 3,
+      "database_write_documents": 0,
+      "database_write_index_rows": 0,
       "file_storage_read_bytes": 0,
       "text_search_query_bytes": 0,
       "text_search_write_query_bytes": 0,
       "vector_search_query_bytes": 0,
       "vector_search_write_query_bytes": 0,
-      "network_egress_bytes": 0
+      "network_egress_bytes": 0,
+      "audit_log_egress_bytes": 0,
+      "function_args_bytes": 12,
+      "function_returns_bytes": 843
     }
   }
 }

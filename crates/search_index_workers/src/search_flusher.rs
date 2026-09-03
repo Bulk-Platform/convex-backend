@@ -49,9 +49,11 @@ use database::{
     IndexBackfillModel,
     IndexModel,
     IndexWorkerMetadataModel,
+    SearchFlusherWakeSubscriber,
     TableScanCursor,
     Token,
 };
+use errors::ErrorMetadataAnyhowExt;
 use futures::{
     StreamExt,
     TryStreamExt,
@@ -173,6 +175,20 @@ impl<RT: Runtime, T: SearchIndex + 'static> SearchFlusher<RT, T> {
         }
     }
 
+    /// Live flushers subscribe to be woken as soon as an in-memory index
+    /// passes the soft limit, instead of waiting for the next poll. Backfill
+    /// flushers don't build in-memory index contents, so they have nothing to
+    /// wake up for.
+    pub(crate) fn wake_subscriber(&self) -> Option<SearchFlusherWakeSubscriber> {
+        match self.flusher_type {
+            FlusherType::LiveFlush => Some(
+                self.database
+                    .subscribe_search_flusher_wake(Self::search_type()),
+            ),
+            FlusherType::Backfill => None,
+        }
+    }
+
     fn index_type_name(&self) -> &'static str {
         match Self::search_type() {
             SearchType::Vector => "vector",
@@ -228,7 +244,23 @@ impl<RT: Runtime, T: SearchIndex + 'static> SearchFlusher<RT, T> {
         build_args: T::BuildIndexArgs,
     ) -> anyhow::Result<u64> {
         let timer = build_one_search_index_timer(T::search_type());
+        match self.build_one_inner(job, build_args).await {
+            Ok(num_documents) => {
+                timer.finish();
+                Ok(num_documents)
+            },
+            Err(e) => {
+                timer.finish_with(e.metric_status_label_value());
+                Err(e)
+            },
+        }
+    }
 
+    async fn build_one_inner(
+        &self,
+        job: IndexBuild<T>,
+        build_args: T::BuildIndexArgs,
+    ) -> anyhow::Result<u64> {
         let result = self.build_multipart_segment(&job, build_args).await?;
         tracing::debug!(
             "Built a {} segment for: {result:#?}",
@@ -260,7 +292,6 @@ impl<RT: Runtime, T: SearchIndex + 'static> SearchFlusher<RT, T> {
             index_stats.num_non_deleted_documents(),
             Self::search_type(),
         );
-        timer.finish();
 
         Ok(new_segment_stats.num_documents())
     }
@@ -331,7 +362,7 @@ impl<RT: Runtime, T: SearchIndex + 'static> SearchFlusher<RT, T> {
             };
             if let Some(build_reason) = needs_backfill {
                 if FlusherType::from(build_reason) != self.flusher_type {
-                    tracing::info!(
+                    tracing::debug!(
                         "Skipping build for index {name} with id {index_id} and {build_reason:?} \
                          because it is a {:?} flusher",
                         self.flusher_type

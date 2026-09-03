@@ -4,6 +4,7 @@ use std::{
         HashMap,
     },
     fmt,
+    sync::Arc,
     time::{
         Duration,
         SystemTime,
@@ -15,6 +16,7 @@ use biscuit::JWT;
 use chrono::DateTime;
 pub use common::types::SystemKey;
 use common::{
+    audit_log_lines::ConvexActorVar,
     components::ComponentId,
     identity::{
         IdentityCacheKey,
@@ -80,6 +82,7 @@ use pb::{
             StoreFile as StoreFileProto,
         },
         AdminKey as AdminKeyProto,
+        ExportDownloadToken as ExportDownloadTokenProto,
         StorageToken as StorageTokenProto,
     },
     convex_query_journal::InstanceQueryJournal as InstanceQueryJournalProto,
@@ -117,6 +120,7 @@ use crate::{
 const ACTION_KEY_VERSION: u8 = 2;
 const ADMIN_KEY_VERSION: u8 = 1;
 const CURSOR_VERSION: u8 = 7;
+const EXPORT_DOWNLOAD_KEY_VERSION: u8 = 1;
 const STORE_FILE_AUTHZ_VERSION: u8 = 1;
 const QUERY_JOURNAL_VERSION: u8 = 7;
 
@@ -130,6 +134,8 @@ pub struct KeyBroker {
     admin_key_encryptor: RandomEncryptor,
     action_callback_encryptor: RandomEncryptor,
     cursor_encryptor: DeterministicEncryptor,
+    data_sync_encryptor: RandomEncryptor,
+    export_download_encryptor: RandomEncryptor,
     journal_encryptor: RandomEncryptor,
     store_file_encryptor: RandomEncryptor,
 }
@@ -146,7 +152,7 @@ pub enum Identity {
     User(UserIdentity),
     // ActingUser keeps track of the ID of the admin acting as a user,
     // and that user's fake attributes
-    ActingUser(AdminIdentity, UserIdentityAttributes),
+    ActingUser(AdminIdentity, Arc<UserIdentityAttributes>),
     // Unknown(None) means no identity was provided.
     // Unknown(Some(error_message)) means an error occurred while parsing the identity.
     // We allow the request to go through, but keep the error to throw when code tries to
@@ -159,7 +165,7 @@ impl From<Identity> for AuthenticationToken {
         match i {
             Identity::User(identity) => AuthenticationToken::User(identity.original_token),
             Identity::ActingUser(identity, user) => {
-                AuthenticationToken::Admin(identity.key, Some(user))
+                AuthenticationToken::Admin(identity.key, Some(Arc::unwrap_or_clone(user)))
             },
             Identity::DeploymentAdmin(identity) => AuthenticationToken::Admin(identity.key, None),
             _ => AuthenticationToken::None,
@@ -182,7 +188,7 @@ impl TryFrom<Identity> for pb::convex_identity::UncheckedIdentity {
             Identity::ActingUser(admin_identity, attributes) => {
                 UncheckedIdentityProto::ActingUser(ActingUser {
                     admin_identity: Some(admin_identity.try_into()?),
-                    attributes: Some(attributes.into()),
+                    attributes: Some(Arc::unwrap_or_clone(attributes).into()),
                 })
             },
             Identity::Unknown(error_message) => UncheckedIdentityProto::Unknown(UnknownIdentity {
@@ -229,7 +235,10 @@ impl Identity {
                 )?;
                 let attributes =
                     attributes.ok_or_else(|| anyhow::anyhow!("Missing user attributes"))?;
-                Ok(Identity::ActingUser(admin_identity, attributes.try_into()?))
+                Ok(Identity::ActingUser(
+                    admin_identity,
+                    Arc::new(attributes.try_into()?),
+                ))
             },
             UncheckedIdentityProto::Unknown(UnknownIdentity { error_message }) => Ok(
                 Identity::Unknown(error_message.map(|e| e.try_into()).transpose()?),
@@ -271,13 +280,13 @@ impl From<Identity> for InertIdentity {
             Identity::DeploymentAdmin(i) => InertIdentity::DeploymentAdmin(i.deployment_name),
             Identity::System(_) => InertIdentity::System,
             Identity::Unknown(_) => InertIdentity::Unknown,
-            Identity::User(user) => InertIdentity::User(user.attributes.token_identifier),
+            Identity::User(user) => InertIdentity::User(user.attributes.token_identifier.clone()),
             Identity::ActingUser(identity, user) => match identity.principal {
                 AdminIdentityPrincipal::Member(member_id) => {
-                    InertIdentity::MemberActingUser(member_id, user.token_identifier)
+                    InertIdentity::MemberActingUser(member_id, user.token_identifier.clone())
                 },
                 AdminIdentityPrincipal::Team(team_id) => {
-                    InertIdentity::TeamActingUser(team_id, user.token_identifier)
+                    InertIdentity::TeamActingUser(team_id, user.token_identifier.clone())
                 },
             },
         }
@@ -351,6 +360,33 @@ impl Identity {
         matches!(self, Identity::ActingUser(..))
     }
 
+    pub fn convex_actor_var(&self) -> Option<ConvexActorVar> {
+        let admin_identity = match self {
+            Identity::DeploymentAdmin(admin_identity) | Identity::ActingUser(admin_identity, _) => {
+                admin_identity
+            },
+            Identity::System(_) | Identity::User(_) | Identity::Unknown(_) => return None,
+        };
+        // Mirror `model::deployment_audit_log::types::DeploymentAuditLogActor`: an
+        // identity backed by an access token is a `Token` (with the member that
+        // owns the token, if any), otherwise a member-authenticated identity is a
+        // `Member`.
+        let member_id = match admin_identity.principal {
+            AdminIdentityPrincipal::Member(member_id) => Some(member_id.0),
+            AdminIdentityPrincipal::Team(_) => None,
+        };
+        Some(match admin_identity.token_id {
+            Some(token_id) => ConvexActorVar::Token {
+                member_id,
+                token_id: token_id.0,
+                client_id: admin_identity.app_client_id.clone(),
+            },
+            None => ConvexActorVar::Member {
+                member_id: member_id?,
+            },
+        })
+    }
+
     pub fn is_user(&self) -> bool {
         matches!(self, Identity::User(..))
     }
@@ -419,7 +455,7 @@ pub struct UserIdentity {
     // Might be useful for developers to know which provider authenticated this user.
     pub issuer: String,
     pub expiration: SystemTime,
-    pub attributes: UserIdentityAttributes,
+    pub attributes: Arc<UserIdentityAttributes>,
     // The original token this user identity was created from. This may either by an
     // OIDC JWT or a custom JWT.
     pub original_token: String,
@@ -439,7 +475,7 @@ impl From<UserIdentity> for pb::convex_identity::UserIdentity {
             subject: Some(subject),
             issuer: Some(issuer),
             expiration: Some(expiration.into()),
-            attributes: Some(attributes.into()),
+            attributes: Some(Arc::unwrap_or_clone(attributes).into()),
             original_token: Some(original_token),
         }
     }
@@ -506,7 +542,8 @@ impl UserIdentity {
                 issuer: Some(issuer.clone()),
                 custom_claims,
                 ..Default::default()
-            },
+            }
+            .into(),
             original_token,
         })
     }
@@ -597,7 +634,8 @@ impl UserIdentity {
                     .map(|f| f.to_string()),
                 updated_at: claims.updated_at().map(|dt| dt.to_rfc3339()),
                 custom_claims,
-            },
+            }
+            .into(),
         })
     }
 
@@ -615,10 +653,11 @@ impl UserIdentity {
             .expiration
             .ok_or_else(|| anyhow::anyhow!("Missing expiration"))?
             .try_into()?;
-        let attributes = msg
-            .attributes
-            .ok_or_else(|| anyhow::anyhow!("Missing user identity attributes"))?
-            .try_into()?;
+        let attributes = Arc::new(
+            msg.attributes
+                .ok_or_else(|| anyhow::anyhow!("Missing user identity attributes"))?
+                .try_into()?,
+        );
         let original_token = msg
             .original_token
             .ok_or_else(|| anyhow::anyhow!("Missing original_token"))?
@@ -657,6 +696,16 @@ fn extract_custom_jwt_claims(
 pub enum AdminIdentityPrincipal {
     Member(MemberId),
     Team(TeamId),
+}
+
+/// The actor that requested an export download token, recorded in the token
+/// so each download can be attributed (e.g. for audit logging): the member
+/// and/or the big brain access token (e.g. a deploy key) that authenticated
+/// the request. Both are `None` for system actors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExportDownloadActor {
+    pub member_id: Option<MemberId>,
+    pub token_id: Option<AccessTokenId>,
 }
 
 /// AdminIdentityExpired - means that the identity has been around for too long
@@ -879,6 +928,14 @@ impl KeyBroker {
                 &deployment_secret,
                 Purpose::CURSOR,
             )?,
+            data_sync_encryptor: RandomEncryptor::derive_from_secret(
+                &deployment_secret,
+                Purpose::DATA_SYNC_CURSOR,
+            )?,
+            export_download_encryptor: RandomEncryptor::derive_from_secret(
+                &deployment_secret,
+                Purpose::EXPORT_DOWNLOAD_TOKEN,
+            )?,
             journal_encryptor: RandomEncryptor::derive_from_secret(
                 &deployment_secret,
                 Purpose::QUERY_JOURNAL,
@@ -904,6 +961,11 @@ impl KeyBroker {
             DeploymentSecret::try_from(LOCAL_DEV_SECRET).unwrap(),
         )
         .unwrap()
+    }
+
+    /// Encryptor for data sync (streaming export) cursors.
+    pub fn data_sync_encryptor(&self) -> &RandomEncryptor {
+        &self.data_sync_encryptor
     }
 
     pub fn function_runner_keybroker(&self) -> FunctionRunnerKeyBroker {
@@ -1171,6 +1233,77 @@ impl KeyBroker {
         let system_time = SystemTime::UNIX_EPOCH + Duration::from_secs(issued_s);
         let component_id = ComponentId::deserialize_from_string(component_id.as_deref())?;
         Ok((system_time, component_id))
+    }
+
+    /// Issues a short-lived token authorizing the download of a single snapshot
+    /// export. This lets the dashboard trigger a browser download without
+    /// putting the long-lived admin key in the URL. The token records the
+    /// actor that requested it so each download can be audit logged.
+    pub fn issue_export_download_token(
+        &self,
+        snapshot_id: String,
+        actor: ExportDownloadActor,
+    ) -> String {
+        let now = SystemTime::now();
+        let since_epoch = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Failed to compute seconds since epoch?");
+
+        let proto = ExportDownloadTokenProto {
+            issued_s: since_epoch.as_secs(),
+            snapshot_id,
+            member_id: actor.member_id.map(|m| m.0),
+            token_id: actor.token_id.map(|t| t.0),
+        };
+
+        self.export_download_encryptor
+            .encrypt_proto(EXPORT_DOWNLOAD_KEY_VERSION, &proto)
+    }
+
+    /// Checks that an export download token is valid for the given snapshot id
+    /// and was issued within `validity` ago. Returns the actor that requested
+    /// the token, for audit logging.
+    pub fn check_export_download_token(
+        &self,
+        token: &str,
+        snapshot_id: &str,
+        validity: Duration,
+    ) -> anyhow::Result<ExportDownloadActor> {
+        let ExportDownloadTokenProto {
+            issued_s,
+            snapshot_id: token_snapshot_id,
+            member_id,
+            token_id,
+        } = self
+            .export_download_encryptor
+            .decrypt_proto(EXPORT_DOWNLOAD_KEY_VERSION, token)
+            .context(ErrorMetadata::forbidden(
+                "InvalidExportDownloadToken",
+                "Invalid export download token",
+            ))?;
+
+        if issued_s == 0 || token_snapshot_id != snapshot_id {
+            anyhow::bail!(ErrorMetadata::forbidden(
+                "InvalidExportDownloadToken",
+                "Invalid export download token",
+            ));
+        }
+
+        let now = SystemTime::now();
+        let since_epoch = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Failed to compute seconds since epoch?")
+            .as_secs();
+        if issued_s + validity.as_secs() <= since_epoch {
+            anyhow::bail!(ErrorMetadata::forbidden(
+                "ExportDownloadTokenExpired",
+                "This download link has expired. Please retry the download.",
+            ));
+        }
+        Ok(ExportDownloadActor {
+            member_id: member_id.map(MemberId),
+            token_id: token_id.map(AccessTokenId),
+        })
     }
 }
 

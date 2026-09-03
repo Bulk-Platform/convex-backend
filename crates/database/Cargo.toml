@@ -5,9 +5,6 @@ authors = ["Convex, Inc. <no-reply@convex.dev>"]
 edition = "2024"
 license = "LicenseRef-FSL-1.1-Apache-2.0"
 
-[package.metadata.cargo-udeps.ignore]
-development = ["criterion"]
-
 [lib]
 doctest = false
 
@@ -64,7 +61,6 @@ pb = { workspace = true }
 prometheus = { workspace = true }
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
-qdrant_segment = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 roles = { workspace = true }
@@ -76,9 +72,9 @@ shape_inference = { workspace = true }
 short_future = { workspace = true }
 slab = { workspace = true }
 storage = { workspace = true }
+strum = { workspace = true }
 sync_types = { workspace = true }
 table_iteration = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }

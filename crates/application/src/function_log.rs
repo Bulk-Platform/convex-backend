@@ -36,6 +36,7 @@ use common::{
         self,
         FunctionConcurrencyStats,
         FunctionEventSource,
+        FunctionRunReason,
         LogEvent,
         LogSender,
         SchedulerInfo,
@@ -51,16 +52,14 @@ use common::{
         FunctionCaller,
         HttpActionRoute,
         ModuleEnvironment,
+        QueryInvocation,
         TableName,
         TableStats,
         UdfIdentifier,
         UdfType,
     },
 };
-use http::{
-    Method,
-    StatusCode,
-};
+use http::StatusCode;
 use itertools::Itertools;
 use parking_lot::Mutex;
 use serde_json::{
@@ -90,7 +89,6 @@ use udf_metrics::{
     Timeseries,
     UdfMetricsError,
 };
-use url::Url;
 use usage_tracking::{
     AggregatedFunctionUsageStats,
     CallType,
@@ -156,6 +154,8 @@ pub struct FunctionExecution {
     /// Usage statistics for this instance
     pub usage_stats: AggregatedFunctionUsageStats,
     pub memory_used_mb: u64,
+    /// Size of the serialized arguments in bytes, excluding HTTP actions.
+    pub args_bytes: Option<u64>,
     /// Size of the returned value in bytes if the function execution was
     /// successful, excluding HTTP actions.
     pub return_bytes: Option<u64>,
@@ -183,6 +183,9 @@ pub struct FunctionExecution {
     /// Whether this function will be retried (e.g. a mutation that OCCs or hits
     /// write throughput limits)
     pub will_retry: bool,
+
+    // Whether this was a fresh call or a rerun. Only applicable for queries.
+    pub query_invocation: Option<QueryInvocation>,
 }
 
 impl HeapSize for FunctionExecution {
@@ -284,12 +287,15 @@ impl FunctionExecution {
                     }),
                     _ => None,
                 },
+                run_reason: FunctionRunReason::new(&self.caller, self.query_invocation),
                 usage_stats: log_streaming::AggregatedFunctionUsageStats {
                     database_read_bytes: self.usage_stats.database_read_bytes,
                     database_write_bytes: self.usage_stats.database_write_bytes,
                     database_io_read_bytes: self.usage_stats.database_io_read_bytes,
                     database_io_write_bytes: self.usage_stats.database_io_write_bytes,
                     database_read_documents: self.usage_stats.database_read_documents,
+                    database_write_documents: self.usage_stats.database_write_documents,
+                    database_write_index_rows: self.usage_stats.database_write_index_rows,
                     storage_read_bytes: self.usage_stats.storage_read_bytes,
                     storage_write_bytes: self.usage_stats.storage_write_bytes,
                     vector_index_read_bytes: self.usage_stats.vector_index_read_bytes,
@@ -300,6 +306,7 @@ impl FunctionExecution {
                     vector_index_write_query_bytes: self.usage_stats.vector_index_write_query_bytes,
                     network_egress_bytes: self.usage_stats.network_egress_bytes,
                     memory_used_mb: self.memory_used_mb,
+                    args_bytes: self.args_bytes,
                     return_bytes: self.return_bytes,
                     audit_log_egress_bytes: self.usage_stats.audit_log_egress_bytes,
                 },
@@ -453,27 +460,6 @@ impl UdfParams {
             Self::Function { identifier, .. } => identifier.udf_path.clone().strip().to_string(),
             Self::Http { identifier, .. } => identifier.to_string(),
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct HttpActionRequest {
-    url: Url,
-    method: Method,
-}
-
-impl HeapSize for HttpActionRequest {
-    fn heap_size(&self) -> usize {
-        self.url.as_str().len()
-    }
-}
-
-impl From<HttpActionRequest> for serde_json::Value {
-    fn from(value: HttpActionRequest) -> Self {
-        json!({
-            "url": value.url.to_string(),
-            "method": value.method.to_string()
-        })
     }
 }
 
@@ -643,6 +629,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         caller: FunctionCaller,
         usage_tracking: FunctionUsageTracker,
         context: ExecutionContext,
+        query_invocation: QueryInvocation,
     ) {
         self._log_query(
             outcome,
@@ -652,6 +639,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             caller,
             TrackUsage::Track(usage_tracking),
             context,
+            query_invocation,
         )
         .await
     }
@@ -665,6 +653,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         start: tokio::time::Instant,
         caller: FunctionCaller,
         context: ExecutionContext,
+        query_invocation: QueryInvocation,
     ) -> anyhow::Result<()> {
         // TODO: We currently synthesize a `UdfOutcome` for
         // an internal system error. If we decide we want to keep internal system errors
@@ -685,6 +674,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             caller,
             TrackUsage::SystemError,
             context,
+            query_invocation,
         )
         .await;
         Ok(())
@@ -700,6 +690,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         caller: FunctionCaller,
         usage: TrackUsage,
         context: ExecutionContext,
+        query_invocation: QueryInvocation,
     ) {
         let aggregated = match usage {
             TrackUsage::Track(usage_tracker) => {
@@ -730,6 +721,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         if outcome.path.is_system() {
             return;
         }
+        let args_bytes = Some(outcome.arguments.heap_size() as u64);
         let return_bytes = outcome.result.as_ref().ok().map(|v| v.heap_size() as u64);
         let execution = FunctionExecution {
             params: UdfParams::Function {
@@ -753,6 +745,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             syscall_trace: outcome.syscall_trace.clone(),
             usage_stats: aggregated,
             memory_used_mb: outcome.memory_in_mb,
+            args_bytes,
             return_bytes,
             udf_server_version: outcome.udf_server_version.clone(),
             identity: outcome.identity.clone(),
@@ -760,6 +753,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             mutation_retry_count: None,
             occ_info: None,
             will_retry: false,
+            query_invocation: Some(query_invocation),
         };
         self.log_execution(execution, true, true);
     }
@@ -934,6 +928,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         if outcome.path.udf_path.is_system() {
             return;
         }
+        let args_bytes = Some(outcome.arguments.heap_size() as u64);
         let return_bytes = outcome.result.as_ref().ok().map(|v| v.heap_size() as u64);
         let execution = FunctionExecution {
             params: UdfParams::Function {
@@ -954,6 +949,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             syscall_trace: outcome.syscall_trace,
             usage_stats: aggregated,
             memory_used_mb: outcome.memory_in_mb,
+            args_bytes,
             return_bytes,
             udf_server_version: outcome.udf_server_version,
             identity: outcome.identity,
@@ -961,6 +957,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             mutation_retry_count: Some(mutation_retry_count),
             occ_info,
             will_retry,
+            query_invocation: None,
         };
         self.log_execution(execution, true, true);
     }
@@ -1031,6 +1028,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         if outcome.path.udf_path.is_system() {
             return;
         }
+        let args_bytes = Some(outcome.arguments.heap_size() as u64);
         let return_bytes = outcome.result.as_ref().ok().map(|v| v.heap_size() as u64);
         let execution = FunctionExecution {
             params: UdfParams::Function {
@@ -1051,6 +1049,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             syscall_trace: outcome.syscall_trace,
             usage_stats: aggregated,
             memory_used_mb: completion.memory_in_mb,
+            args_bytes,
             return_bytes,
             udf_server_version: outcome.udf_server_version,
             identity: outcome.identity,
@@ -1058,6 +1057,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             mutation_retry_count: None,
             occ_info: None,
             will_retry: false,
+            query_invocation: None,
         };
         self.log_execution(execution, /* send_console_events */ false, true)
     }
@@ -1211,6 +1211,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             environment: ModuleEnvironment::Isolate,
             usage_stats: aggregated,
             memory_used_mb: outcome.memory_in_mb(),
+            args_bytes: None,
             return_bytes: None,
             syscall_trace: outcome.syscall_trace,
             udf_server_version: outcome.udf_server_version,
@@ -1219,6 +1220,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             mutation_retry_count: None,
             occ_info: None,
             will_retry: false,
+            query_invocation: None,
         };
         self.log_execution(
             execution,

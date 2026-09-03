@@ -14,12 +14,14 @@ use ::authentication::{
     access_token_auth::NullAccessTokenAuth,
     application_auth::ApplicationAuth,
 };
+use ::usage_limits::NoopUsageLimitNotifier;
 use application::{
     self,
     api::ApplicationApi,
     log_visibility::RedactLogsToClient,
     Application,
     QueryCache,
+    SourceMapCache,
 };
 use common::{
     self,
@@ -78,6 +80,7 @@ use search::{
     SegmentTermMetadataFetcher,
 };
 use serde::Serialize;
+pub use sync::subscription_reconnect::SubscriptionReconnectRateLimiter;
 
 pub mod admin;
 mod app_metrics;
@@ -139,6 +142,7 @@ impl LocalAppState {
 pub struct RouterState {
     pub api: Arc<dyn ApplicationApi>,
     pub runtime: ProdRuntime,
+    pub subscription_reconnect_rate_limiter: Option<Arc<SubscriptionReconnectRateLimiter>>,
 }
 
 #[derive(Serialize)]
@@ -170,6 +174,7 @@ pub async fn make_app(
             Quota::per_second(*DOCUMENT_RETENTION_RATE_LIMIT),
         )),
         deleted_tablet_sender,
+        config.name(),
     )
     .await?;
     initialize_application_system_tables(&database).await?;
@@ -242,6 +247,7 @@ pub async fn make_app(
         file_storage.clone(),
         application_storage,
         usage_event_logger,
+        Arc::new(NoopUsageLimitNotifier),
         key_broker.clone(),
         DeploymentMetadata {
             name: config.name(),
@@ -268,6 +274,8 @@ pub async fn make_app(
         Arc::new(InProcessExportProvider),
         deleted_tablet_receiver,
         oidc_http_client,
+        None,
+        SourceMapCache::new(runtime.clone()),
     )
     .await?;
 

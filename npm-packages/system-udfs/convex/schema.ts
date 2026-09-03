@@ -68,23 +68,23 @@ const CronSchedule = v.union(
   }),
   v.object({
     type: v.literal("hourly"),
-    minuteUTC: v.int64(),
+    minuteUTC: v.optional(v.int64()),
   }),
   v.object({
     type: v.literal("daily"),
-    minuteUTC: v.int64(),
+    minuteUTC: v.optional(v.int64()),
     hourUTC: v.int64(),
   }),
   v.object({
     type: v.literal("weekly"),
     dayOfWeek: v.int64(),
     hourUTC: v.int64(),
-    minuteUTC: v.int64(),
+    minuteUTC: v.optional(v.int64()),
   }),
   v.object({
     type: v.literal("monthly"),
     day: v.int64(),
-    minuteUTC: v.int64(),
+    minuteUTC: v.optional(v.int64()),
     hourUTC: v.int64(),
   }),
   v.object({
@@ -386,6 +386,9 @@ export default defineSchema({
     name: v.union(v.string(), v.null()),
     args: v.union(v.array(v.any()), v.null()),
     state: v.optional(v.union(v.literal("active"), v.literal("unmounted"))),
+    // Absolute path this component's HTTP routes are served under: the app's
+    // `httpPrefix` for the root, the mount path in the parent for children.
+    httpPrefix: v.optional(v.union(v.string(), v.null())),
   }),
   _modules: defineTable({
     path: v.string(),
@@ -441,7 +444,12 @@ export default defineSchema({
         state: v.literal("requested"),
         requestor: exportRequestor,
       }),
-      // TODO: add canceled
+      v.object({
+        state: v.literal("canceled"),
+        start_ts: v.optional(v.union(v.null(), v.int64())),
+        canceled_ts: v.int64(),
+        requestor: exportRequestor,
+      }),
     ),
   ).index("by_requestor", ["requestor"]),
   _deployment_audit_log: deploymentAuditLogTable,

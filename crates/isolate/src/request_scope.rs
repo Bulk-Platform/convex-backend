@@ -25,7 +25,6 @@ use deno_core::{
         callback_scope,
     },
 };
-use encoding_rs::Decoder;
 use errors::{
     ErrorMetadata,
     ErrorMetadataAnyhowExt,
@@ -43,8 +42,9 @@ use crate::{
         ToV8 as _,
     },
     environment::{
-        IsolateEnvironment,
+        OpProvider,
         UncatchableDeveloperError,
+        V8IsolateEnvironment,
     },
     execution_scope::{
         ExecutionScope,
@@ -64,14 +64,14 @@ use crate::{
     },
     module_map::ModuleMap,
     ops::{
-        run_op,
+        run_v8_op,
         start_async_op,
     },
     strings,
     termination::{
         ContextId,
         ContextTerminationReason,
-        IsolateHandle,
+        ExecutionHandle,
         IsolateTerminationReason,
     },
 };
@@ -80,19 +80,18 @@ use crate::{
 /// that's set up with our `RequestState` and `ModuleMap`. This scope lasts for
 /// the entirety of a request, where executing code may enter into potentially
 /// nested [`ExecutionScope`]s.
-pub struct RequestScope<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> {
-    // NB: The default type parameter to `HandleScope` indicates that it has a `Context`, so
-    // this scope is attached to our request's context. The `v8::HandleScope<()>`, on
-    // the other hand, does not have a currently executing context.
+pub struct RequestScope<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> {
+    // NB: The default type parameter to `PinScope` indicates that it has a `Context`, so
+    // this scope is attached to our request's context.
     pub(crate) scope: &'a mut v8::PinScope<'s, 'i>,
-    pub(crate) handle: IsolateHandle,
+    pub(crate) handle: ExecutionHandle,
     pub(crate) _pd: PhantomData<(RT, E)>,
 }
 
 /// Custom per-request state. All environments have a timeout.
-/// Note the IsolateHandle and ModuleMap are stored on separate slots, so
+/// Note the ExecutionHandle and ModuleMap are stored on separate slots, so
 /// they can be fetched without needing the environment type E.
-pub struct RequestState<RT: Runtime, E: IsolateEnvironment<RT>> {
+pub struct RequestState<RT: Runtime, E: V8IsolateEnvironment<RT>> {
     pub rt: RT,
     pub environment: E,
     pub context_id: ContextId,
@@ -102,12 +101,9 @@ pub struct RequestState<RT: Runtime, E: IsolateEnvironment<RT>> {
     /// Tracks bytes read in HTTP action requests
     pub request_stream_state: Option<RequestStreamState>,
     pub console_timers: WithHeapSize<BTreeMap<String, UnixTimestamp>>,
-    // This is not wrapped in `WithHeapSize` so we can return `&mut TextDecoderStream`.
-    // Additionally, `TextDecoderResource` should have a fairly small heap size.
-    pub text_decoders: BTreeMap<uuid::Uuid, TextDecoderResource>,
 }
 
-impl<RT: Runtime, E: IsolateEnvironment<RT>> RequestState<RT, E> {
+impl<RT: Runtime, E: V8IsolateEnvironment<RT>> RequestState<RT, E> {
     pub fn new(rt: RT, environment: E, context_id: ContextId) -> Self {
         RequestState {
             rt,
@@ -117,7 +113,6 @@ impl<RT: Runtime, E: IsolateEnvironment<RT>> RequestState<RT, E> {
             stream_listeners: WithHeapSize::default(),
             request_stream_state: None,
             console_timers: WithHeapSize::default(),
-            text_decoders: BTreeMap::new(),
         }
     }
 }
@@ -148,11 +143,6 @@ impl RequestStreamState {
     }
 }
 
-pub struct TextDecoderResource {
-    pub decoder: Decoder,
-    pub fatal: bool,
-}
-
 #[derive(Debug, Default)]
 pub struct ReadableStream {
     pub parts: WithHeapSize<VecDeque<bytes::Bytes>>,
@@ -177,9 +167,11 @@ impl HeapSize for StreamListener {
     }
 }
 
-impl<RT: Runtime, E: IsolateEnvironment<RT>> RequestState<RT, E> {
+impl<RT: Runtime, E: V8IsolateEnvironment<RT>> RequestState<RT, E> {
     pub fn create_stream(&mut self) -> anyhow::Result<uuid::Uuid> {
-        let uuid = uuid::Builder::from_random_bytes(self.environment.rng()?.random()).into_uuid();
+        let uuid =
+            uuid::Builder::from_random_bytes(self.environment.syscall_provider().rng()?.random())
+                .into_uuid();
         self.streams.insert(uuid, Ok(ReadableStream::default()));
         Ok(uuid)
     }
@@ -188,37 +180,6 @@ impl<RT: Runtime, E: IsolateEnvironment<RT>> RequestState<RT, E> {
         let uuid = self.create_stream()?;
         self.request_stream_state = Some(RequestStreamState::new(uuid));
         Ok(uuid)
-    }
-
-    pub fn create_text_decoder(
-        &mut self,
-        decoder: TextDecoderResource,
-    ) -> anyhow::Result<uuid::Uuid> {
-        let uuid = uuid::Builder::from_random_bytes(self.environment.rng()?.random()).into_uuid();
-        self.text_decoders.insert(uuid, decoder);
-        Ok(uuid)
-    }
-
-    pub fn get_text_decoder(
-        &mut self,
-        decoder_id: &uuid::Uuid,
-    ) -> anyhow::Result<&mut TextDecoderResource> {
-        let decoder = self
-            .text_decoders
-            .get_mut(decoder_id)
-            .ok_or_else(|| anyhow::anyhow!("Text decoder resource not found"))?;
-        Ok(decoder)
-    }
-
-    pub fn remove_text_decoder(
-        &mut self,
-        decoder_id: &uuid::Uuid,
-    ) -> anyhow::Result<TextDecoderResource> {
-        let decoder = self
-            .text_decoders
-            .remove(decoder_id)
-            .ok_or_else(|| anyhow::anyhow!("Text decoder resource not found"))?;
-        Ok(decoder)
     }
 
     /// As the name implies, the time returned by this function would be a
@@ -231,10 +192,10 @@ impl<RT: Runtime, E: IsolateEnvironment<RT>> RequestState<RT, E> {
     }
 }
 
-impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 's, 'i, RT, E> {
+impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> RequestScope<'a, 's, 'i, RT, E> {
     pub fn with_existing_context(
         scope: &'a mut v8::PinScope<'s, 'i>,
-        handle: IsolateHandle,
+        handle: ExecutionHandle,
         state: RequestState<RT, E>,
         allow_dynamic_imports: bool,
         module_map: ModuleMap,
@@ -265,7 +226,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a
     #[fastrace::trace]
     pub fn new(
         scope: &'a mut v8::PinScope<'s, 'i>,
-        handle: IsolateHandle,
+        handle: ExecutionHandle,
         state: RequestState<RT, E>,
         allow_dynamic_imports: bool,
     ) -> anyhow::Result<Self> {
@@ -324,7 +285,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a
         Ok(isolate_context)
     }
 
-    pub fn handle(&self) -> IsolateHandle {
+    pub fn handle(&self) -> ExecutionHandle {
         self.handle.clone()
     }
 
@@ -334,7 +295,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a
         rv: v8::ReturnValue,
     ) {
         let mut scope = ExecutionScope::<RT, E>::new(scope);
-        if let Err(e) = run_op(&mut scope, args, rv) {
+        if let Err(e) = run_v8_op(&mut scope, args, rv) {
             Self::handle_syscall_or_op_error(&mut scope, e)
         }
     }
@@ -598,7 +559,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a
     }
 }
 
-impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> Drop
+impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> Drop
     for RequestScope<'a, 's, 'i, RT, E>
 {
     fn drop(&mut self) {

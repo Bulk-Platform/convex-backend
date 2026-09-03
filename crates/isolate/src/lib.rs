@@ -18,7 +18,7 @@ pub mod client;
 mod concurrency_limiter;
 pub mod context_cache;
 mod context_local_state;
-mod convert_v8;
+pub mod convert_v8;
 pub mod environment;
 pub mod error;
 mod execution_scope;
@@ -30,11 +30,11 @@ pub mod isolate_worker;
 pub mod metrics;
 pub mod module_cache;
 pub mod module_map;
-mod ops;
+pub mod ops;
 mod request_scope;
 pub mod strings;
 mod termination;
-mod timeout;
+pub mod timeout;
 mod udf_runtime;
 
 pub use self::{
@@ -53,7 +53,6 @@ pub use self::{
         deserialize_udf_custom_error,
         deserialize_udf_result,
         format_uncaught_error,
-        UdfArgsJson,
     },
     isolate::IsolateHeapStats,
     metrics::{
@@ -61,5 +60,12 @@ pub use self::{
         log_source_map_token_lookup_failed,
     },
     request_scope::RequestScope,
-    timeout::Timeout,
+    termination::{
+        ContextId,
+        ExecutionHandle,
+    },
+    timeout::{
+        start_cooperative_request,
+        Timeout,
+    },
 };

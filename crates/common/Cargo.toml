@@ -5,9 +5,8 @@ authors = ["Convex, Inc. <no-reply@convex.dev>"]
 edition = "2024"
 license = "LicenseRef-FSL-1.1-Apache-2.0"
 
-[package.metadata.cargo-udeps.ignore]
-normal = ["proptest", "proptest-derive"]
-development = ["proptest", "proptest-derive"]
+[package.metadata.cargo-machete]
+ignored = ["flate2"]
 
 [lib]
 doctest = false
@@ -41,6 +40,7 @@ bytes = { workspace = true }
 clap = { workspace = true }
 cmd_util = { workspace = true }
 compact_str = { workspace = true }
+const-hex = { workspace = true }
 crossbeam-channel = { workspace = true }
 csf = { workspace = true }
 cstr = { workspace = true }
@@ -56,7 +56,6 @@ futures-async-stream = { workspace = true }
 futures-util = { workspace = true }
 governor = { workspace = true }
 headers = { workspace = true }
-hex = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 humansize = { workspace = true }
@@ -128,6 +127,7 @@ proptest = { workspace = true }
 proptest-derive = { workspace = true }
 proptest-http = { workspace = true }
 rand_chacha = { workspace = true }
+sentry = { workspace = true, features = ["test"] }
 shape_inference = { workspace = true, features = ["testing"] }
 sync_types = { workspace = true, features = [
     "testing",

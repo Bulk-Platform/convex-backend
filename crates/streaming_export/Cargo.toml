@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "LicenseRef-FSL-1.1-Apache-2.0"
 
+[package.metadata.cargo-machete]
+ignored = ["prost"]
+
 [lib]
 doctest = false
 
@@ -11,6 +14,7 @@ doctest = false
 testing = [
     "common/testing",
     "database/testing",
+    "errors/testing",
     "keybroker/testing",
     "table_iteration/testing",
     "usage_tracking/testing",
@@ -21,6 +25,7 @@ testing = [
 anyhow = { workspace = true }
 common = { workspace = true }
 database = { workspace = true }
+errors = { workspace = true }
 fastrace = { workspace = true }
 keybroker = { workspace = true }
 pb_data_sync = { workspace = true }
@@ -33,6 +38,7 @@ value = { workspace = true }
 [dev-dependencies]
 common = { workspace = true, features = ["testing"] }
 database = { workspace = true, features = ["testing"] }
+errors = { workspace = true, features = ["testing"] }
 keybroker = { workspace = true, features = ["testing"] }
 table_iteration = { workspace = true, features = ["testing"] }
 usage_tracking = { workspace = true, features = ["testing"] }

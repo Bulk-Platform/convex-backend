@@ -18,8 +18,9 @@ jobs:
   build:
     name: Build and publish amd64 backend
     if:
-      github.ref_type == 'branch' && github.ref_name ==
-      github.event.repository.default_branch
+      github.ref_type == 'branch' && (startsWith(github.ref_name,
+      'codex/upgrade-convex-') || github.ref_name ==
+      github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -77,6 +78,7 @@ jobs:
         run: |
           {
             echo "### Bulk Convex backend"
+            echo "Source: ${{ github.ref_name }} at ${{ github.sha }}"
             echo '```text'
             echo "${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
             echo '```'

@@ -17,6 +17,7 @@ import {
 import { cn } from "@ui/cn";
 import { useRouter } from "next/router";
 import { Donut } from "@ui/Donut";
+import { Loading } from "@ui/Loading";
 
 const BUSINESS_METRIC_TO_SECTION: Record<string, string> = {
   functionCalls: "functionCalls",
@@ -27,6 +28,8 @@ const BUSINESS_METRIC_TO_SECTION: Record<string, string> = {
   searchStorage: "searchStorage",
   searchQueries: "searchQueries",
   dataEgress: "dataEgress",
+  auditLogBandwidth: "auditLogBandwidth",
+  aiGatewayCost: "aiGatewayCost",
   deploymentCount: "deployments",
 };
 
@@ -39,6 +42,8 @@ const SELF_SERVE_METRIC_TO_SECTION: Record<string, string> = {
   searchStorage: "searchStorage",
   searchQueries: "searchQueries",
   dataEgress: "dataEgress",
+  auditLogBandwidth: "auditLogBandwidth",
+  aiGatewayCost: "aiGatewayCost",
   deploymentCount: "deployments",
 };
 
@@ -46,6 +51,7 @@ type BusinessMetricKey =
   | keyof Omit<UsageSummaryRow, "deploymentClass" | "region">
   | "compute"
   | "actionCompute"
+  | "aiGatewayCost"
   | "deploymentCount";
 
 type Section = {
@@ -57,6 +63,8 @@ type Section = {
   title: string;
   suffix?: string;
   noOnDemand?: boolean;
+  // The plan includes none of this metric; the whole amount bills on demand.
+  allOnDemand?: boolean;
 };
 
 const businessSections: Section[] = [
@@ -76,7 +84,8 @@ const businessSections: Section[] = [
   {
     metric: "databaseStorage",
     format: formatBytes,
-    detail: "The total size of all documents stored in your projects",
+    detail:
+      "The total size of all documents and indexes stored in your projects",
     title: "Database Storage",
   },
   {
@@ -111,6 +120,20 @@ const businessSections: Section[] = [
     title: "Data Egress",
   },
   {
+    metric: "auditLogBandwidth",
+    format: formatBytes,
+    detail:
+      "The amount of audit log data egressed to your configured S3 bucket.",
+    title: "Audit Log Bandwidth",
+  },
+  {
+    metric: "aiGatewayCost",
+    format: (v: number) => formatQuantity(v, "currency"),
+    detail: "Spend on Convex-managed AI models through the AI gateway",
+    title: "AI Gateway",
+    allOnDemand: true,
+  },
+  {
     metric: "deploymentCount",
     format: formatNumberCompact,
     detail: "The number of deployments across all projects",
@@ -140,7 +163,8 @@ const selfServeSections: Section[] = [
     metric: "databaseStorage",
     entitlement: "teamMaxDatabaseStorage",
     format: formatBytes,
-    detail: "The total size of all documents stored in your projects",
+    detail:
+      "The total size of all documents and indexes stored in your projects",
     title: "Database Storage",
   },
   {
@@ -166,6 +190,13 @@ const selfServeSections: Section[] = [
     title: "Data Egress",
   },
   {
+    metric: "auditLogBandwidth",
+    format: formatBytes,
+    detail:
+      "The amount of audit log data egressed to your configured S3 bucket.",
+    title: "Audit Log Bandwidth",
+  },
+  {
     metric: "searchStorage",
     entitlement: "teamMaxVectorStorage",
     format: formatBytes,
@@ -187,20 +218,31 @@ const selfServeSections: Section[] = [
     title: "Deployments",
     noOnDemand: true,
   },
+  {
+    metric: "aiGatewayCost",
+    format: (v: number) => formatQuantity(v, "currency"),
+    detail: "Spend on Convex-managed AI models through the AI gateway",
+    title: "AI Gateway",
+    allOnDemand: true,
+  },
 ];
 
 export function BusinessPlanSummary({
   summary,
-  deploymentCount,
   error,
+  aiGatewayCost,
+  aiGatewayCostError,
+  showAiGatewayUsage,
   isBusinessPlan = true,
   entitlements,
   hasSubscription = false,
   showEntitlements = false,
 }: {
   summary?: UsageSummaryRow[];
-  deploymentCount?: number;
   error?: any;
+  aiGatewayCost?: number;
+  aiGatewayCostError?: any;
+  showAiGatewayUsage?: boolean;
   isBusinessPlan?: boolean;
   entitlements?: TeamEntitlementsResponse;
   hasSubscription?: boolean;
@@ -209,12 +251,27 @@ export function BusinessPlanSummary({
   const router = useRouter();
   const activeSections = isBusinessPlan ? businessSections : selfServeSections;
 
+  // Deployment counts live on the summary rows but are team-wide (the gauge has
+  // no project/component dimension we filter on), so sum across every row and
+  // apply the same total to both the full and primary-region aggregates.
+  const deploymentCount = summary
+    ? summary.reduce((sum, row) => sum + row.deploymentCount, 0)
+    : undefined;
+  const pausedDeploymentCount = summary
+    ? summary.reduce((sum, row) => sum + row.pausedDeploymentCount, 0)
+    : undefined;
+  const idleDeploymentCount = summary
+    ? summary.reduce((sum, row) => sum + row.idleDeploymentCount, 0)
+    : undefined;
+
   // Aggregate usage rows by summing each metric in activeSections.
   const aggregateRows = (rows: UsageSummaryRow[]) =>
     rows.reduce(
       (acc, row) => {
         for (const section of activeSections) {
           if (section.metric === "deploymentCount") continue;
+          // Comes from its own query, not the summary rows.
+          if (section.metric === "aiGatewayCost") continue;
           let value: number;
           if (section.metric === "compute") {
             value =
@@ -236,9 +293,19 @@ export function BusinessPlanSummary({
   // Aggregate across deployment classes and regions
   const aggregated = summary ? aggregateRows(summary) : undefined;
 
-  // Add deployment count from separate data source
+  // Only show the audit log egress section for teams that can configure custom audit logs.
+  const visibleSections = activeSections.filter(
+    (section) =>
+      section.metric !== "auditLogBandwidth" ||
+      entitlements?.customAuditLogsInLogStreamsConfigEnabled === true,
+  );
+
+  // Apply the team-wide deployment count to the aggregate.
   if (aggregated && deploymentCount !== undefined) {
     aggregated.deploymentCount = deploymentCount;
+  }
+  if (aggregated && aiGatewayCost !== undefined) {
+    aggregated.aiGatewayCost = aiGatewayCost;
   }
 
   // For self-serve plans, aggregate only primary region (aws-us-east-1)
@@ -248,10 +315,15 @@ export function BusinessPlanSummary({
       ? aggregateRows(summary.filter((row) => row.region === "aws-us-east-1"))
       : undefined;
 
-  // Deployment count is not region-specific (it comes from a separate data
-  // source), so its primary-region value is the full count.
+  // Deployment count is team-wide, so its primary-region value is the full
+  // count rather than a region-filtered subset.
   if (primaryRegionAggregated && deploymentCount !== undefined) {
     primaryRegionAggregated.deploymentCount = deploymentCount;
+  }
+  // AI spend has no region dimension, so the primary-region aggregate carries
+  // the same team-wide total.
+  if (primaryRegionAggregated && aiGatewayCost !== undefined) {
+    primaryRegionAggregated.aiGatewayCost = aiGatewayCost;
   }
 
   const sectionToRoute = isBusinessPlan
@@ -343,7 +415,7 @@ export function BusinessPlanSummary({
           ) : !aggregated ? (
             <PlanSummaryLoading />
           ) : (
-            activeSections.map((section, index) => {
+            visibleSections.map((section, index) => {
               const sectionId = sectionToRoute[section.metric];
               const { section: _s, tab: _t, ...restQuery } = router.query;
               const linkQuery = sectionId
@@ -352,6 +424,16 @@ export function BusinessPlanSummary({
               const linkHref = { pathname: router.pathname, query: linkQuery };
 
               const metric = aggregated[section.metric] ?? 0;
+              const aiCostFailed =
+                section.metric === "aiGatewayCost" &&
+                aiGatewayCostError !== undefined;
+              const aiCostPending =
+                section.metric === "aiGatewayCost" &&
+                aiGatewayCost === undefined &&
+                !aiCostFailed;
+              if (section.metric === "aiGatewayCost" && !showAiGatewayUsage) {
+                return null;
+              }
               const entitlement =
                 section.entitlement && entitlements
                   ? ((entitlements as Record<string, unknown>)[
@@ -364,8 +446,9 @@ export function BusinessPlanSummary({
               const primaryRegionMetric = primaryRegionAggregated
                 ? (primaryRegionAggregated[section.metric] ?? 0)
                 : metric;
-              const includedAmount =
-                primaryRegionMetric !== undefined && entitlement !== undefined
+              const includedAmount = section.allOnDemand
+                ? 0
+                : primaryRegionMetric !== undefined && entitlement !== undefined
                   ? Math.min(primaryRegionMetric, entitlement)
                   : undefined;
               const onDemandAmount =
@@ -395,25 +478,40 @@ export function BusinessPlanSummary({
                   )}
                 >
                   <div className="flex items-center gap-2">
-                    {showEntitlements && entitlement !== undefined && (
-                      <Tooltip
-                        side="bottom"
-                        tip={`Your team has used ${(100 * (displayedUsage / entitlement)).toFixed(2)}% of the included amount of ${section.title}.`}
-                        className="flex animate-fadeInFromLoading items-center"
-                      >
-                        <Donut current={displayedUsage} max={entitlement} />
-                      </Tooltip>
-                    )}
+                    {showEntitlements &&
+                      (entitlement !== undefined ? (
+                        <Tooltip
+                          side="bottom"
+                          tip={`Your team has used ${(100 * (displayedUsage / entitlement)).toFixed(2)}% of the included amount of ${section.title}.`}
+                          className="flex animate-fadeInFromLoading items-center"
+                        >
+                          <Donut current={displayedUsage} max={entitlement} />
+                        </Tooltip>
+                      ) : (
+                        // Keep sections without an included limit aligned with
+                        // the gauged ones.
+                        <div className="hidden size-6 sm:block" />
+                      ))}
                     <SectionLabel detail={section.detail}>
                       {section.title}
                     </SectionLabel>
                   </div>
                   <div className="animate-fadeInFromLoading">
-                    <span>
-                      {section.format(displayedUsage)}
-                      {section.suffix &&
-                        (!showEntitlements ? ` ${section.suffix}` : "")}
-                    </span>
+                    {hasSubscription && section.allOnDemand ? (
+                      <span className="text-content-secondary">–</span>
+                    ) : aiCostFailed ? (
+                      <span className="text-content-secondary">
+                        Unavailable
+                      </span>
+                    ) : aiCostPending ? (
+                      <Loading fullHeight={false} className="h-4 w-16" />
+                    ) : (
+                      <span>
+                        {section.format(displayedUsage)}
+                        {section.suffix &&
+                          (!showEntitlements ? ` ${section.suffix}` : "")}
+                      </span>
+                    )}
                     {showEntitlements && entitlement !== undefined && (
                       <span>
                         {" "}
@@ -421,13 +519,47 @@ export function BusinessPlanSummary({
                         {section.suffix ? ` ${section.suffix}` : ""}
                       </span>
                     )}
+                    {section.metric === "deploymentCount" &&
+                      isBusinessPlan &&
+                      pausedDeploymentCount !== undefined &&
+                      idleDeploymentCount !== undefined && (
+                        <span className="text-content-secondary">
+                          {" "}
+                          (
+                          {formatNumberCompact(
+                            Math.max(
+                              displayedUsage -
+                                pausedDeploymentCount -
+                                idleDeploymentCount,
+                              0,
+                            ),
+                          )}{" "}
+                          active · {formatNumberCompact(idleDeploymentCount)}{" "}
+                          idle · {formatNumberCompact(pausedDeploymentCount)}{" "}
+                          paused)
+                        </span>
+                      )}
                   </div>
                   {hasSubscription && (
                     <div className="animate-fadeInFromLoading">
-                      {!section.noOnDemand &&
+                      {section.allOnDemand ? (
+                        aiCostFailed ? (
+                          <span className="text-content-secondary">
+                            Unavailable
+                          </span>
+                        ) : aiCostPending ? (
+                          <Loading fullHeight={false} className="h-4 w-16" />
+                        ) : (
+                          // The whole amount bills on demand, so it is not an
+                          // increment over an included amount.
+                          `${section.format(metric)}${section.suffix ? ` ${section.suffix}` : ""}`
+                        )
+                      ) : (
+                        !section.noOnDemand &&
                         onDemandAmount !== undefined &&
                         onDemandAmount > 0 &&
-                        `+${section.format(onDemandAmount)}${section.suffix ? ` ${section.suffix}` : ""}`}
+                        `+${section.format(onDemandAmount)}${section.suffix ? ` ${section.suffix}` : ""}`
+                      )}
                     </div>
                   )}
                   <span className="flex items-center gap-1 text-xs text-content-secondary">

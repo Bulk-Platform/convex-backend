@@ -12,6 +12,7 @@ use common::{
         UnixTimestamp,
     },
     try_anyhow,
+    types::AttributedCaller,
 };
 use errors::{
     ErrorMetadata,
@@ -30,6 +31,7 @@ use serde_json::{
     json,
     Value as JsonValue,
 };
+use udf::helpers::UdfArgsJson;
 use value::{
     id_v6::DeveloperDocumentId,
     JsonPackedValue,
@@ -46,7 +48,6 @@ use crate::{
         with_argument_error,
         ArgName,
     },
-    helpers::UdfArgsJson,
     metrics::async_syscall_timer,
 };
 
@@ -55,7 +56,7 @@ impl<RT: Runtime> TaskExecutor<RT> {
         self.component_id
     }
 
-    #[fastrace::trace(properties = {"name": "{{name}}"})]
+    #[fastrace::trace(properties = {"name": "{name}"})]
     pub async fn run_async_syscall(&self, name: String, args: JsonValue) -> anyhow::Result<String> {
         let start = self.rt.monotonic_now();
         let timer = async_syscall_timer(&name);
@@ -66,6 +67,9 @@ impl<RT: Runtime> TaskExecutor<RT> {
                     self.async_syscall_actions_runMutation(args).await?.into()
                 },
                 "1.0/actions/action" => self.async_syscall_actions_runAction(args).await?.into(),
+                "1.0/createServiceToken" => {
+                    self.async_syscall_createServiceToken(args).await?.into()
+                },
                 "1.0/actions/schedule" => self.async_syscall_schedule(args).await?.into(),
                 "1.0/actions/cancel_job" => self.async_syscall_cancel_job(args).await?.into(),
                 "1.0/actions/vectorSearch" => self.async_syscall_vectorSearch(args).await?.into(),
@@ -168,6 +172,39 @@ impl<RT: Runtime> TaskExecutor<RT> {
             .map_err(remove_rejected_before_execution)?
             .result?;
         Ok(value)
+    }
+
+    #[convex_macro::instrument_future]
+    async fn async_syscall_createServiceToken(&self, args: JsonValue) -> anyhow::Result<JsonValue> {
+        // Claims are chosen entirely by the backend per service; the caller only
+        // names the service.
+        let CreateServiceTokenArgs {
+            service: Service::AiGateway,
+        } = with_argument_error("createServiceToken", || Ok(serde_json::from_value(args)?))?;
+        // Every value here comes from the executor's own state, so a function
+        // cannot misattribute its spend by lying about who it is.
+        let component_path = self.component_path.clone();
+        let caller = match self.http_action_route.get() {
+            Some(route) => AttributedCaller::HttpAction {
+                component_path,
+                route: route.clone(),
+            },
+            None => AttributedCaller::Action {
+                component_path,
+                udf_path: self.udf_path.clone(),
+            },
+        };
+        let action_callbacks = self.action_callbacks.clone();
+        let identity = self.identity.clone();
+        let token = self
+            .ai_gateway_token
+            .get_or_try_init(|| async move {
+                action_callbacks
+                    .create_ai_gateway_token(identity, caller)
+                    .await
+            })
+            .await?;
+        Ok(JsonValue::String(token.clone()))
     }
 
     #[convex_macro::instrument_future]
@@ -521,6 +558,18 @@ impl<RT: Runtime> TaskExecutor<RT> {
             .await?;
         Ok(serde_json::to_value(String::from(handle))?)
     }
+}
+
+/// The service a `1.0/createServiceToken` syscall names.
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+enum Service {
+    #[serde(rename = "ai-gateway")]
+    AiGateway,
+}
+
+#[derive(Deserialize)]
+struct CreateServiceTokenArgs {
+    service: Service,
 }
 
 pub fn parse_name_or_reference(

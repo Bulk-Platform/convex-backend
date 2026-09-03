@@ -1,4 +1,5 @@
 use std::{
+    self,
     fmt,
     hash::{
         Hash,
@@ -13,6 +14,7 @@ use sync_types::types::SerializedArgs;
 use super::size::Size;
 use crate::{
     size::{
+        array_size,
         check_nesting,
         check_system_size,
     },
@@ -25,7 +27,7 @@ use crate::{
 
 const MAX_ARRAY_LEN: usize = 8192;
 
-/// Wrapper on `Vec<Value>` that enforces size limits.
+/// Wrapper on `Vec<ConvexValue>` that enforces size limits.
 #[derive(Clone)]
 pub struct ConvexArray {
     // Precomputed `1 + size(v1) + ... + size(vN) + 1`
@@ -33,7 +35,7 @@ pub struct ConvexArray {
     // Precomputed `1 + max(nesting(v1), ..., nesting(vN))`.
     nesting: u8,
 
-    items: Vec<ConvexValue>,
+    items: Box<[ConvexValue]>,
 }
 
 impl ConvexArray {
@@ -41,7 +43,7 @@ impl ConvexArray {
         Self {
             size: 2,
             nesting: 1,
-            items: vec![],
+            items: Box::new([]),
         }
     }
 
@@ -71,20 +73,22 @@ impl<'a> IntoIterator for &'a ConvexArray {
     }
 }
 
+pub(crate) fn check_array_len(len: usize) -> anyhow::Result<()> {
+    if len > MAX_ARRAY_LEN {
+        anyhow::bail!(ErrorMetadata::bad_request(
+            "ArrayTooLong",
+            format!("Array length is too long ({len} > maximum length {MAX_ARRAY_LEN})"),
+        ));
+    }
+    Ok(())
+}
+
 impl TryFrom<Vec<ConvexValue>> for ConvexArray {
     type Error = anyhow::Error;
 
     fn try_from(items: Vec<ConvexValue>) -> anyhow::Result<Self> {
-        if items.len() > MAX_ARRAY_LEN {
-            anyhow::bail!(ErrorMetadata::bad_request(
-                "ArrayTooLong",
-                format!(
-                    "Array length is too long ({} > maximum length {MAX_ARRAY_LEN})",
-                    items.len()
-                ),
-            ));
-        }
-        let size = 1 + items.iter().map(|v| v.size()).sum::<usize>() + 1;
+        check_array_len(items.len())?;
+        let size = array_size(&items);
         check_system_size(size)?;
         let nesting = 1 + items.iter().map(|v| v.nesting()).max().unwrap_or(0);
         check_nesting(nesting)?;
@@ -95,14 +99,14 @@ impl TryFrom<Vec<ConvexValue>> for ConvexArray {
         Ok(Self {
             size: size as u32,
             nesting: nesting as u8,
-            items,
+            items: items.into_boxed_slice(),
         })
     }
 }
 
 impl From<ConvexArray> for Vec<ConvexValue> {
     fn from(array: ConvexArray) -> Self {
-        array.items
+        array.items.into_vec()
     }
 }
 

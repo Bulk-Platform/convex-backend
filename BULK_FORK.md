@@ -18,6 +18,12 @@ The Bulk-only runtime knobs are:
 - `LOCAL_BACKEND_MAX_CONCURRENT_REQUESTS` for the main self-hosted listener.
 - `SITE_PROXY_MAX_CONCURRENT_REQUESTS` for the public HTTP-action proxy.
 
+The fork also carries the small self-hosted export-memory fix from upstream PR
+#436 while upstream issue #435 remains open. It unregisters `_file_storage`
+metadata after each component export and avoids reading a whole local-storage
+object merely to determine its size. Keep this patch until upstream ships an
+equivalent fix.
+
 The implementations live in `crates/common/src/knobs.rs` and
 `crates/local_backend/src/`. Production values belong in `bulk-infra`, not in
 this repository.
@@ -47,7 +53,7 @@ Prepare an upgrade without rewriting shared history:
 
 ```bash
 git switch -c codex/upgrade-convex-YYYYMMDD origin/main
-git rebase upstream/main
+git merge --no-ff upstream/main
 git log --oneline upstream/main..HEAD
 git diff --stat upstream/main...HEAD
 ```
@@ -69,8 +75,21 @@ on the Linux image build plus its published-binary smoke test before deployment.
 
 ## Build and publish
 
-After the fork pull request is merged to `main`, run the GitHub Actions workflow
-`Release Bulk Convex Backend`:
+For an isolated dev-slot test before merging, run the GitHub Actions workflow
+from a `codex/upgrade-convex-*` branch:
+
+```bash
+gh workflow run bulk_release_backend.yml \
+  --repo Bulk-Platform/convex-backend \
+  --ref codex/upgrade-convex-YYYYMMDD
+```
+
+The upgrade-branch path still publishes only the commit SHA tag and immutable
+digest. It does not update `latest` or any deployment. Pin that digest only on
+the selected disposable dev slot.
+
+After the fork pull request is merged to `main`, run the same workflow on
+`main`:
 
 ```bash
 gh workflow run bulk_release_backend.yml \

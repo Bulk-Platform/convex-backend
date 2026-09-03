@@ -1,5 +1,8 @@
 use std::{
-    sync::LazyLock,
+    sync::{
+        Arc,
+        LazyLock,
+    },
     time::Duration,
 };
 
@@ -92,26 +95,85 @@ impl<'a, RT: Runtime> DataSyncProgressModel<'a, RT> {
         Self { tx }
     }
 
-    /// Upsert the progress row for `metadata.sync_id`.
-    pub async fn update(&mut self, metadata: DataSyncProgressMetadata) -> anyhow::Result<()> {
-        let existing = self
-            .tx
+    /// The sync's progress row, if any.
+    pub async fn get(
+        &mut self,
+        sync_id: &str,
+    ) -> anyhow::Result<Option<Arc<ParsedDocument<DataSyncProgressMetadata>>>> {
+        self.tx
             .query_system(TableNamespace::Global, &DATA_SYNC_PROGRESS_INDEX_BY_SYNC_ID)?
-            .eq(&[metadata.sync_id.as_str()])?
+            .eq(&[sync_id])?
             .unique()
-            .await?;
+            .await
+    }
+
+    /// The progress row of the sync with this id, if it completed a page
+    /// within [`DATA_SYNC_ACTIVE_WINDOW`]. The single-sync counterpart of
+    /// [`Self::active_syncs`].
+    pub async fn active_sync(
+        &mut self,
+        now_ms: u64,
+        sync_id: &str,
+    ) -> anyhow::Result<Option<DataSyncProgressMetadata>> {
+        let cutoff_ms = now_ms.saturating_sub(DATA_SYNC_ACTIVE_WINDOW.as_millis() as u64);
+        Ok(self
+            .get(sync_id)
+            .await?
+            .filter(|doc| doc.last_updated_ms >= cutoff_ms)
+            .map(|doc| (*doc).clone().into_value()))
+    }
+
+    /// Upsert the progress row for `metadata.sync_id`, throttled to at most one
+    /// write per `min_write_interval` while the sync is still advancing.
+    /// Returns the row's previous metadata; `None` means the sync had no row
+    /// yet and this write inserted it. A throttled update returns the
+    /// existing metadata without writing, leaving the transaction free of
+    /// writes. Pass `Duration::ZERO` to always write.
+    ///
+    /// `caught_up` marks a page that reached a fully-consistent snapshot with
+    /// nothing left to sync (`Synced` with no more to catch up on). Such a
+    /// settled state is flushed as soon as its document count changes,
+    /// bypassing the throttle, so a sync's final progress is never lost — right
+    /// after an import the first `Synced` page can report zero documents (the
+    /// writes aren't yet visible at the lagging repeatable snapshot), and the
+    /// pages that emit them settle within the throttle window. Intermediate
+    /// progress while still catching up is a disposable estimate and may be
+    /// dropped. A change in state variant (e.g. the transition out of
+    /// `InitialSync`) is likewise always written.
+    pub async fn update(
+        &mut self,
+        metadata: DataSyncProgressMetadata,
+        min_write_interval: Duration,
+        caught_up: bool,
+    ) -> anyhow::Result<Option<DataSyncProgressMetadata>> {
+        let existing = self.get(metadata.sync_id.as_str()).await?;
+        if let Some(doc) = &existing {
+            let elapsed_ms = metadata.last_updated_ms.saturating_sub(doc.last_updated_ms);
+            let variant_changed =
+                std::mem::discriminant(&doc.state) != std::mem::discriminant(&metadata.state);
+            let progressed =
+                metadata.state.num_documents_synced() != doc.state.num_documents_synced();
+            let should_write = variant_changed
+                || (caught_up && progressed)
+                || elapsed_ms >= min_write_interval.as_millis() as u64;
+            if !should_write {
+                return Ok(existing.map(|doc| (*doc).clone().into_value()));
+            }
+        }
         let mut model = SystemMetadataModel::new_global(self.tx);
         match existing {
             Some(doc) => {
+                let old = (*doc).clone().into_value();
                 model.replace(doc.id(), metadata.try_into()?).await?;
+                Ok(Some(old))
             },
             None => {
                 model
                     .insert(&DATA_SYNC_PROGRESS_TABLE, metadata.try_into()?)
                     .await?;
+                Ok(None)
             },
         }
-        Ok(())
     }
 
     /// One page of the progress rows of active syncs — those that completed a

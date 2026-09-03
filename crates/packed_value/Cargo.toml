@@ -5,6 +5,9 @@ authors = ["Convex, Inc. <no-reply@convex.dev>"]
 edition = "2024"
 license = "LicenseRef-FSL-1.1-Apache-2.0"
 
+[package.metadata.cargo-machete]
+ignored = ["maplit"]
+
 [lib]
 doctest = false
 
@@ -13,10 +16,10 @@ testing = ["proptest", "value/testing"]
 
 [dependencies]
 anyhow = { workspace = true }
-base64 = { workspace = true }
 bytes = { workspace = true }
 flexbuffers = { workspace = true }
 proptest = { workspace = true, optional = true }
+scoped-tls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 value = { workspace = true }

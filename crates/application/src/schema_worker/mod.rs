@@ -3,6 +3,7 @@ use std::{
         BTreeMap,
         BTreeSet,
     },
+    num::NonZeroU64,
     sync::Arc,
     time::Duration,
 };
@@ -15,7 +16,10 @@ use common::{
     errors::report_error,
     persistence::LatestDocument,
     runtime::Runtime,
-    schemas::DatabaseSchema,
+    schemas::{
+        DatabaseSchema,
+        TableValidationOutcome,
+    },
     types::{
         IndexId,
         RepeatableTimestamp,
@@ -185,23 +189,44 @@ impl<RT: Runtime> SchemaWorker<RT> {
                 walked_tables,
             });
         }
+        let snapshot = self.database.snapshot(ts)?;
         let table_shapes = self.database.table_shapes_at(ts).await?;
 
         for pending_validation in pending_validations {
             // FIXME: Remove clone
             let db_schema = pending_validation.db_schema.clone();
-            let tables_to_validate = DatabaseSchema::tables_to_validate(
+            let outcomes = DatabaseSchema::table_validation_outcomes(
                 &db_schema,
                 pending_validation.active_schema.as_deref(),
                 &pending_validation.table_mapping,
                 &pending_validation.virtual_system_mapping,
-                &Self::table_shape_provider(&table_shapes, &pending_validation),
+                &table_shape_provider(
+                    &table_shapes,
+                    &pending_validation.table_mapping,
+                    pending_validation.ts,
+                ),
             )?;
+            tracing::info!(
+                "SchemaWorker: table validation outcomes for {:?}: {:?}",
+                pending_validation.namespace,
+                outcomes,
+            );
+            let tables_to_validate: BTreeSet<&TableName> = outcomes
+                .iter()
+                .filter_map(|(table_name, outcome)| {
+                    matches!(outcome, TableValidationOutcome::MustWalk).then_some(*table_name)
+                })
+                .collect();
             walked_tables.insert(
                 pending_validation.namespace,
                 tables_to_validate.iter().map(|&t| t.clone()).collect(),
             );
-            self.validate_tables(tables_to_validate, pending_validation)
+            let total_docs = count_total_docs(
+                &snapshot,
+                tables_to_validate.iter().copied(),
+                pending_validation.namespace,
+            )?;
+            self.validate_tables(tables_to_validate, pending_validation, total_docs)
                 .await?;
         }
 
@@ -213,43 +238,13 @@ impl<RT: Runtime> SchemaWorker<RT> {
         })
     }
 
-    /// Shape provider for [`DatabaseSchema::tables_to_validate`]: a table
-    /// whose shape at the validation timestamp is already a subset of the
-    /// schema being validated can skip the document walk. Returning `None`
-    /// means "shape unavailable" and the table gets walked.
-    fn table_shape_provider<'a>(
-        table_shapes: &'a Option<Arc<TableShapes>>,
-        pending_validation: &'a PendingSchemaValidation,
-    ) -> impl Fn(&TableName) -> anyhow::Result<Option<CountedShape<ProdConfig>>> + 'a {
-        move |table_name| {
-            let Some(table_shapes) = table_shapes.as_ref() else {
-                return Ok(None);
-            };
-            let Ok(table_id) = pending_validation.table_mapping.id(table_name) else {
-                // Nonexistent tables have no documents to validate, so an
-                // empty shape lets them skip validation.
-                return Ok(Some(TableShape::empty().inferred_type().clone()));
-            };
-            // The shapes are caught up to exactly the validation timestamp the
-            // table mapping is from, so every tablet in the mapping must have
-            // a shape.
-            let shape = table_shapes
-                .tablet_shape(&table_id.tablet_id)
-                .with_context(|| {
-                    format!(
-                        "table {table_name} (tablet {}) is in the table mapping at ts {} but has \
-                         no shape in the table shapes at ts {}",
-                        table_id.tablet_id, *pending_validation.ts, table_shapes.ts,
-                    )
-                })?;
-            Ok(Some(shape.inferred_type().clone()))
-        }
-    }
-
     async fn validate_tables(
         &self,
         tables_to_validate: BTreeSet<&TableName>,
-        PendingSchemaValidation {
+        pending_validation: PendingSchemaValidation,
+        total_docs: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let PendingSchemaValidation {
             namespace,
             id,
             timer,
@@ -259,15 +254,14 @@ impl<RT: Runtime> SchemaWorker<RT> {
             ts,
             active_schema: _,
             by_id_indexes,
-        }: PendingSchemaValidation,
-    ) -> anyhow::Result<()> {
-        tracing::info!("SchemaWorker: Tables to check: {:?}", tables_to_validate);
+        } = pending_validation;
 
         let mut schema_validation_progress_tracker = SchemaValidationProgressTracker::new(
             self.database.clone(),
             namespace,
             tables_to_validate.clone().into_iter().cloned().collect(),
             id,
+            total_docs,
         )
         .await?;
         let tablet_ids = tables_to_validate
@@ -379,7 +373,7 @@ struct SchemaValidationProgressTracker<RT: Runtime> {
     tables_to_validate: BTreeSet<TableName>,
     schema_id: ResolvedDocumentId,
     /// The threshold at which to write validation progress to the database.
-    update_threshold: u64,
+    update_threshold: NonZeroU64,
     /// The number of documents that have been validated since writing progress
     /// to the database.
     docs_validated: u64,
@@ -391,10 +385,9 @@ impl<RT: Runtime> SchemaValidationProgressTracker<RT> {
         namespace: TableNamespace,
         tables_to_validate: BTreeSet<TableName>,
         schema_id: ResolvedDocumentId,
+        total_docs: Option<u64>,
     ) -> anyhow::Result<Self> {
         let mut tx = database.begin(Identity::system()).await?;
-        let snapshot = database.snapshot(tx.begin_timestamp())?;
-        let total_docs = Self::_total_docs(&snapshot, &tables_to_validate, namespace)?;
         let mut model = SchemaValidationProgressModel::new(&mut tx, namespace);
         model
             .initialize_schema_validation_progress(schema_id, total_docs)
@@ -403,10 +396,13 @@ impl<RT: Runtime> SchemaValidationProgressTracker<RT> {
             .commit_with_write_source(tx, "schema_validation_tracker_initialized")
             .await?;
         // Update schema validation progress every 5% or 500 documents, whichever is
-        // lower, to slowing down schema validation with too many writes.
-        let update_threshold = total_docs
-            .map(|total| std::cmp::min(500, (total as f64 * 0.05).ceil() as u64))
-            .unwrap_or(500);
+        // lower, to avoid slowing down schema validation with too many writes.
+        let update_threshold = NonZeroU64::new(
+            total_docs
+                .map(|total| std::cmp::min(500, (total as f64 * 0.05).ceil() as u64))
+                .unwrap_or(500),
+        )
+        .unwrap_or(NonZeroU64::MIN);
         Ok(Self {
             database,
             namespace,
@@ -419,33 +415,7 @@ impl<RT: Runtime> SchemaValidationProgressTracker<RT> {
 
     fn total_docs_at_ts(&self, ts: RepeatableTimestamp) -> anyhow::Result<Option<u64>> {
         let snapshot = self.database.snapshot(ts)?;
-        Self::_total_docs(&snapshot, &self.tables_to_validate, self.namespace)
-    }
-
-    fn _total_docs(
-        snapshot: &Snapshot,
-        tables_to_validate: &BTreeSet<TableName>,
-        namespace: TableNamespace,
-    ) -> anyhow::Result<Option<u64>> {
-        let total_docs = if snapshot.table_counts.is_some() {
-            let doc_counts = tables_to_validate
-                .iter()
-                .map(|table_name| {
-                    anyhow::Ok(
-                        snapshot
-                            .table_count(namespace, table_name)
-                            .context(
-                                "Failed to retrieve table count when table counts were present",
-                            )?
-                            .num_values(),
-                    )
-                })
-                .try_collect::<Vec<_>>()?;
-            Some(doc_counts.iter().sum())
-        } else {
-            None
-        };
-        Ok(total_docs)
+        count_total_docs(&snapshot, self.tables_to_validate.iter(), self.namespace)
     }
 
     /// Records that a document has been validated, writing to the db iff if we
@@ -491,4 +461,59 @@ impl<RT: Runtime> SchemaValidationProgressTracker<RT> {
             .await?;
         Ok(())
     }
+}
+
+/// Shape provider for [`DatabaseSchema::tables_to_validate`] and
+/// [`DatabaseSchema::table_validation_outcomes`]: a table whose shape at the
+/// given timestamp is already a subset of the schema being validated can skip
+/// the document walk. Returning `None` means "shape unavailable" and the table
+/// gets walked. `table_shapes` must be caught up to exactly `ts`, the
+/// timestamp `table_mapping` is from.
+pub(crate) fn table_shape_provider<'a>(
+    table_shapes: &'a Option<Arc<TableShapes>>,
+    table_mapping: &'a NamespacedTableMapping,
+    ts: RepeatableTimestamp,
+) -> impl Fn(&TableName) -> anyhow::Result<Option<CountedShape<ProdConfig>>> + 'a {
+    move |table_name| {
+        let Some(table_shapes) = table_shapes.as_ref() else {
+            return Ok(None);
+        };
+        let Ok(table_id) = table_mapping.id(table_name) else {
+            // Nonexistent tables have no documents to validate, so an
+            // empty shape lets them skip validation.
+            return Ok(Some(TableShape::empty().inferred_type().clone()));
+        };
+        // Every tablet in the table mapping must have a shape because the
+        // shapes are caught up to exactly the mapping's timestamp.
+        let shape = table_shapes
+            .tablet_shape(&table_id.tablet_id)
+            .with_context(|| {
+                format!(
+                    "table {table_name} (tablet {}) is in the table mapping at ts {} but has no \
+                     shape in the table shapes at ts {}",
+                    table_id.tablet_id, *ts, table_shapes.ts,
+                )
+            })?;
+        Ok(Some(shape.inferred_type().clone()))
+    }
+}
+
+/// Total number of documents in the given tables at the snapshot, or `None`
+/// if table counts haven't been bootstrapped yet.
+fn count_total_docs<'a>(
+    snapshot: &Snapshot,
+    tables_to_validate: impl Iterator<Item = &'a TableName>,
+    namespace: TableNamespace,
+) -> anyhow::Result<Option<u64>> {
+    if snapshot.table_counts.is_none() {
+        return Ok(None);
+    }
+    let mut total_docs = 0;
+    for table_name in tables_to_validate {
+        total_docs += snapshot
+            .table_count(namespace, table_name)
+            .context("Failed to retrieve table count when table counts were present")?
+            .num_values();
+    }
+    Ok(Some(total_docs))
 }

@@ -57,6 +57,7 @@ use common::{
         index::{
             database_index::IndexedFields,
             index_validation_error,
+            IndexConfig,
             IndexMetadata,
         },
         schema::{
@@ -133,6 +134,7 @@ use common::{
         env_var_total_size,
         env_var_total_size_limit_met,
         AllowedVisibility,
+        AttributionClaims,
         ConvexOrigin,
         ConvexSite,
         DeploymentMetadata,
@@ -145,6 +147,7 @@ use common::{
         ModuleEnvironment,
         NodeDependency,
         ObjectKey,
+        QueryInvocation,
         RepeatableTimestamp,
         TableName,
         Timestamp,
@@ -234,6 +237,10 @@ use model::{
         ComponentsModel,
     },
     config::{
+        module_loader::{
+            ModuleLoader,
+            UncachedModuleLoader,
+        },
         types::{
             ConfigFile,
             ConfigMetadata,
@@ -373,6 +380,12 @@ use udf::{
     HttpActionResult,
 };
 use usage_gauges_tracking_worker::UsageGaugesTrackingWorker;
+use usage_limits::{
+    UsageLimitNotifier,
+    UsageLimitRecorder,
+    UsageLimitWorker,
+    UsageMeter,
+};
 use usage_tracking::{
     FunctionUsageStats,
     FunctionUsageTracker,
@@ -401,7 +414,6 @@ use crate::{
         FunctionMetricsLog,
     },
     log_visibility::LogVisibility,
-    module_cache::ModuleCache,
     redaction::{
         RedactedJsError,
         RedactedLogLines,
@@ -410,13 +422,9 @@ use crate::{
         clear_tables,
         SnapshotImportWorker,
     },
-    usage_limits::{
-        UsageLimitRecorder,
-        UsageLimitWorker,
-        UsageMeter,
-    },
 };
 
+pub mod ai_gateway_jwt;
 pub mod airbyte_import;
 pub mod api;
 pub mod app_metric_seed;
@@ -432,19 +440,21 @@ pub mod function_log;
 pub mod log_streaming;
 pub mod log_visibility;
 mod metrics;
-mod module_cache;
 pub mod redaction;
 pub mod scheduled_jobs;
 mod schema_worker;
 pub mod snapshot_import;
+mod source_map_cache;
 mod streaming_export;
 mod system_table_cleanup;
 mod table_summary_worker;
-pub mod usage_limits;
 pub mod valid_identifier;
 mod worker_handles;
 
-pub use crate::cache::QueryCache;
+pub use crate::{
+    cache::QueryCache,
+    source_map_cache::SourceMapCache,
+};
 use crate::{
     metrics::{
         log_external_deps_package,
@@ -608,7 +618,6 @@ pub struct Application<RT: Runtime> {
     deployment: DeploymentMetadata,
     workers: WorkerHandles,
     log_visibility: Arc<dyn LogVisibility<RT>>,
-    module_cache: ModuleCache<RT>,
     system_env_var_names: HashSet<EnvVarName>,
     app_auth: Arc<ApplicationAuth<RT>>,
     log_manager_client: LogManagerClient,
@@ -637,6 +646,22 @@ pub async fn create_storage<RT: Runtime>(
 
 const DEFAULT_AUDIT_LOG_LIMIT: usize = 15;
 const MAX_AUDIT_LOG_LIMIT: usize = 100;
+
+fn ensure_export_file_storage_within_limit(
+    format: ExportFormat,
+    latest_file_storage_size: Option<u64>,
+) -> anyhow::Result<()> {
+    if matches!(
+        format,
+        ExportFormat::Zip {
+            include_storage: true
+        }
+    ) && let Some(file_storage_size) = latest_file_storage_size
+    {
+        ::exports::ensure_file_storage_export_size(file_storage_size)?;
+    }
+    Ok(())
+}
 
 impl<RT: Runtime> Application<RT> {
     pub async fn initialize_storage(
@@ -694,6 +719,7 @@ impl<RT: Runtime> Application<RT> {
         file_storage: FileStorage<RT>,
         application_storage: ApplicationStorage,
         usage_event_logger: Arc<dyn UsageEventLogger>,
+        usage_limit_notifier: Arc<dyn UsageLimitNotifier>,
         key_broker: KeyBroker,
         deployment: DeploymentMetadata,
         function_runner: Arc<dyn FunctionRunner<RT>>,
@@ -712,6 +738,8 @@ impl<RT: Runtime> Application<RT> {
         export_provider: Arc<dyn ExportProvider<RT>>,
         deleted_tablet_receiver: tokio::sync::mpsc::Receiver<TabletId>,
         oidc_http_client: CachedHttpClient,
+        ai_gateway_jwt_minter: Option<Arc<dyn ai_gateway_jwt::AiGatewayJwtMinter>>,
+        source_map_cache: SourceMapCache<RT>,
     ) -> anyhow::Result<Self> {
         // Wrap the usage logger so usage is recorded for enforcement before
         // being forwarded downstream.
@@ -721,10 +749,6 @@ impl<RT: Runtime> Application<RT> {
 
         let deployment_name = deployment.name.clone();
         let deployment_region = deployment.region.clone();
-        let module_cache =
-            ModuleCache::new(runtime.clone(), application_storage.modules_storage.clone()).await;
-        let module_loader = Arc::new(module_cache.clone());
-
         let default_system_env_vars = btreemap! {
             CONVEX_ORIGIN.clone() => convex_origin.parse()?,
             CONVEX_SITE.clone() => convex_site.parse()?
@@ -824,15 +848,16 @@ impl<RT: Runtime> Application<RT> {
             })
             .collect();
         usage_meter.refresh_configs(usage_limit_configs);
-        let usage_limit_worker = Arc::new(Mutex::new(runtime.spawn(
+        let usage_limit_worker = Arc::new(Mutex::new(Some(runtime.spawn(
             "usage_limit_worker",
             UsageLimitWorker::start(
                 runtime.clone(),
                 database.clone(),
                 Arc::new(log_manager_client.clone()),
+                usage_limit_notifier.clone(),
                 usage_meter.clone(),
             ),
-        )));
+        ))));
 
         let function_log = FunctionExecutionLog::new(
             runtime.clone(),
@@ -855,11 +880,13 @@ impl<RT: Runtime> Application<RT> {
             node_actions,
             file_storage.transactional_file_storage.clone(),
             application_storage.modules_storage.clone(),
-            module_loader,
+            source_map_cache,
             function_log.clone(),
             audit_log_client.clone(),
             default_system_env_vars.clone(),
             cache,
+            ai_gateway_jwt_minter,
+            deployment.clone(),
         ));
         function_runner.set_action_callbacks(runner.clone());
 
@@ -913,7 +940,7 @@ impl<RT: Runtime> Application<RT> {
             application_storage.modules_storage.clone(),
         );
         let migration_worker = Arc::new(Mutex::new(Some(
-            runtime.spawn("migration_worker", migration_worker.go()),
+            runtime.spawn("migration_worker", Box::pin(migration_worker.go())),
         )));
 
         let usage_gauges_tracking_worker = UsageGaugesTrackingWorker::start(
@@ -922,7 +949,7 @@ impl<RT: Runtime> Application<RT> {
             usage_event_logger.clone(),
             Arc::new(log_manager_client.clone()),
             deployment_name.clone(),
-        );
+        )?;
 
         let workers = WorkerHandles {
             usage_gauges_tracking_worker,
@@ -939,6 +966,7 @@ impl<RT: Runtime> Application<RT> {
             system_table_cleanup_worker,
             migration_worker,
             usage_limit_worker,
+            usage_limit_notifier,
         };
 
         Ok(Self {
@@ -955,7 +983,6 @@ impl<RT: Runtime> Application<RT> {
             deployment,
             workers,
             log_visibility,
-            module_cache,
             system_env_var_names: default_system_env_vars.into_keys().collect(),
             app_auth,
             log_manager_client,
@@ -976,16 +1003,20 @@ impl<RT: Runtime> Application<RT> {
         &self.application_storage.modules_storage
     }
 
-    pub fn modules_cache(&self) -> &ModuleCache<RT> {
-        &self.module_cache
-    }
-
     pub fn key_broker(&self) -> &KeyBroker {
         &self.key_broker
     }
 
     pub fn runner(&self) -> Arc<ApplicationFunctionRunner<RT>> {
         self.runner.clone()
+    }
+
+    pub async fn mint_ai_gateway_jwt(
+        &self,
+        identity: &Identity,
+        claims: AttributionClaims,
+    ) -> anyhow::Result<String> {
+        self.runner.mint_ai_gateway_jwt(identity, claims).await
     }
 
     pub fn metrics_log(&self, identity: &Identity) -> anyhow::Result<FunctionMetricsLog<'_, RT>> {
@@ -1045,7 +1076,7 @@ impl<RT: Runtime> Application<RT> {
         }
 
         let (events, next_cursor) = DeploymentAuditLogModel::new(&mut tx)
-            .list_events_from_time(from_ts_ms, cursor, limit)
+            .list_events_from_time(from_ts_ms, None, cursor, limit)
             .await?;
         let cursor = next_cursor.map(|cursor| self.key_broker().encrypt_cursor(&cursor));
         Ok((events, cursor))
@@ -1196,10 +1227,20 @@ impl<RT: Runtime> Application<RT> {
         args: SerializedArgs,
         identity: Identity,
         caller: FunctionCaller,
+        invocation: QueryInvocation,
     ) -> anyhow::Result<RedactedQueryReturn> {
         let ts = *self.now_ts_for_reads();
-        self.read_only_udf_at_ts(request_context, path, args, identity, ts, None, caller)
-            .await
+        self.read_only_udf_at_ts(
+            request_context,
+            path,
+            args,
+            identity,
+            ts,
+            None,
+            caller,
+            invocation,
+        )
+        .await
     }
 
     #[fastrace::trace]
@@ -1212,6 +1253,7 @@ impl<RT: Runtime> Application<RT> {
         ts: Timestamp,
         journal: Option<Option<String>>,
         caller: FunctionCaller,
+        invocation: QueryInvocation,
     ) -> anyhow::Result<RedactedQueryReturn> {
         let request_id = request_context.request_id.clone();
         let persistence_version = self.database.persistence_version();
@@ -1240,6 +1282,7 @@ impl<RT: Runtime> Application<RT> {
                     ts,
                     journal,
                     caller,
+                    invocation,
                 )
                 .await?
         });
@@ -1530,6 +1573,7 @@ impl<RT: Runtime> Application<RT> {
                     args,
                     identity,
                     caller,
+                    QueryInvocation::Fresh,
                 )
                 .await
                 .map(
@@ -1605,6 +1649,12 @@ impl<RT: Runtime> Application<RT> {
         expiration_ts_ns: Option<u64>,
     ) -> anyhow::Result<DeveloperDocumentId> {
         identity.require_operation(DeploymentOp::CreateBackups)?;
+        ensure_export_file_storage_within_limit(
+            format,
+            self.workers
+                .usage_gauges_tracking_worker
+                .latest_file_storage_size(),
+        )?;
         if let Some(expiration_ts_ns) = expiration_ts_ns {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2105,11 +2155,12 @@ impl<RT: Runtime> Application<RT> {
         let auth_config_metadata = ModuleModel::new(tx).get_metadata(path.clone()).await?;
         if let Some(auth_config_metadata) = auth_config_metadata {
             let environment = auth_config_metadata.environment;
-            let auth_config_source = runner
-                .module_cache
-                .get_module(tx, path)
-                .await?
-                .context("Module has metadata but no source")?;
+            let auth_config_source = UncachedModuleLoader {
+                modules_storage: runner.modules_storage.clone(),
+            }
+            .get_module(tx, path)
+            .await?
+            .context("Module has metadata but no source")?;
             let auth_config_module = ModuleConfig {
                 path: AUTH_CONFIG_FILE_NAME.parse()?,
                 source: auth_config_source.source.clone(),
@@ -2315,15 +2366,11 @@ impl<RT: Runtime> Application<RT> {
                 // Download root package
                 let existing_app_modules: BTreeMap<CanonicalizedModulePath, ModuleConfig> =
                     if let Some(root_pkg) = existing_root_package {
-                        download_package(
-                            self.modules_storage().clone(),
-                            root_pkg.storage_key.clone(),
-                            root_pkg.sha256.clone(),
-                        )
-                        .await?
-                        .into_values()
-                        .map(|v| (v.path.clone().canonicalize(), v))
-                        .collect()
+                        download_package(self.modules_storage().clone(), &root_pkg)
+                            .await?
+                            .into_values()
+                            .map(|v| (v.path.clone().canonicalize(), v))
+                            .collect()
                     } else {
                         anyhow::bail!("Failed to download source package for root component.");
                     };
@@ -2933,29 +2980,27 @@ impl<RT: Runtime> Application<RT> {
         let namespace = TableNamespace::by_component_TODO();
         for (index_name, index_fields) in indexes.into_iter() {
             let index_fields = self._validate_user_defined_index_fields(index_fields)?;
-            let index_metadata =
-                IndexMetadata::new_backfilling(*tx.begin_timestamp(), index_name, index_fields);
-            let mut model = IndexModel::new(&mut tx);
-            if let Some(existing_index_metadata) = model
-                .pending_index_metadata(namespace, &index_metadata.name)?
-                .or(model.enabled_index_metadata(namespace, &index_metadata.name)?)
-            {
-                if !index_metadata
-                    .config
-                    .same_spec(&existing_index_metadata.config)
+            let existing_index_metadata = {
+                let mut model = IndexModel::new(&mut tx);
+                model
+                    .pending_index_metadata(namespace, &index_name)?
+                    .or(model.enabled_index_metadata(namespace, &index_name)?)
+            };
+            if let Some(existing_index_metadata) = existing_index_metadata {
+                if let IndexConfig::Database { spec, .. } = &existing_index_metadata.config
+                    && spec.fields == index_fields
                 {
-                    IndexModel::new(&mut tx)
-                        .drop_index(existing_index_metadata.id())
-                        .await?;
-                    IndexModel::new(&mut tx)
-                        .add_system_index(namespace, index_metadata)
-                        .await?;
+                    continue;
                 }
-            } else {
                 IndexModel::new(&mut tx)
-                    .add_system_index(namespace, index_metadata)
+                    .drop_index(existing_index_metadata.id())
                     .await?;
             }
+            let index_metadata =
+                IndexMetadata::new_backfilling(*tx.begin_timestamp(), index_name, index_fields);
+            IndexModel::new(&mut tx)
+                .add_system_index(namespace, index_metadata)
+                .await?;
         }
         self.commit(tx, "add_system_indexes").await?;
         Ok(())
@@ -3152,7 +3197,7 @@ impl<RT: Runtime> Application<RT> {
                                 "Admin identity returned from check_admin_key was not an admin."
                             );
                         };
-                        Identity::ActingUser(i, acting_user)
+                        Identity::ActingUser(i, acting_user.into())
                     },
                     None => admin_identity,
                 }

@@ -55,10 +55,7 @@ use keybroker::Identity;
 use model::{
     backend_state::BackendStateModel,
     exports::ExportsModel,
-    file_storage::{
-        get_total_file_storage_size,
-        get_total_file_storage_size_from_snapshot,
-    },
+    file_storage::FileStorageSizeTracker,
     virtual_system_mapping,
 };
 use parking_lot::Mutex;
@@ -76,6 +73,7 @@ static RUN_PERIOD: LazyLock<Duration> =
 #[derive(Clone)]
 pub struct UsageGaugesTrackingWorker {
     worker: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
+    latest_file_storage_size: Arc<Mutex<Option<u64>>>,
 }
 
 struct UsageGaugesTrackingWorkerInner<RT: Runtime> {
@@ -85,6 +83,10 @@ struct UsageGaugesTrackingWorkerInner<RT: Runtime> {
     usage_logger: Arc<dyn UsageEventLogger>,
     log_sender: Arc<dyn LogSender>,
     instance_name: String,
+    /// Retained across runs so each run only syncs `_file_storage` changes
+    /// since the previous one.
+    file_storage_size: FileStorageSizeTracker<RT>,
+    latest_file_storage_size: Arc<Mutex<Option<u64>>>,
 }
 
 impl UsageGaugesTrackingWorker {
@@ -94,7 +96,10 @@ impl UsageGaugesTrackingWorker {
         usage_logger: Arc<dyn UsageEventLogger>,
         log_sender: Arc<dyn LogSender>,
         instance_name: String,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        let file_storage_size =
+            FileStorageSizeTracker::new(database.latest_database_snapshot()?.data_sync_iterator()?);
+        let latest_file_storage_size = Arc::new(Mutex::new(None));
         let mut worker = UsageGaugesTrackingWorkerInner {
             runtime: runtime.clone(),
             database,
@@ -102,6 +107,8 @@ impl UsageGaugesTrackingWorker {
             usage_logger,
             log_sender,
             instance_name: instance_name.clone(),
+            file_storage_size,
+            latest_file_storage_size: latest_file_storage_size.clone(),
         };
         let worker_handle = Arc::new(Mutex::new(Some(runtime.spawn(
             "usage_gauges_tracking_worker",
@@ -118,9 +125,21 @@ impl UsageGaugesTrackingWorker {
                 }
             },
         ))));
-        Self {
+        Ok(Self {
             worker: worker_handle,
-        }
+            latest_file_storage_size,
+        })
+    }
+
+    /// Returns the most recently computed total file storage size, in bytes.
+    ///
+    /// The value is `None` until the first successful gauge cycle. Thereafter,
+    /// it is a cached observation from the most recently completed cycle and
+    /// may be higher or lower than the current total. Reading it never triggers
+    /// a refresh, so callers requiring a current value must compute one
+    /// separately.
+    pub fn latest_file_storage_size(&self) -> Option<u64> {
+        *self.latest_file_storage_size.lock()
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
@@ -158,10 +177,15 @@ impl<RT: Runtime> UsageGaugesTrackingWorkerInner<RT> {
         }
         let timer = metrics::usage_gauges_tracking_worker_timer();
 
-        let gauge_metrics = get_gauge_metrics(&Identity::system(), &self.database).await?;
-        let backend_state = self.get_backend_state().await?;
+        let gauge_metrics = get_gauge_metrics(
+            &Identity::system(),
+            &self.database.latest_database_snapshot()?,
+            &mut self.file_storage_size,
+        )
+        .await?;
+        *self.latest_file_storage_size.lock() = Some(gauge_metrics.storage_total_size);
 
-        self.send_usage_events(gauge_metrics, backend_state).await;
+        self.send_usage_events(gauge_metrics).await;
         let duration = timer.finish();
         if duration > *USAGE_TRACKING_WORKER_SLOW_TRACE_THRESHOLD {
             tracing::warn!("Usage tracking worker took longer than expected: {duration:?}");
@@ -169,18 +193,9 @@ impl<RT: Runtime> UsageGaugesTrackingWorkerInner<RT> {
         Ok(())
     }
 
-    #[fastrace::trace]
-    async fn get_backend_state(&self) -> anyhow::Result<BackendState> {
-        let mut tx = self.database.begin_system().await?;
-        Ok(BackendStateModel::new(&mut tx)
-            .get_backend_state()
-            .await?
-            .into_value())
-    }
-
     /// Send usage events as the current state of the world to the firehose.
     #[fastrace::trace]
-    async fn send_usage_events(&self, gauge_metrics: GaugeMetrics, backend_state: BackendState) {
+    async fn send_usage_events(&self, gauge_metrics: GaugeMetrics) {
         // Send to log streams if available
         let log_sender = &self.log_sender;
         let totals = gauge_metrics.compute_totals();
@@ -206,6 +221,7 @@ impl<RT: Runtime> UsageGaugesTrackingWorkerInner<RT> {
             storage_total_size,
             cloud_snapshot_total_size,
             document_counts,
+            backend_state,
         } = gauge_metrics;
 
         let (user_document_counts, system_document_counts) = document_counts
@@ -276,6 +292,7 @@ pub struct GaugeMetrics {
     storage_total_size: u64,
     cloud_snapshot_total_size: u64,
     document_counts: Vec<(ComponentPath, TableName, u64)>,
+    backend_state: BackendState,
 }
 
 impl GaugeMetrics {
@@ -355,48 +372,24 @@ pub struct AggregatedStorageUsage {
     pub system_table_document_sizes: BTreeMap<String, u64>,
 }
 
-/// Gauge metrics for the usage worker. The file storage total is computed with
-/// the `DataSyncIterator` (cross-checked against the `TableIterator`); every
-/// other gauge is read from the latest snapshot, which may differ slightly.
+/// Gauge metrics read from `snapshot`. Every gauge except file storage is read
+/// at `snapshot`'s timestamp; the file storage total is at the snapshot
+/// [`FileStorageSizeTracker`]'s iterator picks. Pass the same
+/// `file_storage_size` across calls so each one syncs only the `_file_storage`
+/// changes since the last.
 #[fastrace::trace]
 pub async fn get_gauge_metrics<RT: Runtime>(
     identity: &Identity,
-    database: &Database<RT>,
-) -> anyhow::Result<GaugeMetrics> {
-    let snapshot = database.latest_database_snapshot()?;
-    let document_and_index_storage = snapshot.get_document_and_index_storage(identity)?;
-    let vector_index_storage = snapshot.get_vector_index_storage(identity)?;
-    let text_index_storage = snapshot.get_text_index_storage(identity)?;
-    let cloud_snapshot_total_size = fetch_cloud_snapshot_total_size(identity, &snapshot).await?;
-    let document_counts = snapshot.get_document_counts(identity)?;
-    let storage_total_size = get_total_file_storage_size(identity, database).await?;
-
-    Ok(GaugeMetrics {
-        document_and_index_storage,
-        vector_index_storage,
-        text_index_storage,
-        storage_total_size,
-        cloud_snapshot_total_size,
-        document_counts,
-    })
-}
-
-/// Like [`get_gauge_metrics`] but for offline tooling (e.g. `db-info`) that
-/// only has a [`DatabaseSnapshot`] and inspects a specific, possibly
-/// historical, snapshot. The file storage total uses the `TableIterator` since
-/// the `DataSyncIterator` picks its own recent snapshot rather than a given
-/// one.
-#[fastrace::trace]
-pub async fn get_gauge_metrics_from_snapshot<RT: Runtime>(
-    identity: &Identity,
     snapshot: &DatabaseSnapshot<RT>,
+    file_storage_size: &mut FileStorageSizeTracker<RT>,
 ) -> anyhow::Result<GaugeMetrics> {
     let document_and_index_storage = snapshot.get_document_and_index_storage(identity)?;
     let vector_index_storage = snapshot.get_vector_index_storage(identity)?;
     let text_index_storage = snapshot.get_text_index_storage(identity)?;
     let cloud_snapshot_total_size = fetch_cloud_snapshot_total_size(identity, snapshot).await?;
     let document_counts = snapshot.get_document_counts(identity)?;
-    let storage_total_size = get_total_file_storage_size_from_snapshot(identity, snapshot).await?;
+    let storage_total_size = file_storage_size.total_size(identity, snapshot).await?;
+    let backend_state = fetch_backend_state(identity, snapshot).await?;
 
     Ok(GaugeMetrics {
         document_and_index_storage,
@@ -405,7 +398,25 @@ pub async fn get_gauge_metrics_from_snapshot<RT: Runtime>(
         storage_total_size,
         cloud_snapshot_total_size,
         document_counts,
+        backend_state,
     })
+}
+
+#[fastrace::trace]
+async fn fetch_backend_state<RT: Runtime>(
+    identity: &Identity,
+    database: &DatabaseSnapshot<RT>,
+) -> anyhow::Result<BackendState> {
+    let mut tx = database.begin_tx(
+        identity.clone(),
+        Arc::new(SearchNotEnabled),
+        FunctionUsageTracker::new(),
+        virtual_system_mapping().clone(),
+    )?;
+    Ok(BackendStateModel::new(&mut tx)
+        .get_backend_state()
+        .await?
+        .into_value())
 }
 
 #[fastrace::trace]

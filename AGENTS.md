@@ -19,7 +19,10 @@ Before changing this repository, read [BULK_FORK.md](./BULK_FORK.md).
 - Run Rust formatting and the narrowest relevant tests before opening a pull
   request.
 - Publish production images only with
-  `.github/workflows/bulk_release_backend.yml` after the change is on `main`.
+  `.github/workflows/bulk_release_backend.yml` after the change is on `main`. A
+  `codex/upgrade-convex-*` branch may use the same manual workflow to publish a
+  commit-SHA-only image for an isolated dev-slot test. It must not update a
+  floating tag or any production image pin.
 - Deploy immutable image digests. Never point production at a floating tag.
 
 Nested `AGENTS.md` files may add more specific rules for their directories.

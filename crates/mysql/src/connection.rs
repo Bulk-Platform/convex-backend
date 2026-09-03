@@ -3,7 +3,6 @@ use std::{
     mem,
     path::PathBuf,
     str::FromStr,
-    sync::Arc,
     time::Duration,
 };
 
@@ -189,7 +188,7 @@ impl<'f> Format<'f> for MySQLRawStatementFormat {
 // used with the text protocol.
 fn format_mysql_text_protocol(
     db_name: &str,
-    statement: &'static str,
+    statement: &str,
     params: Vec<MySqlValue>,
     labels: &[StaticMetricLabel],
 ) -> anyhow::Result<String> {
@@ -199,7 +198,7 @@ fn format_mysql_text_protocol(
             .into_iter()
             .map(|p| match p {
                 MySqlValue::NULL => "NULL".to_owned(),
-                MySqlValue::Bytes(bytes) => format!("x'{}'", hex::encode(bytes)),
+                MySqlValue::Bytes(bytes) => format!("x'{}'", const_hex::display(bytes)),
                 MySqlValue::Int(i) => format!("{i}"),
                 MySqlValue::UInt(u) => format!("{u}"),
                 // We don't use the following and I don't want to deal with escaping them.
@@ -210,7 +209,10 @@ fn format_mysql_text_protocol(
             })
             .collect(),
     };
-    let result = MySQLRawStatementFormat.format(statement, args)?.to_string();
+    let result = MySQLRawStatementFormat
+        .format(statement, args)
+        .map_err(|e| anyhow::anyhow!("failed to format statement: {e}"))?
+        .to_string();
     if result.len() > LARGE_STATEMENT_THRESHOLD {
         log_large_statement(labels.to_vec());
     }
@@ -239,13 +241,14 @@ impl<'f> Format<'f> for MySQLPreparedStatementFormat {
 
 // Formats a MySQL query by only replacing the @db_name but leaves positional
 // arguments alone. To be used with MySQL binary protocol.
-fn format_mysql_binary_protocol(db_name: &str, statement: &'static str) -> anyhow::Result<String> {
+fn format_mysql_binary_protocol(db_name: &str, statement: &str) -> anyhow::Result<String> {
     let args = MySQLFormatArguments {
         escaped_db_name: format!("`{db_name}`"),
         params: vec![], // No positional arguments.
     };
     Ok(MySQLPreparedStatementFormat
-        .format(statement, args)?
+        .format(statement, args)
+        .map_err(|e| anyhow::anyhow!("failed to format statement: {e}"))?
         .to_string())
 }
 
@@ -322,11 +325,16 @@ async fn handle_errors<R, RT: Runtime>(
 impl<RT: Runtime> MySqlConnection<'_, RT> {
     /// Executes multiple statements, separated by semicolons.
     #[fastrace::trace]
-    pub async fn execute_many(&mut self, query: &'static str) -> anyhow::Result<()> {
+    pub async fn execute_many(&mut self, query: &str) -> anyhow::Result<()> {
         log_execute(self.labels.clone());
         let statement = format_mysql_text_protocol(self.db_name, query, vec![], &self.labels)?;
         handle_errors(&mut self.conn, self.pool, async move |conn| {
-            with_timeout(conn.query_iter(statement)).await?;
+            // Every statement after the first runs only as its result set is
+            // consumed, and reports its error only there. Dropping the result
+            // instead leaves them pending on the connection, so they run if it
+            // happens to be used again and are silently lost if it is not.
+            let result = with_timeout(conn.query_iter(statement)).await?;
+            with_timeout(result.drop_result()).await?;
             Ok(())
         })
         .await?;
@@ -337,7 +345,7 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
     #[fastrace::trace]
     pub async fn query_optional(
         &mut self,
-        statement: &'static str,
+        statement: &str,
         params: Vec<MySqlValue>,
     ) -> anyhow::Result<Option<Row>> {
         log_query(self.labels.clone());
@@ -371,7 +379,7 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
     #[fastrace::trace]
     pub async fn query_collect<R: Send>(
         &mut self,
-        statement: &'static str,
+        statement: &str,
         params: Vec<MySqlValue>,
         size_hint: usize,
         f: impl Fn(Row) -> anyhow::Result<R> + Send + Sync + 'static,
@@ -453,7 +461,7 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
     #[fastrace::trace]
     pub async fn exec_iter(
         &mut self,
-        statement: &'static str,
+        statement: &str,
         params: Vec<MySqlValue>,
     ) -> anyhow::Result<u64> {
         log_execute(self.labels.clone());
@@ -514,7 +522,7 @@ impl MySqlTransaction<'_> {
     /// result set.
     pub async fn exec_first(
         &mut self,
-        statement: &'static str,
+        statement: &str,
         params: Vec<MySqlValue>,
     ) -> anyhow::Result<Option<Row>> {
         let future = if self.use_prepared_statements {
@@ -531,7 +539,7 @@ impl MySqlTransaction<'_> {
     /// Executes the given statement and drops the result.
     pub async fn exec_drop(
         &mut self,
-        statement: &'static str,
+        statement: &str,
         params: Vec<MySqlValue>,
     ) -> anyhow::Result<()> {
         let future = if self.use_prepared_statements {
@@ -548,7 +556,7 @@ impl MySqlTransaction<'_> {
     /// Execute a SQL statement, returning the number of rows affected.
     pub async fn exec_iter(
         &mut self,
-        statement: &'static str,
+        statement: &str,
         params: Vec<MySqlValue>,
     ) -> anyhow::Result<u64> {
         let affected_rows = if self.use_prepared_statements {
@@ -624,7 +632,7 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
         let ssl_opts = opts.ssl_opts().cloned();
         let mut opts = OptsBuilder::from_opts(opts).pool_opts(pool_opts);
         if require_leader {
-            opts = opts.after_connect(Arc::new(|conn| {
+            opts = opts.after_connect(|conn| {
                 async move {
                     let readonly: Option<(bool,)> = conn
                         .query_first("SELECT @@global.innodb_read_only OR @@global.read_only")
@@ -643,7 +651,7 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
                     Ok(())
                 }
                 .boxed()
-            }));
+            });
         }
         // The MYSQL_CA_FILE environment variable implicitly enables TLS unless
         // the URL specifies require_ssl=false

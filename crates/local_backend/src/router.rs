@@ -98,6 +98,7 @@ use crate::{
         audit_log,
         cancel_developer_job,
         create_function_handle,
+        create_service_token,
         internal_action_post,
         internal_mutation_post,
         internal_query_post,
@@ -121,6 +122,7 @@ use crate::{
         cancel_export,
         get_zip_export,
         request_zip_export,
+        request_zip_export_token,
         set_export_expiration,
     },
     snapshot_import::{
@@ -136,6 +138,7 @@ use crate::{
         storage_upload,
     },
     streaming_export::{
+        data_sync_cursor_from_deltas,
         document_deltas_get,
         document_deltas_post,
         get_table_column_names,
@@ -232,6 +235,15 @@ impl Modify for SecurityAddon {
 #[derive(OpenApi)]
 #[openapi(
     modifiers(&SecurityAddon),
+    // The data sync selection tree must be registered explicitly: these types
+    // are referenced only from flattened maps' `additionalProperties`, which
+    // utoipa's derived `schemas()` fails to register
+    // (https://github.com/juhaku/utoipa/issues/1330).
+    components(schemas(
+        common::types::streaming_export::selection::ComponentSelection,
+        common::types::streaming_export::selection::TableSelection,
+        common::types::streaming_export::selection::ColumnSelection,
+    )),
     info(
         title = "Convex Deployment API",
         version = "1.0.0",
@@ -313,6 +325,10 @@ pub fn router(st: LocalAppState) -> Router {
             "/deploy2/evaluate_push",
             post(deploy_config2::evaluate_push),
         )
+        .route(
+            "/deploy2/evaluate_schema",
+            post(deploy_config2::evaluate_schema),
+        )
         .route("/run_test_function", post(run_test_function))
         .route(
             "/deploy2/wait_for_schema",
@@ -342,6 +358,7 @@ pub fn router(st: LocalAppState) -> Router {
     let snapshot_export_routes = Router::new()
         .route("/request/zip", post(request_zip_export))
         .route("/zip/{id}", get(get_zip_export))
+        .route("/zip/{id}/token", post(request_zip_export_token))
         .route("/set_expiration/{snapshot_id}", post(set_export_expiration))
         .route("/cancel/{snapshot_id}", post(cancel_export));
 
@@ -400,6 +417,7 @@ pub fn router(st: LocalAppState) -> Router {
         .with_state(RouterState {
             api: Arc::new(st.application.clone()),
             runtime: st.application.runtime(),
+            subscription_reconnect_rate_limiter: None,
         });
 
     let version = SERVER_VERSION_STR.to_string();
@@ -441,6 +459,7 @@ where
         .route("/query", post(internal_query_post))
         .route("/mutation", post(internal_mutation_post))
         .route("/action", post(internal_action_post))
+        .route("/create_service_token", post(create_service_token))
         .route("/schedule_job", post(schedule_job))
         .route("/vector_search", post(vector_search))
         .route("/cancel_job", post(cancel_developer_job))
@@ -590,6 +609,10 @@ where
             get(test_streaming_export_connection),
         )
         .route("/get_table_column_names", get(get_table_column_names))
+        .route(
+            "/data_sync_cursor_from_deltas",
+            post(data_sync_cursor_from_deltas),
+        )
 }
 
 pub fn cors() -> CorsLayer {

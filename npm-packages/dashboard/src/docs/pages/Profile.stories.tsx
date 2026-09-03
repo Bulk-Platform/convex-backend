@@ -2,9 +2,8 @@ import { Meta, StoryObj } from "@storybook/nextjs";
 import { mocked, fn } from "storybook/test";
 import {
   useDeleteAccount,
-  useIdentities,
+  useMfaStatus,
   useProfileEmails,
-  useUnlinkIdentity,
   useUpdateProfileName,
 } from "api/profile";
 import {
@@ -13,6 +12,7 @@ import {
   usePaginatedPersonalAccessTokens,
 } from "api/personalAccessTokens";
 import { useDiscordAccounts, useUnlinkDiscordAccount } from "api/discord";
+import { useDirectorySyncOffers } from "api/directorySync";
 import { Profile } from "../../pages/profile";
 
 const now = Date.now();
@@ -45,8 +45,7 @@ const meta = {
     ]);
     mocked(useUpdateProfileName).mockReturnValue(fn());
     mocked(useDeleteAccount).mockReturnValue(fn());
-    mocked(useIdentities).mockReturnValue([]);
-    mocked(useUnlinkIdentity).mockReturnValue(fn());
+    mocked(useMfaStatus).mockReturnValue({ enabled: false });
     mocked(usePaginatedPersonalAccessTokens).mockReturnValue({
       data: {
         items: [
@@ -71,6 +70,7 @@ const meta = {
     mocked(useDeletePersonalAccessToken).mockReturnValue(fn());
     mocked(useDiscordAccounts).mockReturnValue([]);
     mocked(useUnlinkDiscordAccount).mockReturnValue(fn());
+    mocked(useDirectorySyncOffers).mockReturnValue([]);
   },
 } satisfies Meta<typeof Profile>;
 

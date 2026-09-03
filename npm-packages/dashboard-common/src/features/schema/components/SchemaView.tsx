@@ -1,6 +1,7 @@
 import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "convex/react";
 import { useRouter } from "next/router";
+import omit from "lodash/omit";
 import { Share2Icon, CubeIcon } from "@radix-ui/react-icons";
 import udfs from "@common/udfs";
 import {
@@ -19,7 +20,7 @@ import { Button } from "@ui/Button";
 import { Modal } from "@ui/Modal";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { ResizeHandle } from "@common/layouts/SidebarDetailLayout";
-import { useMediaQuery } from "@common/lib/useMediaQuery";
+import { useIsNarrowScreen } from "@ui/useIsNarrowScreen";
 import { ShowSchema } from "@common/features/data/components/ShowSchema";
 import {
   buildGraphFromSchema,
@@ -83,20 +84,20 @@ export function SchemaView({
 
   const [isShowingSchema, setIsShowingSchema] = useState(false);
 
-  // The schema page is feature-flagged; if it's off, don't render it even when
-  // reached by a direct URL — send the user to the data page.
+  // The CLI links here with `?showSchema=true` while a schema push is
+  // validating documents, since the schema modal shows validation progress.
+  // Consume the param and open the modal.
   const router = useRouter();
-  const { schemaPageEnabled, deploymentsURI } = useContext(
-    DeploymentInfoContext,
-  );
   useEffect(() => {
-    if (!schemaPageEnabled) {
-      void router.replace(`${deploymentsURI}/data`);
+    if (router.query.showSchema) {
+      setIsShowingSchema(true);
+      void router.replace(
+        { pathname: router.pathname, query: omit(router.query, "showSchema") },
+        undefined,
+        { shallow: true },
+      );
     }
-  }, [schemaPageEnabled, deploymentsURI, router]);
-  if (!schemaPageEnabled) {
-    return null;
-  }
+  }, [router]);
 
   if (!canViewData) {
     return (
@@ -204,7 +205,7 @@ function SchemaGraphWithNavigation({
 
   // On narrow screens the side panel is too cramped beside the graph, so stack
   // it below the graph (full width) instead of splitting horizontally.
-  const isMobile = useMediaQuery("(max-width: 768px)");
+  const isMobile = useIsNarrowScreen();
 
   // A bump-on-each-request signal that asks the graph to pan a table into view.
   // The nonce makes repeated requests for the same table re-trigger the pan.

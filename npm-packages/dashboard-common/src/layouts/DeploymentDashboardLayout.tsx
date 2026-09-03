@@ -11,7 +11,7 @@ import {
 } from "@radix-ui/react-icons";
 import { useQuery } from "convex/react";
 import { Link } from "@ui/Link";
-import { useContext, useState, useEffect } from "react";
+import { JSX, useContext, useState, useEffect } from "react";
 import udfs from "@common/udfs";
 import classNames from "classnames";
 import {
@@ -34,6 +34,7 @@ import { useIsCloudDeploymentInSelfHostedDashboard } from "@common/lib/useIsClou
 import { Tooltip } from "@ui/Tooltip";
 import Image from "next/image";
 import { ClosePanelButton } from "@ui/ClosePanelButton";
+import { UsageLimitDisabledBanner } from "@common/features/settings/components/UsageLimitDisabledBanner";
 
 type LayoutProps = {
   children: JSX.Element;
@@ -55,9 +56,7 @@ export function DeploymentDashboardLayout({
     useGlobalLocalStorage("functionRunnerOrientation", false);
   const [isRunnerExpanded, setIsRunnerExpanded] = useState(false);
   const isGlobalRunnerShown = useIsGlobalRunnerShown();
-  const { deploymentsURI: uriPrefix, schemaPageEnabled } = useContext(
-    DeploymentInfoContext,
-  );
+  const { deploymentsURI: uriPrefix } = useContext(DeploymentInfoContext);
   const { canViewDataCached } = useContext(PermissionsContext);
   const { isCloudDeploymentInSelfHostedDashboard, deploymentName } =
     useIsCloudDeploymentInSelfHostedDashboard();
@@ -75,17 +74,12 @@ export function DeploymentDashboardLayout({
       Icon: TableIcon,
       href: `${uriPrefix}/data`,
     },
-    // The schema visualizer is gated behind a feature flag during rollout.
-    ...(schemaPageEnabled
-      ? [
-          {
-            key: "schema",
-            label: "Schema",
-            Icon: CubeIcon,
-            href: `${uriPrefix}/schema`,
-          },
-        ]
-      : []),
+    {
+      key: "schema",
+      label: "Schema",
+      Icon: CubeIcon,
+      href: `${uriPrefix}/schema`,
+    },
     {
       key: `functions`,
       label: "Functions",
@@ -167,7 +161,7 @@ export function DeploymentDashboardLayout({
       <FunctionsProvider>
         <div className="flex h-full grow flex-col overflow-y-hidden">
           {(visiblePages === undefined ||
-            visiblePages.includes("settings")) && <PauseBanner />}
+            visiblePages.includes("settings")) && <DeploymentBanners />}
           <MobileBanner />
           <div className="flex h-full flex-col overflow-y-auto sm:flex-row">
             {sidebarItems.length > 0 && (
@@ -216,34 +210,42 @@ export function DeploymentDashboardLayout({
   );
 }
 
-function PauseBanner() {
+function DeploymentBanners() {
   const { canViewDataCached } = useContext(PermissionsContext);
-  const deploymentState = useQuery(
-    udfs.deploymentState.deploymentState,
+  const backendState = useQuery(
+    udfs.backendState.backendState,
     canViewDataCached ? {} : "skip",
   );
 
-  const { useCurrentTeam, useCurrentUsageBanner } = useContext(
+  const { useCurrentTeam, useCurrentUsageBanner, deploymentsURI } = useContext(
     DeploymentInfoContext,
   );
-
   const team = useCurrentTeam();
   const teamUsageBanner = useCurrentUsageBanner(team?.id ?? null);
 
-  const { deploymentsURI } = useContext(DeploymentInfoContext);
-
-  if (!(deploymentState?.state === "paused" && teamUsageBanner !== "Paused")) {
-    return null;
-  }
+  const isPaused =
+    backendState?.system === "none" &&
+    backendState?.user === "paused" &&
+    teamUsageBanner !== "Paused";
+  const isUsageLimitDisabled = backendState?.usage_limit === "disabled";
 
   return (
-    <div className="border-y bg-background-error py-2 text-center text-content-error">
-      This deployment is paused. Resume your deployment on the{" "}
-      <Link passHref href={`${deploymentsURI}/settings/pause-deployment`}>
-        settings
-      </Link>{" "}
-      page.
-    </div>
+    <>
+      {isPaused && (
+        <div className="border-y bg-background-error py-2 text-center text-content-error">
+          This deployment is paused. Resume your deployment on the{" "}
+          <Link passHref href={`${deploymentsURI}/settings/pause-deployment`}>
+            settings
+          </Link>{" "}
+          page.
+        </div>
+      )}
+      {isUsageLimitDisabled && (
+        <UsageLimitDisabledBanner
+          usageLimitsUri={`${deploymentsURI}/settings/usage-limits`}
+        />
+      )}
+    </>
   );
 }
 

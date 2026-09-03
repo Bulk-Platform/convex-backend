@@ -102,6 +102,7 @@ use database::{
     IndexModel,
     IndexTable,
     IndexWorkerMetadataTable,
+    NextPersistenceIndexIdTable,
     SchemaValidationProgressTable,
     SchemasTable,
     TablesTable,
@@ -113,6 +114,7 @@ use database::{
     INDEX_BACKFILLS_TABLE,
     INDEX_DOC_ID_INDEX,
     INDEX_WORKER_METADATA_TABLE,
+    NEXT_PERSISTENCE_INDEX_ID_TABLE,
     NUM_RESERVED_LEGACY_TABLE_NUMBERS,
     SCHEMAS_STATE_INDEX,
     SCHEMAS_TABLE,
@@ -153,7 +155,6 @@ use migrations_model::{
 use modules::{
     ModulesTable,
     MODULES_TABLE,
-    MODULE_INDEX_BY_DELETED,
     MODULE_INDEX_BY_PATH,
 };
 use scheduled_jobs::{
@@ -205,6 +206,7 @@ use crate::{
     },
     deployment_audit_log::{
         DeploymentAuditLogsTable,
+        AUDIT_LOG_INDEX_BY_ACTION,
         DEPLOYMENT_AUDIT_LOG_TABLE,
     },
     environment_variables::EnvironmentVariablesTable,
@@ -291,9 +293,10 @@ enum DefaultTableNumber {
     AuditLogConfig = 39,
     UsageLimits = 40,
     DataSyncProgress = 41,
+    NextPersistenceIndexId = 42,
     // Keep this number and your user name up to date. The number makes it easy to know
     // what to use next. The username on the same line detects merge conflicts
-    // Next Number - 42 - nipunn
+    // Next Number - 43 - tonyt
 }
 
 impl From<DefaultTableNumber> for TableNumber {
@@ -341,6 +344,7 @@ impl From<DefaultTableNumber> for &'static dyn ErasedSystemTable {
             DefaultTableNumber::AuditLogConfig => &AuditLogConfigTable,
             DefaultTableNumber::UsageLimits => &UsageLimitsTable,
             DefaultTableNumber::DataSyncProgress => &DataSyncProgressTable,
+            DefaultTableNumber::NextPersistenceIndexId => &NextPersistenceIndexIdTable,
         }
     }
 }
@@ -384,7 +388,6 @@ static SYSTEM_INDEXES_WITHOUT_CREATION_TIME: LazyLock<BTreeSet<IndexName>> = Laz
         ENVIRONMENT_VARIABLES_INDEX_BY_NAME.name(),
         EXPORTS_BY_STATE_AND_TS_INDEX.name(),
         FILE_STORAGE_ID_INDEX.name(),
-        MODULE_INDEX_BY_DELETED.name(),
         MODULE_INDEX_BY_PATH.name(),
         SCHEDULED_JOBS_INDEX.name(),
         SCHEDULED_JOBS_INDEX_BY_COMPLETED_TS.name(),
@@ -402,7 +405,17 @@ pub async fn initialize_application_system_tables<RT: Runtime>(
     database: &Database<RT>,
 ) -> anyhow::Result<()> {
     let mut tx = database.begin(Identity::system()).await?;
+    NextPersistenceIndexIdTable::initialize(
+        &mut tx,
+        DEFAULT_TABLE_NUMBERS
+            .get(&NEXT_PERSISTENCE_INDEX_ID_TABLE)
+            .copied(),
+    )
+    .await?;
     for table in app_system_tables() {
+        if table.table_name() == NEXT_PERSISTENCE_INDEX_ID_TABLE {
+            continue;
+        }
         let is_new = initialize_application_system_table(
             &mut tx,
             table,
@@ -495,6 +508,7 @@ pub async fn initialize_application_system_table<RT: Runtime>(
                 let IndexConfig::Database {
                     spec,
                     on_disk_state: _,
+                    persistence_index_id: _,
                 } = &index.config
                 else {
                     // This isn't a strict requirement; it's just not implemented or needed.
@@ -617,6 +631,7 @@ static APP_TABLES_TO_LOAD_IN_MEMORY: LazyLock<BTreeSet<TableName>> = LazyLock::n
         AWS_LAMBDA_VERSIONS_TABLE.clone(),
         SOURCE_PACKAGES_TABLE.clone(),
         USAGE_LIMITS_TABLE.clone(),
+        NEXT_PERSISTENCE_INDEX_ID_TABLE.clone(),
     }
 });
 
@@ -669,6 +684,7 @@ pub static FIRST_SEEN_TABLE: LazyLock<BTreeMap<TableName, DatabaseVersion>> = La
         AUDIT_LOG_CONFIG_TABLE.clone() => 124,
         USAGE_LIMITS_TABLE.clone() => 126,
         DATA_SYNC_PROGRESS_TABLE.clone() => 127,
+        NEXT_PERSISTENCE_INDEX_ID_TABLE.clone() => 129,
     }
 });
 
@@ -687,7 +703,6 @@ pub static FIRST_SEEN_INDEX: LazyLock<BTreeMap<IndexName, DatabaseVersion>> = La
         EXPORTS_BY_STATE_AND_TS_INDEX.name() => 88,
         TABLES_BY_NAME_INDEX.name() => 44,
         SCHEMAS_STATE_INDEX.name() => 44,
-        MODULE_INDEX_BY_DELETED.name() => 90,
         ENVIRONMENT_VARIABLES_INDEX_BY_NAME.name() => 91,
         INDEX_DOC_ID_INDEX.name() => 92,
         COMPONENTS_BY_PARENT_INDEX.name() => 100,
@@ -698,5 +713,6 @@ pub static FIRST_SEEN_INDEX: LazyLock<BTreeMap<IndexName, DatabaseVersion>> = La
         USAGE_LIMITS_INDEX_BY_SELECTOR.name() => 126,
         DATA_SYNC_PROGRESS_INDEX_BY_SYNC_ID.name() => 127,
         DATA_SYNC_PROGRESS_INDEX_BY_LAST_UPDATED.name() => 127,
+        AUDIT_LOG_INDEX_BY_ACTION.name() => 128,
     }
 });

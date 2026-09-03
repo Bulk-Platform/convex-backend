@@ -2,33 +2,23 @@ import { useFlags } from "launchdarkly-react-client-sdk";
 import kebabCase from "lodash/kebabCase";
 
 export const flagDefaults: {
-  commandPalette: boolean;
   commandPaletteDeleteProjects: boolean;
-  singleSignOn: boolean;
-  workOsEnvironmentProvisioningDashboardUi: boolean;
   enableNewDashboardVersionNotification: boolean;
-  enableStatuspageWidget: boolean;
   connectionStateCheckIntervalMs: number;
-  scopedDeployKeys: boolean;
-  customRoles: boolean;
-  logStreamTopicFilters: boolean;
-  schemaPage: boolean;
-  usageLimits: boolean;
   nonDefaultTeamDevsInMainMenu: number;
+  showAiGatewayUsage: boolean;
+  ephemeralZipExportToken: boolean;
+  directorySync: boolean;
+  promos: boolean;
 } = {
-  commandPalette: false,
   commandPaletteDeleteProjects: false,
-  singleSignOn: false,
-  workOsEnvironmentProvisioningDashboardUi: false,
   enableNewDashboardVersionNotification: false,
-  enableStatuspageWidget: true,
   connectionStateCheckIntervalMs: 2500,
-  scopedDeployKeys: false,
-  customRoles: false,
-  logStreamTopicFilters: false,
-  schemaPage: false,
-  usageLimits: false,
   nonDefaultTeamDevsInMainMenu: 10,
+  showAiGatewayUsage: false,
+  ephemeralZipExportToken: false,
+  directorySync: false,
+  promos: false,
 };
 
 export const flagDefaultsKebabCase = Object.entries(flagDefaults).reduce(
