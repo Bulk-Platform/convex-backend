@@ -1882,6 +1882,11 @@ pub static EXPORT_PROGRESS_UPDATE_INTERVAL: LazyLock<Duration> =
 pub static EXPORT_MALLOC_TRIM_ENABLED: LazyLock<bool> =
     LazyLock::new(|| env_config("EXPORT_MALLOC_TRIM_ENABLED", false));
 
+/// Optional self-hosted periodic cleanup. Zero disables it; positive intervals
+/// must be at least 60 seconds. Independent of the post-export cleanup flag.
+pub static ALLOCATOR_MALLOC_TRIM_INTERVAL_SECS: LazyLock<u64> =
+    LazyLock::new(|| env_config("ALLOCATOR_MALLOC_TRIM_INTERVAL_SECS", 0));
+
 /// Whether or not a service should propagate all upstream traces or perform its
 /// own sampling
 pub static PROPAGATE_UPSTREAM_TRACES: LazyLock<bool> =
