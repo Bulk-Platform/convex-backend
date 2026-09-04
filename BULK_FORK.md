@@ -17,12 +17,23 @@ The Bulk-only runtime knobs are:
 
 - `LOCAL_BACKEND_MAX_CONCURRENT_REQUESTS` for the main self-hosted listener.
 - `SITE_PROXY_MAX_CONCURRENT_REQUESTS` for the public HTTP-action proxy.
+- `EXPORT_MALLOC_TRIM_ENABLED` to run glibc `malloc_trim(0)` on a blocking
+  worker after each successful snapshot export. It defaults to `false` and
+  should only be enabled after measuring trim duration and query tail latency.
 
 The fork also carries the small self-hosted export-memory fix from upstream PR
 #436 while upstream issue #435 remains open. It unregisters `_file_storage`
 metadata after each component export and avoids reading a whole local-storage
 object merely to determine its size. Keep this patch until upstream ships an
 equivalent fix.
+
+Bulk's glibc-based self-hosted image can retain free pages across repeated
+exports even after the export buffers are dropped. The opt-in trim hook records
+attempts, duration, and observed RSS reclaimed as
+`snapshot_export_malloc_trim_total`,
+`snapshot_export_malloc_trim_seconds`, and
+`snapshot_export_malloc_trim_reclaimed_bytes`. Do not combine it with
+jemalloc-only `MALLOC_CONF` settings or an artificial glibc arena cap.
 
 The implementations live in `crates/common/src/knobs.rs` and
 `crates/local_backend/src/`. Production values belong in `bulk-infra`, not in
