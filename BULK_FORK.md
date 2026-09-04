@@ -23,8 +23,8 @@ The Bulk-only runtime knobs are:
 - `ALLOCATOR_MALLOC_TRIM_INTERVAL_SECS` enables a self-hosted periodic cleanup
   timer. It defaults to zero (disabled); positive values below 60 are rejected.
   The timer waits a full interval before its first pass and after each pass.
-  Both triggers share a nonblocking lock, so overlapping trims are skipped.
-  Use a fixed-load canary before enabling this on another host.
+  Both triggers share a nonblocking lock, so overlapping trims are skipped. Use
+  a fixed-load canary before enabling this on another host.
 
 The fork also carries the small self-hosted export-memory fix from upstream PR
 #436 while upstream issue #435 remains open. It unregisters `_file_storage`
