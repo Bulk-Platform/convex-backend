@@ -368,6 +368,7 @@ dependencies = [
  "log_streaming",
  "lru 0.18.0",
  "maplit",
+ "memory-stats",
  "metrics",
  "model",
  "must-let",

@@ -1876,6 +1876,12 @@ pub static EXPORT_WORKER_PAGE_SIZE: LazyLock<usize> =
 pub static EXPORT_PROGRESS_UPDATE_INTERVAL: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("EXPORT_PROGRESS_UPDATE_INTERVAL_SECS", 5)));
 
+/// Whether to ask glibc to release unused allocator pages after a successful
+/// snapshot export. This is disabled by default because `malloc_trim` pauses
+/// allocation while it walks allocator arenas and is only available on glibc.
+pub static EXPORT_MALLOC_TRIM_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_config("EXPORT_MALLOC_TRIM_ENABLED", false));
+
 /// Whether or not a service should propagate all upstream traces or perform its
 /// own sampling
 pub static PROPAGATE_UPSTREAM_TRACES: LazyLock<bool> =
