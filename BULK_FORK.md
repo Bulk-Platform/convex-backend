@@ -30,8 +30,7 @@ equivalent fix.
 Bulk's glibc-based self-hosted image can retain free pages across repeated
 exports even after the export buffers are dropped. The opt-in trim hook records
 attempts, duration, and observed RSS reclaimed as
-`snapshot_export_malloc_trim_total`,
-`snapshot_export_malloc_trim_seconds`, and
+`snapshot_export_malloc_trim_total`, `snapshot_export_malloc_trim_seconds`, and
 `snapshot_export_malloc_trim_reclaimed_bytes`. Do not combine it with
 jemalloc-only `MALLOC_CONF` settings or an artificial glibc arena cap.
 
