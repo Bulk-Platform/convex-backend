@@ -20,6 +20,11 @@ The Bulk-only runtime knobs are:
 - `EXPORT_MALLOC_TRIM_ENABLED` to run glibc `malloc_trim(0)` on a blocking
   worker after each successful snapshot export. It defaults to `false` and
   should only be enabled after measuring trim duration and query tail latency.
+- `ALLOCATOR_MALLOC_TRIM_INTERVAL_SECS` enables a self-hosted periodic cleanup
+  timer. It defaults to zero (disabled); positive values below 60 are rejected.
+  The timer waits a full interval before its first pass and after each pass.
+  Both triggers share a nonblocking lock, so overlapping trims are skipped. Use
+  a fixed-load canary before enabling this on another host.
 
 The fork also carries the small self-hosted export-memory fix from upstream PR
 #436 while upstream issue #435 remains open. It unregisters `_file_storage`
@@ -33,6 +38,13 @@ attempts, duration, and observed RSS reclaimed as
 `snapshot_export_malloc_trim_total`, `snapshot_export_malloc_trim_seconds`, and
 `snapshot_export_malloc_trim_reclaimed_bytes`. Do not combine it with
 jemalloc-only `MALLOC_CONF` settings or an artificial glibc arena cap.
+
+The shared hook additionally records `allocator_malloc_trim_total` and
+`allocator_malloc_trim_seconds` labeled by `reason` (`export` or `periodic`).
+Logs include glibc arena allocated/free bytes and directly mapped bytes before
+and after cleanup. These are allocator statistics, not an exact accounting of
+resident pages; thread caches are included in the allocated estimate. Existing
+export metric names remain available. No database format changes are involved.
 
 The implementations live in `crates/common/src/knobs.rs` and
 `crates/local_backend/src/`. Production values belong in `bulk-infra`, not in

@@ -4,8 +4,6 @@ use std::{
 };
 
 use anyhow::Context;
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-use common::runtime::tokio_spawn_blocking;
 use common::{
     self,
     backoff::Backoff,
@@ -54,12 +52,11 @@ use usage_tracking::{
 };
 use value::ResolvedDocumentId;
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-use crate::exports::metrics::{
-    log_malloc_trim,
-    log_malloc_trim_join_error,
-};
 use crate::{
+    allocator::{
+        trim_allocator,
+        TrimReason,
+    },
     exports::metrics::log_export_failed,
     metrics::log_worker_starting,
 };
@@ -67,67 +64,12 @@ use crate::{
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(900); // 15 minutes
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-struct AllocatorTrimResult {
-    duration: Duration,
-    released: bool,
-    rss_before_bytes: Option<usize>,
-    rss_after_bytes: Option<usize>,
-}
-
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-impl AllocatorTrimResult {
-    fn reclaimed_bytes(&self) -> Option<usize> {
-        Some(self.rss_before_bytes?.saturating_sub(self.rss_after_bytes?))
-    }
-}
-
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn trim_glibc_allocator() -> AllocatorTrimResult {
-    let rss_before_bytes = memory_stats::memory_stats().map(|stats| stats.physical_mem);
-    let started = std::time::Instant::now();
-    // SAFETY: malloc_trim takes no pointers and zero is the documented value
-    // for releasing every completely free page glibc can reclaim.
-    let released = unsafe { libc::malloc_trim(0) } != 0;
-    let duration = started.elapsed();
-    let rss_after_bytes = memory_stats::memory_stats().map(|stats| stats.physical_mem);
-    AllocatorTrimResult {
-        duration,
-        released,
-        rss_before_bytes,
-        rss_after_bytes,
-    }
-}
-
 async fn maybe_trim_allocator_after_export() {
     if !*EXPORT_MALLOC_TRIM_ENABLED {
         return;
     }
 
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    match tokio_spawn_blocking("snapshot_export_malloc_trim", trim_glibc_allocator).await {
-        Ok(result) => {
-            let reclaimed_bytes = result.reclaimed_bytes();
-            log_malloc_trim(result.duration, result.released, reclaimed_bytes);
-            tracing::info!(
-                released = result.released,
-                duration_seconds = result.duration.as_secs_f64(),
-                rss_before_bytes = result.rss_before_bytes,
-                rss_after_bytes = result.rss_after_bytes,
-                rss_reclaimed_bytes = reclaimed_bytes,
-                "Post-export glibc malloc_trim completed"
-            );
-        },
-        Err(error) => {
-            log_malloc_trim_join_error();
-            tracing::warn!(%error, "Post-export glibc malloc_trim task failed");
-        },
-    }
-
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    tracing::warn!(
-        "EXPORT_MALLOC_TRIM_ENABLED is set, but malloc_trim is unavailable on this platform"
-    );
+    trim_allocator(TrimReason::Export).await;
 }
 
 #[derive(thiserror::Error, Debug)]

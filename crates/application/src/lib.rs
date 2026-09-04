@@ -426,6 +426,7 @@ use crate::{
 
 pub mod ai_gateway_jwt;
 pub mod airbyte_import;
+pub mod allocator;
 pub mod api;
 pub mod app_metric_seed;
 pub mod application_function_runner;
