@@ -22,6 +22,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.13"
@@ -30,7 +34,8 @@ jobs:
 
       - name: Get dprint version
         run: |
-          echo DPRINT_VERSION=$(node -p "require('./scripts/package.json').devDependencies['dprint']") >> $GITHUB_ENV
+          dprint_version="$(node -p "require('./scripts/package.json').devDependencies['dprint']")"
+          echo "DPRINT_VERSION=$dprint_version" >> "$GITHUB_ENV"
 
       - uses: dprint/check@9cb3a2b17a8e606d37aae341e49df3654933fc23 # v2.3
         with:

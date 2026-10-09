@@ -8,6 +8,7 @@ on:
 jobs:
   check-cla:
     name: Check CLA in PR description
+    if: github.repository == 'get-convex/convex-backend'
     runs-on: ubuntu-latest
 
     steps:
