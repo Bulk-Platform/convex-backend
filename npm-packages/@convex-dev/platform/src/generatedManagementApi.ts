@@ -1577,6 +1577,7 @@ export interface components {
              *     this project, if one exists (an active local deployment or default
              *     cloud dev deployment). */
             devDeploymentName?: string | null;
+            tags: string[];
         };
         ProjectSlug: string;
         ProposedTeamName: string;

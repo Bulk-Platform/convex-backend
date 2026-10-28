@@ -24,6 +24,7 @@ const project: ProjectResponse = {
   name: "My amazing app",
   slug: "my-amazing-app",
   createTime: Date.now(),
+  tags: [],
   prodDeploymentName: "musical-otter-456",
   devDeploymentName: "happy-capybara-123",
 };

@@ -4447,7 +4447,8 @@
           "slug",
           "teamId",
           "teamSlug",
-          "createTime"
+          "createTime",
+          "tags"
         ],
         "properties": {
           "id": {
@@ -4486,6 +4487,12 @@
               "null"
             ],
             "description": "The name of the requesting member's default development deployment for\nthis project, if one exists (an active local deployment or default\ncloud dev deployment)."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
