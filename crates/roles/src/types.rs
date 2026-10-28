@@ -212,6 +212,7 @@ pub enum RolePolicyAction {
     UpdateDeploymentType(DeploymentId),
     DeleteDeployment(DeploymentId),
     ViewDeployments(DeploymentId),
+    WriteDeploymentEnvironmentVariables(DeploymentId),
     UseAiGateway {
         project_id: ProjectId,
         owner: MemberId,
@@ -485,6 +486,7 @@ impl RolePolicyAction {
             | P::UpdateDeploymentType(id)
             | P::DeleteDeployment(id)
             | P::ViewDeployments(id)
+            | P::WriteDeploymentEnvironmentVariables(id)
             | P::ViewDeploymentIntegrations(id)
             | P::WriteDeploymentIntegrations(id)
             | P::CreateCustomDomain(id)
@@ -626,6 +628,7 @@ impl RolePolicyAction {
             P::UpdateDeploymentType(_) => S::UpdateDeploymentType,
             P::DeleteDeployment(_) => S::DeleteDeployment,
             P::ViewDeployments(_) => S::ViewDeployments,
+            P::WriteDeploymentEnvironmentVariables(_) => S::WriteEnvironmentVariables,
             P::ViewDeploymentIntegrations(_) => S::ViewDeploymentIntegrations,
             P::WriteDeploymentIntegrations(_) => S::WriteDeploymentIntegrations,
             P::CreateCustomDomain(_) => S::CreateCustomDomain,
