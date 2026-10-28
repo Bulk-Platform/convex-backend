@@ -546,6 +546,18 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "tag",
+            "in": "query",
+            "description": "Only return projects with this tag. This parameter can be provided more than once to match projects with any of several tags",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
           }
         ],
         "responses": {

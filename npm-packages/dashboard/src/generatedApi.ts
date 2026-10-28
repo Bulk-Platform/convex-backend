@@ -3739,6 +3739,8 @@ export interface operations {
                 limit?: number;
                 /** @description Search query to filter projects by name or slug (case-insensitive) */
                 q?: string;
+                /** @description Only return projects with this tag. This parameter can be provided more than once to match projects with any of several tags */
+                tag?: string[];
             };
             header?: never;
             path: {
