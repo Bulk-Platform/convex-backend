@@ -110,7 +110,10 @@ pub(crate) struct ReplicaWriter<RT: Runtime> {
     stopped: AtomicBool,
     queue: mpsc::Sender<ReplayQueueMessage<RT>>,
     pub(super) settings: Settings,
+    /// Held by sampled scans from sampling through outcome logging.
     pub(super) comparison_permits: Arc<Semaphore>,
+    /// Held only while a comparison reads V6.
+    pub(super) replica_read_permits: Semaphore,
     writer_state_gauge: Arc<metrics::WriterStateGauge>,
 }
 
@@ -133,6 +136,7 @@ impl<RT: Runtime> ReplicaWriter<RT> {
             stopped: AtomicBool::new(false),
             queue,
             comparison_permits: Arc::new(Semaphore::new(settings.max_concurrent_comparisons)),
+            replica_read_permits: Semaphore::new(settings.max_concurrent_replica_reads),
             settings,
             writer_state_gauge,
         });

@@ -256,7 +256,7 @@ struct IndexScanComparison<RT: Runtime> {
     source_calls: Arc<RwLock<()>>,
     scan: IndexScanRequest,
     // Held from sampling through outcome logging to bound capture buffers and
-    // concurrent V6 reads, and let tests wait for recorded outcomes.
+    // let tests wait for recorded outcomes.
     _permit: OwnedSemaphorePermit,
 }
 
@@ -306,39 +306,42 @@ impl<RT: Runtime> IndexScanComparison<RT> {
         source_exhausted: bool,
     ) -> ComparisonOutcome {
         let scan = &self.scan;
+        let deadline = tokio::time::Instant::now() + self.replica.settings.apply_wait;
         // V5 commits can be visible before their replay is queued. Once source
         // calls are idle, every write observed by this scan has queued replay
         // or retired the replica. Release the lock before waiting for replay.
         if self.source_calls.try_write().is_err() {
             return ComparisonOutcome::Invalidated;
         }
-        if !self
-            .replica
-            .wait_for_prior_replay(Some(
-                tokio::time::Instant::now() + self.replica.settings.apply_wait,
-            ))
-            .await
-        {
+        if !self.replica.wait_for_prior_replay(Some(deadline)).await {
             return ComparisonOutcome::Invalidated;
         }
         // Once V5 reaches the end, read one extra entry to detect a longer V6
         // result. A captured prefix establishes only its own length.
         let limit = source_entries.len() + usize::from(source_exhausted);
         let reader = self.replica.v6.reader();
-        let replica_entries: anyhow::Result<Vec<IndexEntryMetadata>> = reader
-            .index_scan(
-                scan.index,
-                scan.tablet_id,
-                scan.read_timestamp,
-                &scan.range,
-                scan.order,
-                limit,
-                scan.retention_validator.clone(),
-            )
-            .take(limit)
-            .map_ok(|(key, document)| IndexEntryMetadata::new(key, &document))
-            .try_collect()
-            .await;
+        let replica_entries: anyhow::Result<Vec<IndexEntryMetadata>> = {
+            let Ok(Ok(_read_permit)) =
+                tokio::time::timeout_at(deadline, self.replica.replica_read_permits.acquire())
+                    .await
+            else {
+                return ComparisonOutcome::Dropped;
+            };
+            reader
+                .index_scan(
+                    scan.index,
+                    scan.tablet_id,
+                    scan.read_timestamp,
+                    &scan.range,
+                    scan.order,
+                    limit,
+                    scan.retention_validator.clone(),
+                )
+                .take(limit)
+                .map_ok(|(key, document)| IndexEntryMetadata::new(key, &document))
+                .try_collect()
+                .await
+        };
         if scan
             .retention_validator
             .validate_snapshot(scan.read_timestamp)
@@ -355,8 +358,11 @@ impl<RT: Runtime> IndexScanComparison<RT> {
                 return ComparisonOutcome::Error;
             },
         };
-        // Retirement can delete data during the scan; check ownership after
-        // reading to avoid reporting cleanup as a mismatch.
+        if replica_entries == source_entries {
+            return ComparisonOutcome::Match;
+        }
+        // Retirement can delete data during the scan; confirm ownership before
+        // reporting cleanup as a mismatch.
         match self.replica.is_active_owner().await {
             Ok(true) => {},
             Ok(false) => return ComparisonOutcome::Invalidated,
@@ -364,9 +370,6 @@ impl<RT: Runtime> IndexScanComparison<RT> {
                 tracing::warn!("V6 replica comparison could not read replica state: {error:#}");
                 return ComparisonOutcome::Error;
             },
-        }
-        if replica_entries == source_entries {
-            return ComparisonOutcome::Match;
         }
         let position = source_entries
             .iter()

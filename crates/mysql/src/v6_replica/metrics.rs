@@ -56,7 +56,8 @@ pub(crate) enum ComparisonOutcome {
     Sampled,
     /// Comparison requires an active replica and a persistence index ID.
     Ineligible,
-    /// The deployment's comparison concurrency limit was reached.
+    /// No capture slot when sampled, or no replica read slot before the
+    /// comparison's `apply_wait` deadline.
     Dropped,
     /// The V5 scan failed while collecting entries.
     ServingError,

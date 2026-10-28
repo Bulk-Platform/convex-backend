@@ -32,8 +32,13 @@ pub(super) struct Settings {
     /// Fraction of V5 index scans selected before eligibility checks.
     pub(super) comparison_sample_rate: f64,
     pub(super) max_comparison_entries: usize,
-    /// Includes source scans still collecting entries for comparison.
+    /// Sampled scans capturing entries or awaiting a verdict; bounds capture
+    /// memory. Scans sampled beyond it are dropped.
     pub(super) max_concurrent_comparisons: usize,
+    /// V6 index scans in flight for comparisons. A comparison waits for a slot
+    /// until its `apply_wait` deadline, which the replay barrier shares, then
+    /// is dropped.
+    pub(super) max_concurrent_replica_reads: usize,
 }
 
 /// Fraction of V5 index scans compared against the V6 replica, settable per
@@ -48,8 +53,14 @@ pub(super) static MYSQL_V6_REPLICA_COMPARE_SAMPLE_RATE: LazyLock<f64> = LazyLock
     }
 });
 
-/// The sample rate is the one knob; the limits are constants until operating
-/// the replica shows which of them need tuning.
+/// V6 index scans in flight for comparisons per deployment, settable per
+/// conductor. Zero makes every comparison wait out its deadline and drop; use
+/// the sample rate to turn comparisons off.
+pub(super) static MYSQL_V6_REPLICA_MAX_CONCURRENT_REPLICA_READS: LazyLock<usize> =
+    LazyLock::new(|| env_config("MYSQL_V6_REPLICA_MAX_CONCURRENT_REPLICA_READS", 8));
+
+/// The sample rate and the replica read slots are knobs; the other limits are
+/// constants until operating the replica shows which of them need tuning.
 pub(super) static SETTINGS: LazyLock<Settings> = LazyLock::new(|| Settings {
     apply_wait: Duration::from_secs(2),
     max_queued_jobs: 1024,
@@ -57,5 +68,6 @@ pub(super) static SETTINGS: LazyLock<Settings> = LazyLock::new(|| Settings {
     init_timeout: Duration::from_secs(10),
     comparison_sample_rate: *MYSQL_V6_REPLICA_COMPARE_SAMPLE_RATE,
     max_comparison_entries: 128,
-    max_concurrent_comparisons: 4,
+    max_concurrent_comparisons: 64,
+    max_concurrent_replica_reads: *MYSQL_V6_REPLICA_MAX_CONCURRENT_REPLICA_READS,
 });
