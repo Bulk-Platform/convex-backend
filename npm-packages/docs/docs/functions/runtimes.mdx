@@ -201,6 +201,10 @@ export const updateSomething = mutation({
 });
 ```
 
+For why `Date.now()` is frozen, and how it relates to `_creationTime` and
+[commit timestamps](/database/advanced/commit-timestamp), see
+[this whiteboard session](https://www.youtube.com/watch?v=pHrxmSjxLg8).
+
 Likewise, `performance.now()` is fixed to same result during query function
 execution. However, `performance.now()` will increment inside mutations.
 [`Performance.timeOrigin`](https://developer.mozilla.org/en-US/docs/Web/API/Performance/timeOrigin)
