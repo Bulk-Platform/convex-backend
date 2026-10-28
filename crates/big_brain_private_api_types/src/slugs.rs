@@ -8,6 +8,10 @@ use regex::Regex;
 // format.
 static SLUG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\w-]+$").unwrap());
 
+pub fn is_slug_charset(s: &str) -> bool {
+    SLUG_REGEX.is_match(s)
+}
+
 pub fn validate_slug(slug: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         slug.len() >= 3,
@@ -18,7 +22,7 @@ pub fn validate_slug(slug: &str) -> anyhow::Result<()> {
         ErrorMetadata::bad_request("InvalidSlug", "Slug must be at most 64 characters long.",)
     );
     anyhow::ensure!(
-        SLUG_REGEX.is_match(slug),
+        is_slug_charset(slug),
         ErrorMetadata::bad_request(
             "InvalidSlug",
             "Slug must contain only numbers, letters, and '-'.",
