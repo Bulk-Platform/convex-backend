@@ -76,6 +76,9 @@ export function useStripePaymentSetup(
 
   const options: StripeElementsOptions = {
     clientSecret,
+    // Stripe defaults to the browser's locale; the rest of the dashboard is
+    // English-only.
+    locale: "en",
     // TODO: Finish styling to have the Stripe form match the rest of the app
     appearance: {
       theme: "stripe",
