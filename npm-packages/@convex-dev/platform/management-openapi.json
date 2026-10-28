@@ -121,7 +121,7 @@
           "Projects"
         ],
         "summary": "Update project",
-        "description": "Update a project's name and/or slug. Returns the updated project.",
+        "description": "Update a project's name, slug, and/or tags. Returns the updated project.",
         "operationId": "update project",
         "parameters": [
           {
@@ -3761,6 +3761,15 @@
                 "description": "When creating a deployment, the hosting region to use for the\ndeployment. If not provided, the default deployment region for your\nteam will be used."
               }
             ]
+          },
+          "tags": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
           }
         },
         "additionalProperties": false
@@ -4424,6 +4433,16 @@
                 "description": "New slug for the project. If omitted, the slug is left unchanged."
               }
             ]
+          },
+          "tags": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Replaces the project's full set of tags; `[]` clears them. If omitted,\nthe tags are left unchanged."
           }
         },
         "additionalProperties": false

@@ -44,7 +44,7 @@ export interface paths {
         head?: never;
         /**
          * Update project
-         * @description Update a project's name and/or slug. Returns the updated project.
+         * @description Update a project's name, slug, and/or tags. Returns the updated project.
          */
         patch: operations["update project"];
         trace?: never;
@@ -1291,6 +1291,7 @@ export interface components {
              *     used. */
             deploymentClass?: string | null;
             deploymentRegion?: null | components["schemas"]["RegionName"];
+            tags?: string[] | null;
         };
         PlatformCreateProjectResponse: {
             /** @description Deprecated alias for `id`, kept for backwards compatibility. */
@@ -1551,6 +1552,9 @@ export interface components {
         PlatformUpdateProjectArgs: {
             name?: null | components["schemas"]["ProjectName"];
             slug?: null | components["schemas"]["ProjectSlug"];
+            /** @description Replaces the project's full set of tags; `[]` clears them. If omitted,
+             *     the tags are left unchanged. */
+            tags?: string[] | null;
         };
         PreviewDeploymentIdentifier: string;
         /** Format: int64 */
