@@ -12,6 +12,7 @@ use std::{
         Context,
         Poll,
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -309,9 +310,17 @@ impl<RT: Runtime> IndexScanComparison<RT> {
         let deadline = tokio::time::Instant::now() + self.replica.settings.apply_wait;
         // V5 commits can be visible before their replay is queued. Once source
         // calls are idle, every write observed by this scan has queued replay
-        // or retired the replica. Release the lock before waiting for replay.
-        if self.source_calls.try_write().is_err() {
-            return ComparisonOutcome::Invalidated;
+        // or retired the replica. A busy deployment is rarely idle on the
+        // first look, so poll until the deadline; each successful try drops
+        // the lock at once so queued source calls are not held up.
+        loop {
+            if self.source_calls.try_write().is_ok() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return ComparisonOutcome::Invalidated;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         if !self.replica.wait_for_prior_replay(Some(deadline)).await {
             return ComparisonOutcome::Invalidated;

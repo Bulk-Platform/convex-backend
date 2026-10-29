@@ -302,7 +302,7 @@ impl<RT: Runtime> Persistence<RT> {
         let multitenant = self.multitenant;
         let instance_name = mysql_async::Value::from(&self.instance_name.raw);
         self.lease
-            .transact(async move |tx| {
+            .transact("write", async move |tx| {
                 // First, process all of the full document chunks.
                 let mut document_chunks = smart_chunks(documents);
                 for chunk in &mut document_chunks {
@@ -436,7 +436,7 @@ impl<RT: Runtime> PersistenceTrait for Persistence<RT> {
         let multitenant = self.multitenant;
         let instance_name = mysql_async::Value::from(&self.instance_name.raw);
         self.lease
-            .transact(async move |tx| {
+            .transact("write_persistence_global", async move |tx| {
                 let stmt = super::write_persistence_global(multitenant);
                 let mut params = if multitenant {
                     vec![instance_name]
@@ -482,7 +482,7 @@ impl<RT: Runtime> PersistenceTrait for Persistence<RT> {
             }
         });
         self.lease
-            .transact(async move |tx| {
+            .transact("delete_documents", async move |tx| {
                 let mut deleted_count = 0;
                 for chunk in smart_chunks(&documents) {
                     let mut params = Vec::with_capacity(
@@ -516,7 +516,7 @@ impl<RT: Runtime> PersistenceTrait for Persistence<RT> {
         let multitenant = self.multitenant;
         let instance_name = mysql_async::Value::from(&self.instance_name.raw);
         self.lease
-            .transact(async move |tx| {
+            .transact("delete_tablet_documents", async move |tx| {
                 let mut deleted_count = 0;
                 let mut params = Vec::with_capacity(
                     super::documents::DELETE_TABLE_COLUMN_COUNT + (multitenant as usize),
@@ -1436,13 +1436,13 @@ impl<RT: Runtime> Lease<RT> {
     /// it will succeed. Instead, a new `Lease` must be made with `acquire`,
     /// and any in-memory state then resynced because of any changes that
     /// might've been made to the database state while the lease was not
-    /// held.
+    /// held. `op` names the persistence operation on the commit metric.
     #[fastrace::trace]
-    pub(crate) async fn transact<F, T>(&self, f: F) -> anyhow::Result<T>
+    pub(crate) async fn transact<F, T>(&self, op: &'static str, f: F) -> anyhow::Result<T>
     where
         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
     {
-        self.transact_with_isolation(None, f).await
+        self.transact_with_isolation(op, None, f).await
     }
 
     /// Like [`Self::transact`], but runs at READ COMMITTED instead of the
@@ -1450,17 +1450,22 @@ impl<RT: Runtime> Lease<RT> {
     /// this so their DELETEs take only record locks, sparing concurrent index
     /// writers the next-key/gap locks REPEATABLE READ adds.
     #[fastrace::trace]
-    pub(crate) async fn transact_read_committed<F, T>(&self, f: F) -> anyhow::Result<T>
+    pub(crate) async fn transact_read_committed<F, T>(
+        &self,
+        op: &'static str,
+        f: F,
+    ) -> anyhow::Result<T>
     where
         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
     {
-        self.transact_with_isolation(Some(IsolationLevel::ReadCommitted), f)
+        self.transact_with_isolation(op, Some(IsolationLevel::ReadCommitted), f)
             .await
     }
 
     #[fastrace::trace]
     async fn transact_with_isolation<F, T>(
         &self,
+        op: &'static str,
         isolation: Option<IsolationLevel>,
         f: F,
     ) -> anyhow::Result<T>
@@ -1498,7 +1503,7 @@ impl<RT: Runtime> Lease<RT> {
                 )))
                 .await?;
 
-            let timer = metrics::commit_timer(self.pool.cluster_name());
+            let timer = metrics::commit_timer(self.pool.cluster_name(), op);
             tx.commit().await?;
             timer.finish();
 

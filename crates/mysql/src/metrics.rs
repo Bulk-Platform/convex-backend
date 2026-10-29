@@ -433,12 +433,13 @@ pub fn lease_precond_timer(cluster_name: &str) -> StatusTimer {
 
 register_convex_histogram!(
     MYSQL_COMMIT_SECONDS,
-    "Time to commit a transaction",
-    &[STATUS_LABEL[0], "cluster_name"]
+    "Time to commit a transaction, by the persistence operation that ran it",
+    &[STATUS_LABEL[0], "cluster_name", "op"]
 );
-pub fn commit_timer(cluster_name: &str) -> StatusTimer {
+pub fn commit_timer(cluster_name: &str, op: &'static str) -> StatusTimer {
     let mut timer = StatusTimer::new(&MYSQL_COMMIT_SECONDS);
     timer.add_label(cluster_name_label(cluster_name));
+    timer.add_label(StaticMetricLabel::new("op", op));
     timer
 }
 

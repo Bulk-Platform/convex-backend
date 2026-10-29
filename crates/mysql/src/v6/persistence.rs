@@ -549,7 +549,7 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
         }
         let cluster_name = self.inner.pool.cluster_name();
         self.lease
-            .transact(async |tx| {
+            .transact("write", async |tx| {
                 for chunk in fill_chunks(document_updates) {
                     let query = match conflict_strategy {
                         ConflictStrategy::Error => documents::insert_chunk(chunk.len()),
@@ -605,7 +605,7 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
         let cluster_name = self.inner.pool.cluster_name();
         for chunk in fill_chunks(&rows) {
             self.lease
-                .transact(async |tx| {
+                .transact("write_index_backfill", async |tx| {
                     self.inner
                         .engine
                         .write_backfill_chunk(tx, chunk, cluster_name)
@@ -646,7 +646,7 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
             Value::Bytes(serde_json::to_vec(&value)?),
         ];
         self.lease
-            .transact(async |tx| {
+            .transact("write_persistence_global", async |tx| {
                 tx.exec_drop(super::WRITE_PERSISTENCE_GLOBAL, params)
                     .await?;
                 Ok(())
@@ -720,7 +720,7 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
             }
         });
         self.lease
-            .transact(async |tx| {
+            .transact("delete_documents", async |tx| {
                 let mut deleted = 0;
                 for chunk in fill_chunks(&document_ids) {
                     let mut params = vec![self.inner.deployment_id.into()];
@@ -746,7 +746,7 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
         chunk_size: usize,
     ) -> anyhow::Result<usize> {
         self.lease
-            .transact(async |tx| {
+            .transact("delete_tablet_documents", async |tx| {
                 Ok(tx
                     .exec_iter(
                         documents::delete_tablet_chunk(),
@@ -1078,27 +1078,33 @@ impl<RT: Runtime> Lease<RT> {
         })
     }
 
-    pub(crate) async fn transact<F, T>(&self, f: F) -> anyhow::Result<T>
+    /// `op` names the persistence operation on the commit metric.
+    pub(crate) async fn transact<F, T>(&self, op: &'static str, f: F) -> anyhow::Result<T>
     where
         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
     {
-        self.transact_with_isolation(None, f).await
+        self.transact_with_isolation(op, None, f).await
     }
 
     /// Like [`Self::transact`], but runs at READ COMMITTED instead of the
     /// InnoDB session default (REPEATABLE READ). Index retention deletes use
     /// this so their DELETEs take only record locks, sparing concurrent index
     /// writers the next-key/gap locks REPEATABLE READ adds.
-    pub(crate) async fn transact_read_committed<F, T>(&self, f: F) -> anyhow::Result<T>
+    pub(crate) async fn transact_read_committed<F, T>(
+        &self,
+        op: &'static str,
+        f: F,
+    ) -> anyhow::Result<T>
     where
         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
     {
-        self.transact_with_isolation(Some(IsolationLevel::ReadCommitted), f)
+        self.transact_with_isolation(op, Some(IsolationLevel::ReadCommitted), f)
             .await
     }
 
     async fn transact_with_isolation<F, T>(
         &self,
+        op: &'static str,
         isolation: Option<IsolationLevel>,
         f: F,
     ) -> anyhow::Result<T>
@@ -1123,7 +1129,7 @@ impl<RT: Runtime> Lease<RT> {
             }
             timer.finish();
             let value = f(&mut tx).await?;
-            let timer = metrics::commit_timer(self.pool.cluster_name());
+            let timer = metrics::commit_timer(self.pool.cluster_name(), op);
             tx.commit().await?;
             timer.finish();
             Ok(value)
@@ -1170,12 +1176,12 @@ fn row_to_document(row: &Row) -> anyhow::Result<DocumentLogEntry> {
 }
 
 impl<RT: Runtime> crate::v6::backfill::BackfillLease for Lease<RT> {
-    async fn transact_read_committed<F, T>(&self, f: F) -> anyhow::Result<T>
+    async fn transact_read_committed<F, T>(&self, op: &'static str, f: F) -> anyhow::Result<T>
     where
         F: for<'a> AsyncFnOnce(
             &'a mut crate::connection::MySqlTransaction<'_>,
         ) -> anyhow::Result<T>,
     {
-        Lease::transact_read_committed(self, f).await
+        Lease::transact_read_committed(self, op, f).await
     }
 }
