@@ -6,10 +6,12 @@ use std::{
             Ordering,
         },
         Arc,
+        OnceLock,
     },
     time::Duration,
 };
 
+use anyhow::Context as _;
 use common::{
     backoff::Backoff,
     errors::{
@@ -96,7 +98,12 @@ enum ReplayQueueMessage<RT: Runtime> {
 }
 
 pub(crate) struct ReplicaWriter<RT: Runtime> {
-    pub(super) v6: Arc<dyn PersistenceTrait>,
+    /// Set once this writer owns the registration; a pending writer queues
+    /// operations until then.
+    v6: OnceLock<Arc<dyn PersistenceTrait>>,
+    /// Releases the worker once `v6` is set. Dropped on stop, so a pending
+    /// worker skips its queue instead.
+    activation: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
     pub(super) target: ReplicaTarget<RT>,
     /// Metrics use the source V5 cluster's name.
     pub(super) cluster_name: String,
@@ -119,15 +126,17 @@ pub(crate) struct ReplicaWriter<RT: Runtime> {
 
 impl<RT: Runtime> ReplicaWriter<RT> {
     pub(super) fn new(
-        v6: Arc<dyn PersistenceTrait>,
+        v6: Option<Arc<dyn PersistenceTrait>>,
         target: ReplicaTarget<RT>,
         source: ReplicaHandoffState,
         settings: Settings,
         writer_state_gauge: Arc<metrics::WriterStateGauge>,
     ) -> Arc<Self> {
         let (queue, mut receiver) = mpsc::channel(settings.max_queued_jobs);
+        let (activate, activated) = oneshot::channel();
         let replica = Arc::new(Self {
-            v6,
+            v6: OnceLock::new(),
+            activation: parking_lot::Mutex::new(Some(activate)),
             target,
             cluster_name: source.cluster_name,
             deployment_id: source.deployment_id,
@@ -140,7 +149,16 @@ impl<RT: Runtime> ReplicaWriter<RT> {
             settings,
             writer_state_gauge,
         });
+        match v6 {
+            Some(v6) => replica.activate(v6),
+            None => replica
+                .writer_state_gauge
+                .set(metrics::WriterState::Pending),
+        }
         common::runtime::tokio_spawn("v6_replica_worker", async move {
+            // A pending writer holds its jobs until the handoff resolves. A
+            // dropped sender means it stopped, and the loop skips them.
+            let _ = activated.await;
             while let Some(message) = receiver.recv().await {
                 match message {
                     ReplayQueueMessage::Replay {
@@ -163,6 +181,25 @@ impl<RT: Runtime> ReplicaWriter<RT> {
 
     pub(crate) fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.v6.get().is_some() && !self.is_stopped()
+    }
+
+    pub(super) fn v6(&self) -> anyhow::Result<&Arc<dyn PersistenceTrait>> {
+        self.v6.get().context("the V6 replica is not active")
+    }
+
+    fn activate(&self, v6: Arc<dyn PersistenceTrait>) {
+        let mut activation = self.activation.lock();
+        if self.is_stopped() || self.v6.set(v6).is_err() {
+            return;
+        }
+        self.writer_state_gauge.set(metrics::WriterState::Ready);
+        if let Some(activate) = activation.take() {
+            let _ = activate.send(());
+        }
     }
 
     /// Call before returning the V5 result so operations issued after that
@@ -244,42 +281,36 @@ impl<RT: Runtime> ReplicaWriter<RT> {
     }
 
     async fn apply(&self, operation: &ReplayOperation) -> anyhow::Result<u64> {
+        let v6 = self.v6()?;
         match operation {
             ReplayOperation::Write {
                 documents,
                 indexes,
                 conflict_strategy,
             } => {
-                self.v6
-                    .write(documents, indexes, *conflict_strategy)
-                    .await?;
+                v6.write(documents, indexes, *conflict_strategy).await?;
                 Ok(0)
             },
             ReplayOperation::WriteIndexBackfill { entries } => {
-                self.v6.write_index_backfill(entries).await?;
+                v6.write_index_backfill(entries).await?;
                 Ok(0)
             },
             ReplayOperation::ReconcileIndexBackfill { index } => {
-                self.v6.reconcile_index_backfill(*index).await?;
+                v6.reconcile_index_backfill(*index).await?;
                 Ok(0)
             },
             ReplayOperation::DeleteIndexBackfillMarkers { index } => {
-                self.v6.delete_index_backfill_markers_chunk(*index).await
+                v6.delete_index_backfill_markers_chunk(*index).await
             },
             ReplayOperation::DeleteDocuments { documents } => {
-                Ok(self.v6.delete(documents.clone()).await? as u64)
+                Ok(v6.delete(documents.clone()).await? as u64)
             },
             ReplayOperation::DeleteTabletDocuments {
                 tablet_id,
                 chunk_size,
-            } => Ok(self
-                .v6
-                .delete_tablet_documents(*tablet_id, *chunk_size)
-                .await? as u64),
+            } => Ok(v6.delete_tablet_documents(*tablet_id, *chunk_size).await? as u64),
             ReplayOperation::WritePersistenceGlobal { key, value } => {
-                self.v6
-                    .write_persistence_global(*key, value.clone())
-                    .await?;
+                v6.write_persistence_global(*key, value.clone()).await?;
                 Ok(0)
             },
         }
@@ -307,10 +338,10 @@ impl<RT: Runtime> ReplicaWriter<RT> {
     /// Retention retries marker discovery periodically, so a stale result is
     /// safe. Marker deletions queue behind the reconciliation they depend on.
     pub(crate) async fn index_backfill_marker_indexes(self: &Arc<Self>) -> Vec<PersistenceIndexId> {
-        if self.is_stopped() {
+        let Some(v6) = self.v6.get().filter(|_| !self.is_stopped()) else {
             return Vec::new();
-        }
-        match self.v6.index_backfill_marker_indexes().await {
+        };
+        match v6.index_backfill_marker_indexes().await {
             Ok(indexes) => indexes,
             Err(error) => {
                 self.retire(metrics::RetireReason::JobFailed, &error);
@@ -323,6 +354,14 @@ impl<RT: Runtime> ReplicaWriter<RT> {
     /// shutdown.
     pub(crate) async fn close(self: &Arc<Self>) {
         if self.is_stopped() {
+            return;
+        }
+        if !self.is_active() {
+            // Queued writes were never applied, so no certificate is possible.
+            self.retire(
+                metrics::RetireReason::UncleanHandoff,
+                &anyhow::anyhow!("shut down before the handoff resolved"),
+            );
             return;
         }
         let result = tokio::time::timeout(self.settings.apply_wait, async {
@@ -352,10 +391,12 @@ impl<RT: Runtime> ReplicaWriter<RT> {
     }
 
     fn stop(&self, state: metrics::WriterState) -> bool {
+        let mut activation = self.activation.lock();
         if self.stopped.swap(true, Ordering::AcqRel) {
             return false;
         }
         self.writer_state_gauge.set(state);
+        activation.take();
         true
     }
 
@@ -403,5 +444,102 @@ impl<RT: Runtime> ReplicaWriter<RT> {
             state.is_some_and(|state| !state.retired && state.lease_ts == self.lease_ts)
                 && !self.is_stopped(),
         )
+    }
+}
+
+enum Handoff {
+    /// The previous writer drained its replay and certified its shutdown.
+    Certified,
+    /// No certificate arrived in time, or another stale writer registered.
+    Expired,
+    /// A newer writer owns the registration.
+    Superseded,
+    /// Another process retired the replica.
+    Retired,
+    Stopped,
+}
+
+impl<RT: Runtime> ReplicaWriter<RT> {
+    /// Rolling updates start the new conductor before stopping the old one,
+    /// so the previous writer is usually still draining when this writer
+    /// loads. Queue writes until it certifies a clean shutdown, then take the
+    /// registration; retire if the certificate does not arrive in time.
+    pub(super) fn resolve_handoff(
+        self: &Arc<Self>,
+        source: ReplicaHandoffState,
+        previous_lease_ts: i64,
+    ) {
+        let replica = self.clone();
+        common::runtime::tokio_spawn("v6_replica_handoff", async move {
+            match replica.await_certificate(previous_lease_ts).await {
+                Handoff::Certified => replica.claim(&source).await,
+                Handoff::Expired => replica.retire(
+                    metrics::RetireReason::UncleanHandoff,
+                    &anyhow::anyhow!(
+                        "the previous writer did not certify a clean shutdown within {:?}",
+                        replica.settings.handoff_grace
+                    ),
+                ),
+                Handoff::Superseded => {
+                    if replica.stop(metrics::WriterState::Displaced) {
+                        tracing::info!(
+                            instance_name = %replica.instance_name,
+                            "V6 replica displaced by another writer"
+                        );
+                    }
+                },
+                Handoff::Retired => {
+                    replica.stop(metrics::WriterState::Retired);
+                },
+                Handoff::Stopped => {},
+            }
+        });
+    }
+
+    async fn await_certificate(&self, previous_lease_ts: i64) -> Handoff {
+        let deadline = Instant::now() + self.settings.handoff_grace;
+        let poll = (self.settings.handoff_grace / 20)
+            .clamp(Duration::from_millis(50), Duration::from_secs(2));
+        loop {
+            tokio::time::sleep(poll).await;
+            if self.is_stopped() {
+                return Handoff::Stopped;
+            }
+            match state::read(&self.target.pool, &self.target.db_name, self.deployment_id).await {
+                Ok(Some(current)) if current.retired => return Handoff::Retired,
+                Ok(Some(current)) if current.lease_ts >= self.lease_ts => {
+                    return Handoff::Superseded;
+                },
+                Ok(Some(current)) if current.lease_ts != previous_lease_ts => {
+                    return Handoff::Expired;
+                },
+                Ok(Some(current)) if current.clean_shutdown => return Handoff::Certified,
+                Ok(Some(_)) => {},
+                Ok(None) => return Handoff::Expired,
+                Err(error) => {
+                    tracing::warn!("Could not read the V6 replica handoff state: {error:#}");
+                },
+            }
+            if Instant::now() >= deadline {
+                return Handoff::Expired;
+            }
+        }
+    }
+
+    async fn claim(self: &Arc<Self>, source: &ReplicaHandoffState) {
+        match state::register(&self.target.pool, &self.target.db_name, source, false).await {
+            Ok(true) => match super::open_v6(&self.target, source).await {
+                Ok(v6) => self.activate(v6),
+                Err(error) => self.retire(metrics::RetireReason::InitializationFailed, &error),
+            },
+            Ok(false) => {
+                super::spawn_delete_data(self.target.clone(), self.deployment_id);
+                self.retire(
+                    metrics::RetireReason::UncleanHandoff,
+                    &anyhow::anyhow!("the handoff state changed before this writer registered"),
+                );
+            },
+            Err(error) => self.retire(metrics::RetireReason::UncleanHandoff, &error),
+        }
     }
 }

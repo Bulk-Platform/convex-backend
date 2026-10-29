@@ -271,7 +271,7 @@ impl<RT: Runtime> IndexScanComparison<RT> {
         }
         let log = |outcome| metrics::log_comparison(&replica.cluster_name, outcome);
         log(ComparisonOutcome::Sampled);
-        if replica.is_stopped() || scan.index.persistence_index_id().is_none() {
+        if !replica.is_active() || scan.index.persistence_index_id().is_none() {
             log(ComparisonOutcome::Ineligible);
             return None;
         }
@@ -319,7 +319,10 @@ impl<RT: Runtime> IndexScanComparison<RT> {
         // Once V5 reaches the end, read one extra entry to detect a longer V6
         // result. A captured prefix establishes only its own length.
         let limit = source_entries.len() + usize::from(source_exhausted);
-        let reader = self.replica.v6.reader();
+        let Ok(v6) = self.replica.v6() else {
+            return ComparisonOutcome::Invalidated;
+        };
+        let reader = v6.reader();
         let replica_entries: anyhow::Result<Vec<IndexEntryMetadata>> = {
             let Ok(Ok(_read_permit)) =
                 tokio::time::timeout_at(deadline, self.replica.replica_read_permits.acquire())

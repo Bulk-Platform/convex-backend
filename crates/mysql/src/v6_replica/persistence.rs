@@ -12,6 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use common::{
+    errors::LeaseLostError,
     persistence::{
         ConflictStrategy,
         DocumentLogEntry,
@@ -123,7 +124,17 @@ impl<RT: Runtime> ReplicatedV5Persistence<RT> {
             return Ok((call.await?, None));
         };
         let mut replay_guard = SourceWriteReplayGuard(Some(replica));
-        let value = call.await?;
+        let value = match call.await {
+            Ok(value) => value,
+            // The lease check runs before any statement, so a lost lease
+            // commits nothing and the writer that took it can still resume.
+            Err(error) => {
+                if error.is::<LeaseLostError>() {
+                    replay_guard.0 = None;
+                }
+                return Err(error);
+            },
+        };
         let replay = replica.enqueue(operation());
         replay_guard.0 = None;
         Ok((value, replay))

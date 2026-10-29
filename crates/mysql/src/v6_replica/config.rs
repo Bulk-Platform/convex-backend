@@ -29,6 +29,11 @@ pub(super) struct Settings {
     pub(super) job_retry: Duration,
     /// Deployment loading waits for replica initialization.
     pub(super) init_timeout: Duration,
+    /// How long a new writer queues its writes while waiting for the previous
+    /// writer's clean-shutdown certificate. A rolling update stops the old
+    /// conductor within seconds of the new one taking the lease; a deployment
+    /// move waits for the source conductor's next reconcile, up to a minute.
+    pub(super) handoff_grace: Duration,
     /// Fraction of V5 index scans selected before eligibility checks.
     pub(super) comparison_sample_rate: f64,
     pub(super) max_comparison_entries: usize,
@@ -66,6 +71,7 @@ pub(super) static SETTINGS: LazyLock<Settings> = LazyLock::new(|| Settings {
     max_queued_jobs: 1024,
     job_retry: Duration::from_secs(30),
     init_timeout: Duration::from_secs(10),
+    handoff_grace: Duration::from_secs(120),
     comparison_sample_rate: *MYSQL_V6_REPLICA_COMPARE_SAMPLE_RATE,
     max_comparison_entries: 128,
     max_concurrent_comparisons: 64,

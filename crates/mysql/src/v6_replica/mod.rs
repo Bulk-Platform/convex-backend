@@ -1,8 +1,10 @@
 //! Asynchronous replay of V5 writes into a separate V6 database.
 //!
-//! Each V5 writer must register in the replica database before serving writes.
-//! If replay may be incomplete, retirement permanently disables replay,
-//! persists that decision, and schedules deletion of the replica's data.
+//! Each V5 writer registers in the replica database before replaying. A writer
+//! that finds its predecessor still draining queues its writes and registers
+//! once the predecessor certifies a clean shutdown. If replay may be
+//! incomplete, retirement permanently disables replay, persists that decision,
+//! and schedules deletion of the replica's data.
 mod comparison;
 mod config;
 mod metrics;
@@ -12,7 +14,6 @@ mod state;
 use std::{
     collections::BTreeSet,
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::Context as _;
@@ -126,10 +127,7 @@ impl<RT: Runtime> ReplicatedV5PersistenceFactory<RT> {
         .await
         .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")))
         {
-            Ok(Some(replica)) => {
-                writer_state_gauge.set(WriterState::Ready);
-                Some(replica)
-            },
+            Ok(Some(replica)) => Some(replica),
             Ok(None) => None,
             Err(error) => {
                 tracing::warn!(
@@ -148,7 +146,8 @@ impl<RT: Runtime> ReplicatedV5PersistenceFactory<RT> {
     }
 
     /// `None` means the replica is persistently marked retired, so V5 can serve
-    /// on its own.
+    /// on its own. A writer whose predecessor has not certified its shutdown
+    /// starts pending and lets `ReplicaWriter::resolve_handoff` decide.
     async fn initialize(
         &self,
         v5: &v5::Persistence<RT>,
@@ -167,21 +166,23 @@ impl<RT: Runtime> ReplicatedV5PersistenceFactory<RT> {
             lease_ts: lease.timestamp(),
             clean_shutdown: false,
         };
-        let deadline = tokio::time::Instant::now() + self.settings.apply_wait;
-        let previous = loop {
-            let current = state::read(&target.pool, &target.db_name, deployment_id).await?;
-            if current.as_ref().is_some_and(|current| {
-                current.lease_ts < source.lease_ts
-                    && current.same_source(&source)
-                    && !current.retired
-                    && !current.clean_shutdown
-            }) && tokio::time::Instant::now() < deadline
-            {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                continue;
-            }
-            break current;
-        };
+        let previous = state::read(&target.pool, &target.db_name, deployment_id).await?;
+        if let Some(current) = &previous
+            && current.lease_ts < source.lease_ts
+            && current.same_source(&source)
+            && !current.retired
+            && !current.clean_shutdown
+        {
+            let replica = ReplicaWriter::new(
+                None,
+                target,
+                source.clone(),
+                self.settings.clone(),
+                writer_state_gauge.clone(),
+            );
+            replica.resolve_handoff(source, current.lease_ts);
+            return Ok(Some(replica));
+        }
         // An empty document log can still have globals or backfilled indexes
         // that a new replica would be missing.
         let source_is_fresh = previous.is_none()
@@ -202,42 +203,53 @@ impl<RT: Runtime> ReplicatedV5PersistenceFactory<RT> {
                 if !current.retired {
                     metrics::log_retirement(&source.cluster_name, RetireReason::UncleanHandoff);
                 }
+                writer_state_gauge.set(WriterState::Retired);
                 spawn_delete_data(target, deployment_id);
             }
             return Ok(None);
         }
-        let (lease_lost, _) = tokio::sync::oneshot::channel();
-        let v6 = Arc::new(
-            v6::Persistence::new(
-                target.pool.clone(),
-                target.db_name.clone(),
-                MySqlOptions {
-                    allow_read_only: true,
-                    version: PersistenceVersion::V6,
-                    instance_name: source.instance_name.clone().into(),
-                    multitenant: true,
-                    deployment_id,
-                },
-                ShutdownSignal::new(lease_lost),
-            )
-            .await?,
-        );
-        anyhow::ensure!(
-            state::read(&target.pool, &target.db_name, deployment_id)
-                .await?
-                .is_some_and(|current| current.lease_ts == source.lease_ts
-                    && !current.retired
-                    && !current.clean_shutdown),
-            "replica ownership changed during initialization"
-        );
+        let v6 = open_v6(&target, &source).await?;
         Ok(Some(ReplicaWriter::new(
-            v6,
+            Some(v6),
             target,
             source,
             self.settings.clone(),
             writer_state_gauge.clone(),
         )))
     }
+}
+
+/// Opens the V6 side under the writer's lease, then confirms the registration
+/// still names this writer.
+async fn open_v6<RT: Runtime>(
+    target: &ReplicaTarget<RT>,
+    source: &ReplicaHandoffState,
+) -> anyhow::Result<Arc<dyn Persistence>> {
+    let (lease_lost, _) = tokio::sync::oneshot::channel();
+    let v6: Arc<dyn Persistence> = Arc::new(
+        v6::Persistence::new(
+            target.pool.clone(),
+            target.db_name.clone(),
+            MySqlOptions {
+                allow_read_only: true,
+                version: PersistenceVersion::V6,
+                instance_name: source.instance_name.clone().into(),
+                multitenant: true,
+                deployment_id: source.deployment_id,
+            },
+            ShutdownSignal::new(lease_lost),
+        )
+        .await?,
+    );
+    anyhow::ensure!(
+        state::read(&target.pool, &target.db_name, source.deployment_id)
+            .await?
+            .is_some_and(|current| current.lease_ts == source.lease_ts
+                && !current.retired
+                && !current.clean_shutdown),
+        "replica ownership changed during initialization"
+    );
+    Ok(v6)
 }
 
 pub fn maintenance<RT: Runtime>(

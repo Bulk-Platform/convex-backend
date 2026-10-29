@@ -38,6 +38,8 @@ pub(crate) enum RetireReason {
     BulkWrite,
     /// The replica may be missing source writes at a writer handoff.
     UncleanHandoff,
+    /// The V6 side could not be opened after a resolved handoff.
+    InitializationFailed,
 }
 pub(crate) fn log_retirement(cluster_name: &str, reason: RetireReason) {
     MYSQL_V6_REPLICA_RETIREMENTS_TOTAL
@@ -86,6 +88,8 @@ register_convex_gauge!(
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum WriterState {
     Ready,
+    /// Queueing writes until the previous writer certifies its shutdown.
+    Pending,
     Displaced,
     Closed,
     /// The deployment has history the replica never received.
