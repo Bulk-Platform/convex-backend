@@ -1629,6 +1629,30 @@
             "in": "path",
             "description": "Team ID",
             "required": true
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Inclusive lower bound in YYYY-MM-DD format, using UTC.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "Inclusive upper bound in YYYY-MM-DD format, using UTC.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {

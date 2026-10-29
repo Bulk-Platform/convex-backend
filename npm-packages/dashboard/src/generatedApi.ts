@@ -4581,7 +4581,12 @@ export interface operations {
     };
     get_prices: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Inclusive lower bound in YYYY-MM-DD format, using UTC. */
+                from?: string | null;
+                /** @description Inclusive upper bound in YYYY-MM-DD format, using UTC. */
+                to?: string | null;
+            };
             header?: never;
             path: {
                 /** @description Team ID */
