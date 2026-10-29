@@ -6,6 +6,7 @@ import {
   fn,
   mocked,
   screen,
+  spyOn,
   userEvent,
   within,
 } from "storybook/test";
@@ -25,6 +26,7 @@ import type {
   UdfType,
 } from "system-udfs/convex/_system/frontend/common";
 import type { FileMetadata } from "system-udfs/convex/_system/frontend/fileStorageV2";
+import { isApplePlatform } from "@ui/KeyboardShortcut";
 import { flagDefaults, useLaunchDarkly } from "hooks/useLaunchDarkly";
 import { usePostHog } from "hooks/usePostHog";
 import { useCurrentTeam, useTeams } from "api/teams";
@@ -327,6 +329,51 @@ export const NavigatingRowsAreLinks: Story = {
     await expect(getRouter().push).toHaveBeenCalledWith(
       `${DEPLOYMENT_URI}/schema`,
     );
+  },
+};
+
+// ⌘+Enter (Ctrl+Enter off Apple platforms) is the keyboard's ⌘-click: it opens
+// the selected row in a new tab and leaves the palette open.
+export const ModifiedEnterOpensInNewTab: Story = {
+  ...NavigatingRowsAreLinks,
+  play: async () => {
+    const user = userEvent.setup();
+    const open = spyOn(window, "open").mockReturnValue(null);
+    try {
+      const input = await screen.findByRole("combobox");
+      await user.type(input, "schema");
+      await expect(
+        await screen.findByRole("option", { name: /^Schema/, selected: true }),
+      ).toBeInTheDocument();
+
+      const modifier = isApplePlatform() ? "Meta" : "Control";
+      await user.keyboard(`{${modifier}>}{Enter}{/${modifier}}`);
+      await expect(open).toHaveBeenCalledTimes(1);
+      await expect(open).toHaveBeenCalledWith(
+        new URL(`${DEPLOYMENT_URI}/schema`, window.location.href).href,
+        "_blank",
+        "noopener",
+      );
+      await expect(capture).toHaveBeenCalledWith(
+        "command_palette_item_selected",
+        { kind: "navigate:Schema" },
+      );
+      await expect(getRouter().push).not.toHaveBeenCalled();
+      await expect(input).toHaveFocus();
+
+      // Holding the chord opens one tab, not one per key repeat. (user-event
+      // never sets `repeat`, so dispatch the auto-repeat keydown directly.)
+      await fireEvent.keyDown(input, {
+        key: "Enter",
+        metaKey: modifier === "Meta",
+        ctrlKey: modifier === "Control",
+        repeat: true,
+      });
+      await expect(open).toHaveBeenCalledTimes(1);
+      await expect(getRouter().push).not.toHaveBeenCalled();
+    } finally {
+      open.mockRestore();
+    }
   },
 };
 

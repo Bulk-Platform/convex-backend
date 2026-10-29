@@ -27,6 +27,7 @@ import type { PlatformDeploymentResponse, ProjectDetails } from "generatedApi";
 import type { NavigationDestination, NavigationTarget } from "./navigation";
 import { REMOTE_VALUE_PREFIX } from "./navigation";
 import { useCopyAction } from "./copy";
+import { useLinkRegistration } from "./newTab";
 import type { DeploymentPicker } from "./picker";
 import { usePaletteAnalytics } from "./analytics";
 
@@ -345,9 +346,10 @@ function onItemLinkAuxClick(
 // The body of a row, holding everything but a trailing secondary action. Rows
 // that navigate render it as a real anchor, so ⌘-click, middle click and "Open
 // link in a new tab" work on them; the stylesheet moves the row's padding and
-// selected background onto it so it covers the whole row. The anchor is a
-// pointer-only affordance: it stays out of the tab order, and assistive tech
-// flattens it into the enclosing option, which is what cmdk navigates.
+// selected background onto it so it covers the whole row. The anchor stays out
+// of the tab order, and assistive tech flattens it into the enclosing option,
+// which is what cmdk navigates; the keyboard reaches it through the palette
+// instead, whose ⌘/Ctrl+Enter opens the selected row's anchor (see `newTab.ts`).
 export function ItemPrimary({
   href,
   onModifiedClick,
@@ -361,14 +363,17 @@ export function ItemPrimary({
   href?: NavigationDestination;
   // The analytics the row's `onSelect` would have reported. Only a plain click
   // reaches `onSelect`, so without this, selections would undercount by exactly
-  // the ⌘-clicks and middle clicks this component exists to enable.
+  // the ⌘-clicks, middle clicks and ⌘/Ctrl+Enters this component exists to
+  // enable.
   onModifiedClick?: () => void;
   children: React.ReactNode;
 }) {
+  const registerLink = useLinkRegistration(onModifiedClick);
   return href === undefined ? (
     <span data-item-primary="">{children}</span>
   ) : (
     <Link
+      ref={registerLink}
       href={href}
       data-item-primary=""
       // Drops the viewport prefetch, which would fire for every row the list
