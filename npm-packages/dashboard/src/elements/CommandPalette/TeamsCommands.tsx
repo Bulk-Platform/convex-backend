@@ -79,17 +79,20 @@ export function TeamsCommands({
             </Command.Group>
           )}
           <Command.Group heading="Switch Team">
-            {teams.map((team) => (
-              <TeamItem
-                key={team.id}
-                team={team}
-                isCurrent={team.slug === selectedTeamSlug}
-                onSelect={() => {
-                  trackSelected("switch-team");
-                  onNavigate(teamSwitchDestination(team.slug, pathname));
-                }}
-              />
-            ))}
+            {teams.map((team) => {
+              const href = teamSwitchDestination(team.slug, pathname);
+              return (
+                <TeamItem
+                  key={team.id}
+                  team={team}
+                  isCurrent={team.slug === selectedTeamSlug}
+                  onSelect={() => {
+                    trackSelected("switch-team");
+                    onNavigate(href);
+                  }}
+                />
+              );
+            })}
           </Command.Group>
         </>
       )}

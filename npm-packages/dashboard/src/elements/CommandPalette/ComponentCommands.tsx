@@ -1,5 +1,6 @@
 import { Command } from "cmdk";
 import React, { useContext } from "react";
+import type { UrlObject } from "url";
 import { ConvexProvider, useQuery } from "convex/react";
 import { CaretSortIcon } from "@radix-ui/react-icons";
 import { useRouter } from "next/router";
@@ -10,9 +11,18 @@ import {
 } from "@common/lib/deploymentContext";
 import { PuzzlePieceIcon } from "@common/elements/icons";
 import type { Nent } from "@common/lib/useNents";
-import { ActionItem, HighlightedText, LoadingSignal } from "./items";
+import {
+  ActionItem,
+  CurrentBadge,
+  HighlightedText,
+  LoadingSignal,
+} from "./items";
 import { useCopyAction } from "./copy";
-import { matchesSearch, REMOTE_VALUE_PREFIX } from "./navigation";
+import {
+  componentQuery,
+  matchesSearch,
+  REMOTE_VALUE_PREFIX,
+} from "./navigation";
 import { usePaletteAnalytics } from "./analytics";
 
 // The deployment pages that render a NentSwitcher, i.e. where the `component`
@@ -32,29 +42,36 @@ export function pageHasNentSwitcher(pathname: string): boolean {
   return suffix !== undefined && NENT_AWARE_PAGE_SUFFIXES.has(suffix);
 }
 
-// Switches the viewed component, closing the palette first. On a nent-aware
-// page (Data, Functions, …) it sets the `component` query param in place.
-// Elsewhere that param has no effect, so it opens the component's Data page instead.
-export function useSelectComponent(onClose: () => void) {
+// Where viewing a component leads. On a nent-aware page (Data, Functions, …)
+// that's the same page with the `component` query param set. Elsewhere that
+// param has no effect, so it's the component's Data page instead.
+export function useComponentHref() {
   const router = useRouter();
   const { deploymentsURI } = useContext(DeploymentInfoContext);
+  return (id: string | null): UrlObject => {
+    if (!pageHasNentSwitcher(router.pathname)) {
+      return { pathname: `${deploymentsURI}/data`, query: componentQuery(id) };
+    }
+    const { component: _, ...query } = router.query;
+    // `router.pathname` is the route pattern; router.push interpolates its
+    // dynamic segments from `query`.
+    return {
+      pathname: router.pathname,
+      query: { ...query, ...componentQuery(id) },
+    };
+  };
+}
+
+export function useSelectComponent(onClose: () => void) {
+  const router = useRouter();
+  const href = useComponentHref();
   return (id: string | null) => {
     onClose();
-    if (pageHasNentSwitcher(router.pathname)) {
-      const query = { ...router.query };
-      if (id) {
-        query.component = id;
-      } else {
-        delete query.component;
-      }
-      void router.push({ pathname: router.pathname, query }, undefined, {
-        shallow: true,
-      });
-      return;
-    }
-    void router.push({
-      pathname: `${deploymentsURI}/data`,
-      query: id ? { component: id } : {},
+    // Staying on the same page only moves a query param, so keep the current
+    // page's data instead of re-running its server-side fetch. True exactly
+    // when `useComponentHref` took its same-pathname branch.
+    void router.push(href(id), undefined, {
+      shallow: pageHasNentSwitcher(router.pathname),
     });
   };
 }
@@ -165,6 +182,27 @@ function ComponentSwitchInner({
   );
 }
 
+function ComponentRowBody({
+  label,
+  isCurrent,
+  isUnmounted,
+}: {
+  label: React.ReactNode;
+  isCurrent: boolean;
+  isUnmounted: boolean;
+}) {
+  return (
+    <>
+      <PuzzlePieceIcon className="text-content-secondary" />
+      <span className="min-w-0 truncate">{label}</span>
+      <span className="ml-auto flex shrink-0 items-center gap-1.5 text-xs text-content-tertiary">
+        {isUnmounted && "Unmounted"}
+        {isCurrent && <CurrentBadge />}
+      </span>
+    </>
+  );
+}
+
 function SwitchToComponentItem({
   value,
   path,
@@ -188,18 +226,17 @@ function SwitchToComponentItem({
       keywords={keywords}
       onSelect={onSelect}
     >
-      <PuzzlePieceIcon className="text-content-secondary" />
-      <span className="min-w-0 truncate">
-        {'Switch to "'}
-        <HighlightedText text={path} />
-        {'"'}
-      </span>
-      <span className="ml-auto flex shrink-0 items-center gap-1.5 text-xs text-content-tertiary">
-        {isUnmounted && "Unmounted"}
-        {isCurrent && (
-          <span className="rounded-sm border px-1.5 py-0.5">Current</span>
-        )}
-      </span>
+      <ComponentRowBody
+        label={
+          <>
+            {'Switch to "'}
+            <HighlightedText text={path} />
+            {'"'}
+          </>
+        }
+        isCurrent={isCurrent}
+        isUnmounted={isUnmounted}
+      />
     </Command.Item>
   );
 }
@@ -280,16 +317,11 @@ export function ComponentItem({
         onSelect();
       }}
     >
-      <PuzzlePieceIcon className="text-content-secondary" />
-      <span className="min-w-0 truncate">
-        <HighlightedText text={label} />
-      </span>
-      <span className="ml-auto flex shrink-0 items-center gap-1.5 text-xs text-content-tertiary">
-        {isUnmounted && "Unmounted"}
-        {isCurrent && (
-          <span className="rounded-sm border px-1.5 py-0.5">Current</span>
-        )}
-      </span>
+      <ComponentRowBody
+        label={<HighlightedText text={label} />}
+        isCurrent={isCurrent}
+        isUnmounted={isUnmounted}
+      />
     </Command.Item>
   );
 }

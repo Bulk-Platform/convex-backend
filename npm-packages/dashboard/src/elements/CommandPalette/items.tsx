@@ -437,6 +437,9 @@ export function DeploymentItem({
       ? router.asPath.split(/[?#]/)[0].split("/").slice(5).join("/")
       : "";
   const isCurrent = router.query.deploymentName === deployment.name;
+  const href = projectSlug
+    ? `/t/${teamSlug}/${projectSlug}/${deployment.name}${currentView ? `/${currentView}` : ""}`
+    : undefined;
   const value = `${remote ? REMOTE_VALUE_PREFIX : ""}deployment:${deployment.name}`;
   useCopyAction(
     value,
@@ -451,11 +454,10 @@ export function DeploymentItem({
       keywords={remote ? undefined : [primary, deployment.name, typeLabel]}
       onSelect={() => {
         trackSelected("switch-deployment");
-        if (consumeDrillModifier() || !projectSlug) {
+        if (consumeDrillModifier() || !href) {
           return onDrill();
         }
-        const base = `/t/${teamSlug}/${projectSlug}/${deployment.name}`;
-        return onNavigate(currentView ? `${base}/${currentView}` : base);
+        return onNavigate(href);
       }}
     >
       <ItemPrimary>

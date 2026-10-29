@@ -34,6 +34,15 @@ export type NavigationDestination =
   | string
   | { pathname: string; query: Record<string, string> };
 
+// The query params that scope a deployment page to a component. `component` is
+// the component ID, which is what useNents and the rest of the page key off of;
+// the root app has no ID and so needs no param.
+export function componentQuery(
+  componentId: string | null | undefined,
+): Record<string, string> {
+  return componentId ? { component: componentId } : {};
+}
+
 export type NavigationTarget = {
   label: string;
   href: string;

@@ -212,6 +212,7 @@ function CreateDeploymentItem({
     deploymentType === "prod"
       ? PROVISION_PROD_PAGE_NAME
       : PROVISION_DEV_PAGE_NAME;
+  const href = `/t/${team.slug}/${project.slug}/${provisionPage}`;
   return (
     <Command.Item
       value={`action:create-${deploymentType}-deployment`}
@@ -219,7 +220,7 @@ function CreateDeploymentItem({
       className="rounded-md outline-1 -outline-offset-1 outline-border-selected/60 outline-dashed"
       onSelect={() => {
         trackSelected(`create-${deploymentType}-deployment`);
-        onNavigate(`/t/${team.slug}/${project.slug}/${provisionPage}`);
+        onNavigate(href);
       }}
     >
       <div

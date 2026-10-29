@@ -16,7 +16,11 @@ import {
 import type { ComponentId } from "@common/lib/useNents";
 import type { UdfType } from "system-udfs/convex/_system/frontend/common";
 import { useHttpActionRoute } from "@common/features/functions/lib/useHttpActionRoute";
-import { matchesSearch, NavigationDestination } from "./navigation";
+import {
+  componentQuery,
+  matchesSearch,
+  NavigationDestination,
+} from "./navigation";
 import { REMOTE_VALUE_PREFIX } from "./navigation";
 import { HighlightedText } from "./items";
 import type { DocumentSearchResultItem } from "./DocumentSearchResult";
@@ -193,21 +197,15 @@ function FunctionResultItem({
       ? { label: "URL", getText: () => route.url }
       : { label: "function name", getText: () => fn.displayName },
   );
+  const href = {
+    pathname: `${deploymentsURI}/functions`,
+    query: { function: fn.displayName, ...componentQuery(fn.componentId) },
+  };
   return (
     <Command.Item
       value={value}
       className="animate-fadeInFromLoading"
-      onSelect={() =>
-        onNavigate({
-          pathname: `${deploymentsURI}/functions`,
-          query: {
-            function: fn.displayName,
-            // `component` (the component ID) is the param useNents and the rest
-            // of the page key off of.
-            ...(fn.componentId ? { component: fn.componentId } : {}),
-          },
-        })
-      }
+      onSelect={() => onNavigate(href)}
     >
       <CodeIcon className="text-content-secondary" />
       <span className="truncate font-mono">
@@ -233,19 +231,15 @@ function TableResultItem({
 }) {
   const value = `${REMOTE_VALUE_PREFIX}table:${componentId ?? ""}:${tableName}`;
   useCopyAction(value, { label: "table name", getText: () => tableName });
+  const href = {
+    pathname: `${deploymentsURI}/data`,
+    query: { table: tableName, ...componentQuery(componentId) },
+  };
   return (
     <Command.Item
       value={value}
       className="animate-fadeInFromLoading"
-      onSelect={() =>
-        onNavigate({
-          pathname: `${deploymentsURI}/data`,
-          query: {
-            table: tableName,
-            ...(componentId ? { component: componentId } : {}),
-          },
-        })
-      }
+      onSelect={() => onNavigate(href)}
     >
       <TableIcon className="text-content-secondary" />
       <span className="truncate font-mono">
