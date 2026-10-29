@@ -22,7 +22,7 @@ import {
   NavigationDestination,
 } from "./navigation";
 import { REMOTE_VALUE_PREFIX } from "./navigation";
-import { HighlightedText } from "./items";
+import { HighlightedText, ItemPrimary } from "./items";
 import type { DocumentSearchResultItem } from "./DocumentSearchResult";
 import {
   documentGroupHeading,
@@ -38,10 +38,14 @@ const MAX_RESULTS = 20;
 // components, and documents (by ID).
 export function DeploymentSearchCommands({
   search,
+  onTrack,
   onNavigate,
   onOpenDetail,
 }: {
   search: string;
+  // Reports the selection. Separate from `onNavigate` because a ⌘-click on a
+  // result navigates through the browser, never through `onNavigate`.
+  onTrack: () => void;
   onNavigate: (to: NavigationDestination) => void;
   // Opens the detail side panel for a document / file / scheduled-job match.
   onOpenDetail: (detail: DocumentSearchResultItem) => void;
@@ -54,6 +58,7 @@ export function DeploymentSearchCommands({
     <ConvexProvider client={connected.deployment.client}>
       <DeploymentSearchInner
         search={search}
+        onTrack={onTrack}
         onNavigate={onNavigate}
         onOpenDetail={onOpenDetail}
       />
@@ -63,10 +68,12 @@ export function DeploymentSearchCommands({
 
 function DeploymentSearchInner({
   search,
+  onTrack,
   onNavigate,
   onOpenDetail,
 }: {
   search: string;
+  onTrack: () => void;
   onNavigate: (to: NavigationDestination) => void;
   onOpenDetail: (detail: DocumentSearchResultItem) => void;
 }) {
@@ -157,6 +164,7 @@ function DeploymentSearchInner({
               tableName={name}
               componentId={currentComponent}
               deploymentsURI={deploymentsURI}
+              onTrack={onTrack}
               onNavigate={onNavigate}
             />
           ))}
@@ -169,6 +177,7 @@ function DeploymentSearchInner({
               key={`${fn.componentId ?? ""}:${fn.identifier}`}
               fn={fn}
               deploymentsURI={deploymentsURI}
+              onTrack={onTrack}
               onNavigate={onNavigate}
             />
           ))}
@@ -181,10 +190,12 @@ function DeploymentSearchInner({
 function FunctionResultItem({
   fn,
   deploymentsURI,
+  onTrack,
   onNavigate,
 }: {
   fn: ModuleFunction;
   deploymentsURI: string;
+  onTrack: () => void;
   onNavigate: (to: NavigationDestination) => void;
 }) {
   const value = `${REMOTE_VALUE_PREFIX}function:${fn.componentId ?? ""}:${fn.identifier}`;
@@ -205,15 +216,20 @@ function FunctionResultItem({
     <Command.Item
       value={value}
       className="animate-fadeInFromLoading"
-      onSelect={() => onNavigate(href)}
+      onSelect={() => {
+        onTrack();
+        onNavigate(href);
+      }}
     >
-      <CodeIcon className="text-content-secondary" />
-      <span className="truncate font-mono">
-        <HighlightedText text={fn.displayName} />
-      </span>
-      <span className="ml-auto shrink-0 text-xs text-content-tertiary">
-        {udfTypeLabel(fn.udfType)}
-      </span>
+      <ItemPrimary href={href} onModifiedClick={onTrack}>
+        <CodeIcon className="text-content-secondary" />
+        <span className="truncate font-mono">
+          <HighlightedText text={fn.displayName} />
+        </span>
+        <span className="ml-auto shrink-0 text-xs text-content-tertiary">
+          {udfTypeLabel(fn.udfType)}
+        </span>
+      </ItemPrimary>
     </Command.Item>
   );
 }
@@ -222,11 +238,13 @@ function TableResultItem({
   tableName,
   componentId,
   deploymentsURI,
+  onTrack,
   onNavigate,
 }: {
   tableName: string;
   componentId: string | null;
   deploymentsURI: string;
+  onTrack: () => void;
   onNavigate: (to: NavigationDestination) => void;
 }) {
   const value = `${REMOTE_VALUE_PREFIX}table:${componentId ?? ""}:${tableName}`;
@@ -239,15 +257,20 @@ function TableResultItem({
     <Command.Item
       value={value}
       className="animate-fadeInFromLoading"
-      onSelect={() => onNavigate(href)}
+      onSelect={() => {
+        onTrack();
+        onNavigate(href);
+      }}
     >
-      <TableIcon className="text-content-secondary" />
-      <span className="truncate font-mono">
-        <HighlightedText text={tableName} />
-      </span>
-      <span className="ml-auto shrink-0 text-xs text-content-tertiary">
-        Table
-      </span>
+      <ItemPrimary href={href} onModifiedClick={onTrack}>
+        <TableIcon className="text-content-secondary" />
+        <span className="truncate font-mono">
+          <HighlightedText text={tableName} />
+        </span>
+        <span className="ml-auto shrink-0 text-xs text-content-tertiary">
+          Table
+        </span>
+      </ItemPrimary>
     </Command.Item>
   );
 }

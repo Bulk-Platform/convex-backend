@@ -1,5 +1,14 @@
 import { Meta, StoryObj } from "@storybook/nextjs";
-import { mocked, screen, userEvent } from "storybook/test";
+import { getRouter } from "@storybook/nextjs/router.mock";
+import {
+  expect,
+  fireEvent,
+  fn,
+  mocked,
+  screen,
+  userEvent,
+  within,
+} from "storybook/test";
 import { useEffect, type ContextType } from "react";
 import type { FunctionReturnType } from "convex/server";
 import type { Value } from "convex/values";
@@ -17,6 +26,7 @@ import type {
 } from "system-udfs/convex/_system/frontend/common";
 import type { FileMetadata } from "system-udfs/convex/_system/frontend/fileStorageV2";
 import { flagDefaults, useLaunchDarkly } from "hooks/useLaunchDarkly";
+import { usePostHog } from "hooks/usePostHog";
 import { useCurrentTeam, useTeams } from "api/teams";
 import {
   useCurrentProject,
@@ -229,6 +239,94 @@ export const InsideDeployment: Story = {
   beforeEach: () => {
     mocked(useCurrentProject).mockReturnValue(mockProject);
     mocked(useCurrentDeployment).mockReturnValue(devDeployment);
+  },
+};
+
+const capture = fn();
+
+// The link affordances on navigating rows. Split from `InsideDeployment` so
+// that story keeps showing a populated palette: the plain click at the end
+// here selects a row, which closes the dialog for good.
+export const NavigatingRowsAreLinks: Story = {
+  ...InsideDeployment,
+  beforeEach: () => {
+    mocked(useCurrentProject).mockReturnValue(mockProject);
+    mocked(useCurrentDeployment).mockReturnValue(devDeployment);
+    capture.mockClear();
+    mocked(usePostHog).mockReturnValue({
+      capture,
+      posthog: {} as ReturnType<typeof usePostHog>["posthog"],
+    });
+  },
+  play: async () => {
+    const user = userEvent.setup();
+
+    // Rows that navigate are real links, so the browser's own ⌘-click /
+    // open-in-new-tab affordances work on them.
+    const schema = await screen.findByRole("option", { name: /^Schema/ });
+    const schemaLink = within(schema).getByRole("link");
+    await expect(schemaLink).toHaveAttribute(
+      "href",
+      `${DEPLOYMENT_URI}/schema`,
+    );
+
+    // A modified click belongs to the browser: the palette must not also
+    // navigate the tab the user opened a background tab from. Blink runs an
+    // anchor's activation behavior for dispatched clicks too, so suppress that
+    // side of it and leave only the palette's reaction under test. Capture
+    // phase, because the handler's own `stopPropagation` would keep a
+    // bubble-phase listener on `document` from ever running.
+    const swallow = (event: Event) => event.preventDefault();
+    document.addEventListener("click", swallow, { capture: true });
+    try {
+      await fireEvent.click(schemaLink, { metaKey: true });
+    } finally {
+      document.removeEventListener("click", swallow, { capture: true });
+    }
+    await expect(getRouter().push).not.toHaveBeenCalled();
+    // …but it is still a selection. `onSelect` — where every row reports its
+    // analytics — never runs for a modified click, so the row reports it from
+    // the click handler instead; otherwise the metric would undercount by
+    // exactly the ⌘-clicks this feature adds.
+    await expect(capture).toHaveBeenCalledWith(
+      "command_palette_item_selected",
+      {
+        kind: "navigate:Schema",
+      },
+    );
+
+    // A middle click fires `auxclick` instead of `click`, so it bypasses the
+    // click handler above and needs its own report. A dispatched `auxclick`
+    // has no activation behavior, so nothing opens here.
+    await fireEvent(
+      schemaLink,
+      new MouseEvent("auxclick", { bubbles: true, button: 1 }),
+    );
+    await expect(capture).toHaveBeenCalledTimes(2);
+    // The secondary button fires `auxclick` too, but only opens the menu.
+    await fireEvent(
+      schemaLink,
+      new MouseEvent("auxclick", { bubbles: true, button: 2 }),
+    );
+    await expect(capture).toHaveBeenCalledTimes(2);
+    await expect(getRouter().push).not.toHaveBeenCalled();
+
+    // Pressing a row must not pull focus out of the input: a modified click
+    // leaves the palette open, and a focused anchor would swallow the
+    // keystrokes that follow.
+    await user.pointer({ keys: "[MouseLeft>]", target: schemaLink });
+    await expect(screen.getByRole("combobox")).toHaveFocus();
+
+    // Releasing completes a plain click, which navigates exactly once — through
+    // the palette rather than the anchor, so it keeps the analytics/close/scroll
+    // behavior Enter has.
+    await user.pointer({ keys: "[/MouseLeft]", target: schemaLink });
+    await expect(getRouter().push).toHaveBeenCalledTimes(1);
+    // Reported once per selection, not once per click path.
+    await expect(capture).toHaveBeenCalledTimes(3);
+    await expect(getRouter().push).toHaveBeenCalledWith(
+      `${DEPLOYMENT_URI}/schema`,
+    );
   },
 };
 
@@ -575,4 +673,20 @@ export const DataPlaneSearch: Story = {
   parameters: dataDeploymentRouter,
   render: () => <DataDeploymentPalette />,
   beforeEach: setupDataDeployment,
+  play: async () => {
+    const user = userEvent.setup();
+    await user.type(await screen.findByRole("combobox"), "waitlist");
+
+    // A component row on a nent-aware page links to the same page with the
+    // `component` param set. Only the param is asserted, not the whole URL:
+    // Storybook swaps in its own `next/link`, which concatenates `pathname`
+    // and `query` instead of resolving them, so the route pattern's dynamic
+    // segments stay uninterpolated here. The real router fills them in.
+    const component = await screen.findByRole("option", {
+      name: /^Switch to "waitlist"/,
+    });
+    const href = within(component).getByRole("link").getAttribute("href");
+    await expect(href).toContain("/data?");
+    await expect(href).toContain("component=waitlist");
+  },
 };

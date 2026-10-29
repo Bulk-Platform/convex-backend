@@ -1,4 +1,5 @@
 import type { ComponentType } from "react";
+import type { UrlObject } from "url";
 import {
   PieChartIcon,
   ClockIcon,
@@ -28,18 +29,16 @@ import {
   TEAM_SETTINGS_SECTIONS,
 } from "lib/sectionAnchors";
 
-// Where a command can navigate: a plain href, or a pathname + query object
-// (the form next/router.push accepts) for destinations with encoded params.
-export type NavigationDestination =
-  | string
-  | { pathname: string; query: Record<string, string> };
+// Where a command can navigate: a plain href, or the URL object form that
+// next/router.push and next/link both take, for destinations with encoded
+// params. Rows render these as anchors, so the object form has to stay
+// Link-compatible.
+export type NavigationDestination = string | UrlObject;
 
 // The query params that scope a deployment page to a component. `component` is
 // the component ID, which is what useNents and the rest of the page key off of;
 // the root app has no ID and so needs no param.
-export function componentQuery(
-  componentId: string | null | undefined,
-): Record<string, string> {
+export function componentQuery(componentId: string | null | undefined) {
   return componentId ? { component: componentId } : {};
 }
 

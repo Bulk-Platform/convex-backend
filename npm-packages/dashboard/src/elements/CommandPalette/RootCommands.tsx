@@ -136,13 +136,11 @@ export function RootCommands({
       {deploymentNav && (
         <DeploymentSearchCommands
           search={search}
-          // Every data-plane result counts as one "data-search" selection kind.
-          // Tables and functions navigate directly; documents, files, and
-          // scheduled jobs open the detail panel — so track both paths.
-          onNavigate={(to) => {
-            trackSelected("data-search");
-            onNavigate(to);
-          }}
+          // Every data-plane result counts as one "data-search" selection kind,
+          // whether it navigates (tables, functions) or opens the detail panel
+          // (documents, files, scheduled jobs).
+          onTrack={() => trackSelected("data-search")}
+          onNavigate={onNavigate}
           onOpenDetail={(item) => {
             trackSelected("data-search");
             onOpenDetail(item);

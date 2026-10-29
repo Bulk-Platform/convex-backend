@@ -298,9 +298,9 @@ function CommandPaletteDialog({
         // destination has rendered. This also covers re-selecting the section
         // you're already on, which is a no-op for the router.
         const hash =
-          typeof to === "string" && to.includes("#")
+          typeof to === "string"
             ? to.split("#")[1]
-            : undefined;
+            : to.hash?.replace(/^#/, "");
         if (hash) {
           setTimeout(() => {
             document

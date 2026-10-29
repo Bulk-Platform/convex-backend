@@ -14,6 +14,7 @@ import {
   ActionItem,
   CurrentBadge,
   HighlightedText,
+  ItemPrimary,
   LoadingSignal,
   NavigationItem,
   PinnedActions,
@@ -86,10 +87,9 @@ export function TeamsCommands({
                   key={team.id}
                   team={team}
                   isCurrent={team.slug === selectedTeamSlug}
-                  onSelect={() => {
-                    trackSelected("switch-team");
-                    onNavigate(href);
-                  }}
+                  href={href}
+                  onTrack={() => trackSelected("switch-team")}
+                  onNavigate={() => onNavigate(href)}
                 />
               );
             })}
@@ -115,11 +115,15 @@ export function TeamsCommands({
 function TeamItem({
   team,
   isCurrent,
-  onSelect,
+  href,
+  onTrack,
+  onNavigate,
 }: {
   team: TeamResponse;
   isCurrent: boolean;
-  onSelect: () => void;
+  href: string;
+  onTrack: () => void;
+  onNavigate: () => void;
 }) {
   const value = `team:${team.slug}`;
   useCopyAction(value, { label: "slug", getText: () => team.slug });
@@ -128,22 +132,27 @@ function TeamItem({
       value={value}
       className="animate-fadeInFromLoading"
       keywords={[team.name, team.slug]}
-      onSelect={onSelect}
+      onSelect={() => {
+        onTrack();
+        onNavigate();
+      }}
     >
-      <Avatar name={team.name} hashKey={team.id.toString()} />
-      <span className="flex min-w-0 flex-col">
-        <span className="truncate">
-          <HighlightedText text={team.name} />
+      <ItemPrimary href={href} onModifiedClick={onTrack}>
+        <Avatar name={team.name} hashKey={team.id.toString()} />
+        <span className="flex min-w-0 flex-col">
+          <span className="truncate">
+            <HighlightedText text={team.name} />
+          </span>
+          <span className="truncate text-xs text-content-tertiary">
+            <HighlightedText text={team.slug} />
+          </span>
         </span>
-        <span className="truncate text-xs text-content-tertiary">
-          <HighlightedText text={team.slug} />
-        </span>
-      </span>
-      {isCurrent && (
-        <span className="ml-auto text-xs text-content-tertiary">
-          <CurrentBadge />
-        </span>
-      )}
+        {isCurrent && (
+          <span className="ml-auto text-xs text-content-tertiary">
+            <CurrentBadge />
+          </span>
+        )}
+      </ItemPrimary>
     </Command.Item>
   );
 }

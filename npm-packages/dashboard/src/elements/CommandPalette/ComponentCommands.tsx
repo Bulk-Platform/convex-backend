@@ -15,6 +15,7 @@ import {
   ActionItem,
   CurrentBadge,
   HighlightedText,
+  ItemPrimary,
   LoadingSignal,
 } from "./items";
 import { useCopyAction } from "./copy";
@@ -53,8 +54,8 @@ export function useComponentHref() {
       return { pathname: `${deploymentsURI}/data`, query: componentQuery(id) };
     }
     const { component: _, ...query } = router.query;
-    // `router.pathname` is the route pattern; router.push interpolates its
-    // dynamic segments from `query`.
+    // `router.pathname` is the route pattern; next/link and router.push both
+    // interpolate its dynamic segments from `query`.
     return {
       pathname: router.pathname,
       query: { ...query, ...componentQuery(id) },
@@ -172,6 +173,7 @@ function ComponentSwitchInner({
           key={target.id ?? "app"}
           value={`${REMOTE_VALUE_PREFIX}switch-component:${target.id ?? "app"}`}
           path={target.path}
+          componentId={target.id}
           keywords={target.keywords}
           isCurrent={selected === target.id}
           isUnmounted={target.isUnmounted}
@@ -206,6 +208,7 @@ function ComponentRowBody({
 function SwitchToComponentItem({
   value,
   path,
+  componentId,
   keywords,
   isCurrent,
   isUnmounted,
@@ -213,11 +216,13 @@ function SwitchToComponentItem({
 }: {
   value: string;
   path: string;
+  componentId: string | null;
   keywords: string[];
   isCurrent: boolean;
   isUnmounted: boolean;
   onSelect: () => void;
 }) {
+  const componentHref = useComponentHref();
   useCopyAction(value, { label: "component path", getText: () => path });
   return (
     <Command.Item
@@ -226,17 +231,19 @@ function SwitchToComponentItem({
       keywords={keywords}
       onSelect={onSelect}
     >
-      <ComponentRowBody
-        label={
-          <>
-            {'Switch to "'}
-            <HighlightedText text={path} />
-            {'"'}
-          </>
-        }
-        isCurrent={isCurrent}
-        isUnmounted={isUnmounted}
-      />
+      <ItemPrimary href={componentHref(componentId)}>
+        <ComponentRowBody
+          label={
+            <>
+              {'Switch to "'}
+              <HighlightedText text={path} />
+              {'"'}
+            </>
+          }
+          isCurrent={isCurrent}
+          isUnmounted={isUnmounted}
+        />
+      </ItemPrimary>
     </Command.Item>
   );
 }
@@ -271,6 +278,7 @@ function ComponentsList({ onClose }: { onClose: () => void }) {
       <ComponentItem
         value="component:app"
         label="app"
+        componentId={null}
         keywords={["app", "root"]}
         isCurrent={selected === null}
         onSelect={() => selectComponent(null)}
@@ -280,6 +288,7 @@ function ComponentsList({ onClose }: { onClose: () => void }) {
           key={component.id}
           value={`component:${component.id}`}
           label={component.path}
+          componentId={component.id}
           keywords={[component.path, component.name ?? "", "component"]}
           isCurrent={selected === component.id}
           isUnmounted={component.state !== "active"}
@@ -290,9 +299,10 @@ function ComponentsList({ onClose }: { onClose: () => void }) {
   );
 }
 
-export function ComponentItem({
+function ComponentItem({
   value,
   label,
+  componentId,
   keywords,
   isCurrent,
   isUnmounted = false,
@@ -300,12 +310,15 @@ export function ComponentItem({
 }: {
   value: string;
   label: string;
+  componentId: string | null;
   keywords: string[];
   isCurrent: boolean;
   isUnmounted?: boolean;
   onSelect: () => void;
 }) {
   const { trackSelected } = usePaletteAnalytics();
+  const track = () => trackSelected("switch-component");
+  const componentHref = useComponentHref();
   useCopyAction(value, { label: "component path", getText: () => label });
   return (
     <Command.Item
@@ -313,15 +326,17 @@ export function ComponentItem({
       className="animate-fadeInFromLoading"
       keywords={keywords}
       onSelect={() => {
-        trackSelected("switch-component");
+        track();
         onSelect();
       }}
     >
-      <ComponentRowBody
-        label={<HighlightedText text={label} />}
-        isCurrent={isCurrent}
-        isUnmounted={isUnmounted}
-      />
+      <ItemPrimary href={componentHref(componentId)} onModifiedClick={track}>
+        <ComponentRowBody
+          label={<HighlightedText text={label} />}
+          isCurrent={isCurrent}
+          isUnmounted={isUnmounted}
+        />
+      </ItemPrimary>
     </Command.Item>
   );
 }
