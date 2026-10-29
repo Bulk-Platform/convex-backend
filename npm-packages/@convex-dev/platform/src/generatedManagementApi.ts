@@ -1586,6 +1586,13 @@ export interface components {
              *     this project, if one exists (an active local deployment or default
              *     cloud dev deployment). */
             devDeploymentName?: string | null;
+            /** @description The reference of the default production deployment for this project,
+             *     if one exists (e.g. "production"). */
+            prodDeploymentReference?: string | null;
+            /** @description The reference of the requesting member's default development deployment
+             *     for this project, if one exists and is a cloud deployment (e.g.
+             *     "dev/jane-doe"). */
+            devDeploymentReference?: string | null;
             tags: string[];
         };
         ProjectSlug: string;

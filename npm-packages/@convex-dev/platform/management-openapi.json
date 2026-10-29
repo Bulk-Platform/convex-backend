@@ -4523,6 +4523,20 @@
             ],
             "description": "The name of the requesting member's default development deployment for\nthis project, if one exists (an active local deployment or default\ncloud dev deployment)."
           },
+          "prodDeploymentReference": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The reference of the default production deployment for this project,\nif one exists (e.g. \"production\")."
+          },
+          "devDeploymentReference": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The reference of the requesting member's default development deployment\nfor this project, if one exists and is a cloud deployment (e.g.\n\"dev/jane-doe\")."
+          },
           "tags": {
             "type": "array",
             "items": {
