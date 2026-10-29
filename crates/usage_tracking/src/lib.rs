@@ -1293,8 +1293,6 @@ fn to_vector_query_usage(
                 index_name: Some(index_name.to_string()),
                 num_searches: Some(usage.num_searches),
                 bytes_searched: Some(usage.bytes_searched),
-                // Older readers require field 6 to be present during rolling upgrades.
-                dimensions: Some(0),
             },
         )
         .collect()
