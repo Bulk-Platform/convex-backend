@@ -192,6 +192,8 @@ function displayValidator(validator: ValidatorJSON): string {
       return `v.int64()`;
     case "commitTs":
       return `v.commitTs()`;
+    case "function":
+      return `v.function()`;
     case "boolean":
       return `v.boolean()`;
     case "string":
