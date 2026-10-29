@@ -9,9 +9,8 @@
   },
   "bin": "dist/scenario-runner.mjs",
   "dependencies": {
-    "@sentry/node": "^7.23.0",
+    "@sentry/node": "^8.55.2",
     "convex": "workspace:*",
-    "@sentry/tracing": "^7.23.0",
     "random-words": "1.3.0",
     "langchain": "^0.3.37",
     "tiktoken": "^1.0.10",
