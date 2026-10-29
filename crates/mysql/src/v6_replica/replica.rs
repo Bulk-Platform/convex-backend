@@ -1,5 +1,7 @@
-//! A per-deployment worker that applies queued operations to V6 in FIFO order.
+//! A per-deployment worker that applies queued operations to V6 in FIFO order,
+//! merging consecutive writes into one transaction.
 use std::{
+    collections::BTreeSet,
     sync::{
         atomic::{
             AtomicBool,
@@ -19,6 +21,7 @@ use common::{
         is_transient_db_error,
         LeaseLostError,
     },
+    index::IndexKeyBytes,
     persistence::{
         ConflictStrategy,
         DocumentLogEntry,
@@ -30,6 +33,7 @@ use common::{
     runtime::Runtime,
     types::{
         DeploymentId,
+        IndexRef,
         PersistenceIndexId,
         Timestamp,
     },
@@ -86,15 +90,165 @@ pub(crate) enum ReplayOperation {
     },
 }
 
+type Reply = oneshot::Sender<anyhow::Result<u64>>;
+
 enum ReplayQueueMessage<RT: Runtime> {
     Replay {
         // Queued operations keep the writer alive. The worker holds only the
         // receiver, so the channel closes once these and the source are dropped.
         replica: Arc<ReplicaWriter<RT>>,
         operation: ReplayOperation,
-        reply: oneshot::Sender<anyhow::Result<u64>>,
+        reply: Reply,
     },
     NotifyAfterPriorReplay(oneshot::Sender<()>),
+}
+
+/// Applies messages in order, merging consecutive writes into one V6
+/// transaction, until the last sender is dropped.
+async fn replay_queue<RT: Runtime>(mut receiver: mpsc::Receiver<ReplayQueueMessage<RT>>) {
+    let mut next = receiver.recv().await;
+    while let Some(message) = next.take() {
+        match message {
+            ReplayQueueMessage::NotifyAfterPriorReplay(reply) => {
+                let _ = reply.send(());
+            },
+            ReplayQueueMessage::Replay {
+                replica,
+                operation,
+                reply,
+            } => {
+                let (operation, replies) = match operation {
+                    ReplayOperation::Write {
+                        documents,
+                        indexes,
+                        conflict_strategy,
+                    } => {
+                        let mut batch =
+                            WriteBatch::new(documents, indexes, conflict_strategy, reply);
+                        next = batch.fill(&mut receiver, replica.settings.max_merged_writes);
+                        batch.finish()
+                    },
+                    operation => (operation, vec![reply]),
+                };
+                let jobs = replies.len() as u64;
+                let outcome = replica.run(&operation, jobs).await;
+                metrics::add_queued(&replica.cluster_name, -(jobs as f64));
+                send_outcome(replies, outcome);
+            },
+        }
+        if next.is_none() {
+            next = receiver.recv().await;
+        }
+    }
+}
+
+/// Consecutive write jobs replayed in one V6 transaction. Their index keys
+/// are disjoint: V6 changes a key's stored entry in place, so an entry naming
+/// its predecessor needs that predecessor committed by an earlier transaction.
+struct WriteBatch {
+    documents: Vec<DocumentLogEntry>,
+    indexes: Vec<PersistenceIndexEntry>,
+    conflict_strategy: ConflictStrategy,
+    keys: BTreeSet<(IndexRef, IndexKeyBytes)>,
+    replies: Vec<Reply>,
+}
+
+impl WriteBatch {
+    fn new(
+        documents: Vec<DocumentLogEntry>,
+        indexes: Vec<PersistenceIndexEntry>,
+        conflict_strategy: ConflictStrategy,
+        reply: Reply,
+    ) -> Self {
+        Self {
+            keys: index_keys(&indexes).collect(),
+            documents,
+            indexes,
+            conflict_strategy,
+            replies: vec![reply],
+        }
+    }
+
+    /// Takes queued jobs while they merge and `max_jobs` allows, returning the
+    /// first message that must wait for the next transaction.
+    fn fill<RT: Runtime>(
+        &mut self,
+        receiver: &mut mpsc::Receiver<ReplayQueueMessage<RT>>,
+        max_jobs: usize,
+    ) -> Option<ReplayQueueMessage<RT>> {
+        while self.replies.len() < max_jobs {
+            match receiver.try_recv().ok()? {
+                ReplayQueueMessage::Replay {
+                    replica,
+                    operation,
+                    reply,
+                } => match self.merge(operation) {
+                    Ok(()) => self.replies.push(reply),
+                    Err(operation) => {
+                        return Some(ReplayQueueMessage::Replay {
+                            replica,
+                            operation,
+                            reply,
+                        })
+                    },
+                },
+                message => return Some(message),
+            }
+        }
+        None
+    }
+
+    fn merge(&mut self, operation: ReplayOperation) -> Result<(), ReplayOperation> {
+        match operation {
+            ReplayOperation::Write {
+                documents,
+                indexes,
+                conflict_strategy,
+            } if conflict_strategy == self.conflict_strategy
+                && self.documents.len() + documents.len() <= crate::MAX_INSERT_SIZE
+                && index_keys(&indexes).all(|key| !self.keys.contains(&key)) =>
+            {
+                self.keys.extend(index_keys(&indexes));
+                self.documents.extend(documents);
+                self.indexes.extend(indexes);
+                Ok(())
+            },
+            operation => Err(operation),
+        }
+    }
+
+    fn finish(self) -> (ReplayOperation, Vec<Reply>) {
+        let operation = ReplayOperation::Write {
+            documents: self.documents,
+            indexes: self.indexes,
+            conflict_strategy: self.conflict_strategy,
+        };
+        (operation, self.replies)
+    }
+}
+
+fn index_keys(
+    indexes: &[PersistenceIndexEntry],
+) -> impl Iterator<Item = (IndexRef, IndexKeyBytes)> + '_ {
+    indexes.iter().map(|entry| (entry.index, entry.key.clone()))
+}
+
+/// Merged jobs share one outcome; the error itself goes to the last reply and
+/// the others get its text.
+fn send_outcome(replies: Vec<Reply>, outcome: anyhow::Result<u64>) {
+    let mut replies = replies.into_iter();
+    let last = replies.next_back();
+    for reply in replies {
+        let _ = reply.send(
+            outcome
+                .as_ref()
+                .copied()
+                .map_err(|error| anyhow::anyhow!("{error:#}")),
+        );
+    }
+    if let Some(last) = last {
+        let _ = last.send(outcome);
+    }
 }
 
 pub(crate) struct ReplicaWriter<RT: Runtime> {
@@ -132,7 +286,7 @@ impl<RT: Runtime> ReplicaWriter<RT> {
         settings: Settings,
         writer_state_gauge: Arc<metrics::WriterStateGauge>,
     ) -> Arc<Self> {
-        let (queue, mut receiver) = mpsc::channel(settings.max_queued_jobs);
+        let (queue, receiver) = mpsc::channel(settings.max_queued_jobs);
         let (activate, activated) = oneshot::channel();
         let replica = Arc::new(Self {
             v6: OnceLock::new(),
@@ -159,22 +313,7 @@ impl<RT: Runtime> ReplicaWriter<RT> {
             // A pending writer holds its jobs until the handoff resolves. A
             // dropped sender means it stopped, and the loop skips them.
             let _ = activated.await;
-            while let Some(message) = receiver.recv().await {
-                match message {
-                    ReplayQueueMessage::Replay {
-                        replica,
-                        operation,
-                        reply,
-                    } => {
-                        let outcome = replica.run(&operation).await;
-                        metrics::add_queued(&replica.cluster_name, -1.0);
-                        let _ = reply.send(outcome);
-                    },
-                    ReplayQueueMessage::NotifyAfterPriorReplay(reply) => {
-                        let _ = reply.send(());
-                    },
-                }
-            }
+            replay_queue(receiver).await;
         });
         replica
     }
@@ -209,7 +348,7 @@ impl<RT: Runtime> ReplicaWriter<RT> {
         operation: ReplayOperation,
     ) -> Option<oneshot::Receiver<anyhow::Result<u64>>> {
         if self.is_stopped() {
-            metrics::log_job(&self.cluster_name, metrics::JobOutcome::Skipped);
+            metrics::log_jobs(&self.cluster_name, metrics::JobOutcome::Skipped, 1);
             return None;
         }
         let (reply, result) = oneshot::channel();
@@ -233,17 +372,23 @@ impl<RT: Runtime> ReplicaWriter<RT> {
         Some(result)
     }
 
-    async fn run(self: &Arc<Self>, operation: &ReplayOperation) -> anyhow::Result<u64> {
+    /// `jobs` is the number of source calls `operation` replays.
+    async fn run(self: &Arc<Self>, operation: &ReplayOperation, jobs: u64) -> anyhow::Result<u64> {
         if self.is_stopped() {
-            metrics::log_job(&self.cluster_name, metrics::JobOutcome::Skipped);
+            metrics::log_jobs(&self.cluster_name, metrics::JobOutcome::Skipped, jobs);
             return Ok(0);
         }
         let result = self.apply_with_retries(operation).await;
         match &result {
-            Ok(_) => metrics::log_job(&self.cluster_name, metrics::JobOutcome::Applied),
+            Ok(_) => {
+                metrics::log_jobs(&self.cluster_name, metrics::JobOutcome::Applied, jobs);
+                if matches!(operation, ReplayOperation::Write { .. }) {
+                    metrics::log_write_batch(&self.cluster_name, jobs);
+                }
+            },
             // A newer writer or deletion now controls the replica's lifetime.
             Err(error) if error.is::<LeaseLostError>() => {
-                metrics::log_job(&self.cluster_name, metrics::JobOutcome::Skipped);
+                metrics::log_jobs(&self.cluster_name, metrics::JobOutcome::Skipped, jobs);
                 if self.stop(metrics::WriterState::Displaced) {
                     tracing::info!(
                         instance_name = %self.instance_name,
@@ -252,7 +397,7 @@ impl<RT: Runtime> ReplicaWriter<RT> {
                 }
             },
             Err(error) => {
-                metrics::log_job(&self.cluster_name, metrics::JobOutcome::Failed);
+                metrics::log_jobs(&self.cluster_name, metrics::JobOutcome::Failed, jobs);
                 self.retire(metrics::RetireReason::JobFailed, error);
             },
         }

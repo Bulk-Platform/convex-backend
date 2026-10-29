@@ -25,6 +25,9 @@ pub(super) struct Settings {
     pub(super) apply_wait: Duration,
     /// Queue overflow retires the replica to bound memory use.
     pub(super) max_queued_jobs: usize,
+    /// Consecutive write jobs one V6 transaction may replay, bounding the work
+    /// a transient failure retries and the locks a transaction holds.
+    pub(super) max_merged_writes: usize,
     /// Retry budget per operation; exhaustion retires the replica.
     pub(super) job_retry: Duration,
     /// Deployment loading waits for replica initialization.
@@ -69,6 +72,7 @@ pub(super) static MYSQL_V6_REPLICA_MAX_CONCURRENT_REPLICA_READS: LazyLock<usize>
 pub(super) static SETTINGS: LazyLock<Settings> = LazyLock::new(|| Settings {
     apply_wait: Duration::from_secs(2),
     max_queued_jobs: 1024,
+    max_merged_writes: 64,
     job_retry: Duration::from_secs(30),
     init_timeout: Duration::from_secs(10),
     handoff_grace: Duration::from_secs(120),

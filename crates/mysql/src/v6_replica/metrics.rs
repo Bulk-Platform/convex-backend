@@ -2,6 +2,7 @@
 use metrics::{
     register_convex_counter,
     register_convex_gauge,
+    register_convex_histogram,
 };
 
 register_convex_counter!(
@@ -17,10 +18,22 @@ pub(crate) enum JobOutcome {
     Failed,
     Skipped,
 }
-pub(crate) fn log_job(cluster_name: &str, outcome: JobOutcome) {
+pub(crate) fn log_jobs(cluster_name: &str, outcome: JobOutcome, count: u64) {
     MYSQL_V6_REPLICA_JOBS_TOTAL
         .with_label_values(&[cluster_name, outcome.into()])
-        .inc();
+        .inc_by(count);
+}
+
+register_convex_histogram!(
+    MYSQL_V6_REPLICA_WRITE_BATCH_COMMITS,
+    "Source commits replayed by one V6 transaction. Consecutive writes to disjoint index keys \
+     merge, so the mean rises with queue depth",
+    &["cluster_name"]
+);
+pub(crate) fn log_write_batch(cluster_name: &str, commits: u64) {
+    MYSQL_V6_REPLICA_WRITE_BATCH_COMMITS
+        .with_label_values(&[cluster_name])
+        .observe(commits as f64);
 }
 
 register_convex_counter!(
