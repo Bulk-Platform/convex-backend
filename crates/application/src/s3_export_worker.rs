@@ -1,9 +1,6 @@
 use std::{
     sync::Arc,
-    time::{
-        Duration,
-        SystemTime,
-    },
+    time::Duration,
 };
 
 use common::{
@@ -57,9 +54,9 @@ use usage_tracking::{
 };
 
 use crate::metrics::{
+    log_s3_export_progress,
     log_s3_export_worker_failed,
     s3_export_sync_timer,
-    S3ExportGauges,
 };
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -71,7 +68,6 @@ pub struct S3ExportWorker<RT: Runtime> {
     database: Database<RT>,
     instance_name: String,
     export_provider: Arc<dyn ExportProvider<RT>>,
-    gauges: S3ExportGauges,
     usage_counter: UsageCounter,
 }
 
@@ -86,7 +82,6 @@ impl<RT: Runtime> S3ExportWorker<RT> {
         Self {
             runtime,
             database,
-            gauges: S3ExportGauges::new(instance_name.clone()),
             instance_name,
             export_provider,
             usage_counter,
@@ -114,7 +109,6 @@ impl<RT: Runtime> S3ExportWorker<RT> {
             .get_by_provider(SinkType::S3Export)
             .await?;
         let Some(export) = export else {
-            self.gauges.clear();
             let token = tx.into_token()?;
             self.database
                 .subscribe_and_wait_for_invalidation(token)
@@ -125,15 +119,12 @@ impl<RT: Runtime> S3ExportWorker<RT> {
             anyhow::bail!("S3 export document has a different configuration type");
         };
         if !config.credentials.is_ready() {
-            self.gauges.clear();
             let token = tx.into_token()?;
             self.database
                 .subscribe_and_wait_for_invalidation(token)
                 .await?;
             return Ok(());
         }
-        // A page that hangs keeps aging past this.
-        self.gauges.start(self.runtime.system_time());
         let state = S3ExportStateModel::new(&mut tx)
             .get(export.developer_id())
             .await?;
@@ -184,7 +175,14 @@ impl<RT: Runtime> S3ExportWorker<RT> {
                 )
                 .in_span(span)
                 .await;
-            timer.finish();
+            match &page {
+                Ok(_) => {
+                    timer.finish();
+                },
+                Err(error) => {
+                    timer.finish_with(error.metric_status_label_value());
+                },
+            }
             match page {
                 Ok(page) => page,
                 // A user error from the destination is the customer's to fix,
@@ -203,6 +201,7 @@ impl<RT: Runtime> S3ExportWorker<RT> {
                 Err(error) => return Err(error),
             }
         };
+        log_s3_export_progress(&page.status, *self.database.now_ts_for_reads());
         // Porter commits the page in the destination before returning it, so
         // a returned page is a billed page. The progress checkpoint below is
         // for the dashboard and can lose an OCC race without unbilling anything.
@@ -250,16 +249,6 @@ impl<RT: Runtime> S3ExportWorker<RT> {
         // After the checkpoint commit, which reads this document.
         self.set_status(&export, SinkState::Active).await?;
         let interval = sync_interval(config.period);
-        self.gauges.set_next_sync_due(next_sync_due(
-            &page.status,
-            interval,
-            self.runtime.system_time(),
-        ));
-        self.gauges.set_snapshot_tables_synced(match &page.status {
-            SyncStatus::Snapshotting { progress } => Some(progress.num_tables_synced),
-            SyncStatus::Stale { .. } | SyncStatus::UpToDate { .. } => None,
-        });
-
         if matches!(&page.status, SyncStatus::UpToDate { .. }) {
             let mut tx = self.database.begin(Identity::system()).await?;
             let current = LogSinksModel::new(&mut tx)
@@ -337,17 +326,6 @@ fn sync_interval(period: SyncPeriod) -> Option<Duration> {
         SyncPeriod::Continuous => None,
         SyncPeriod::Hourly => Some(Duration::from_secs(60 * 60)),
         SyncPeriod::Daily => Some(Duration::from_secs(24 * 60 * 60)),
-    }
-}
-
-/// A caught-up export sleeps for the sync interval; every other page is
-/// followed by another right away. Wall-clock time, because an idle
-/// deployment's snapshot timestamp only moves with the
-/// `MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY` heartbeat.
-fn next_sync_due(status: &SyncStatus, interval: Option<Duration>, now: SystemTime) -> SystemTime {
-    match status {
-        SyncStatus::UpToDate { .. } => now + interval.unwrap_or_default(),
-        SyncStatus::Snapshotting { .. } | SyncStatus::Stale { .. } => now,
     }
 }
 
