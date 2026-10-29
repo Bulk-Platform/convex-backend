@@ -12,6 +12,12 @@ use anyhow::{
     Context,
     Result,
 };
+use common::knobs::S3_EXPORT_MAX_CONCURRENT_TABLE_WRITES;
+use futures::{
+    stream,
+    StreamExt,
+    TryStreamExt,
+};
 use iceberg::{
     io::{
         S3_ACCESS_KEY_ID,
@@ -158,12 +164,12 @@ impl IcebergChangeWriter {
         self.bytes_written
     }
 
-    async fn register(&mut self, name: &str) -> Result<()> {
-        if let Some(location) = self.unregistered.remove(name) {
+    async fn register(&self, name: &str) -> Result<()> {
+        if let Some(location) = self.unregistered.get(name) {
             self.catalog
                 .register_table(
                     &TableIdent::new(self.namespace.clone(), name.to_owned()),
-                    location,
+                    location.clone(),
                 )
                 .await?;
         }
@@ -285,7 +291,7 @@ impl IcebergChangeWriter {
     }
 
     #[fastrace::trace]
-    async fn load_existing(&mut self, ident: &TableIdent) -> Result<Option<Table>> {
+    async fn load_existing(&self, ident: &TableIdent) -> Result<Option<Table>> {
         self.register(ident.name()).await?;
         if !self.catalog.table_exists(ident).await? {
             return Ok(None);
@@ -296,7 +302,7 @@ impl IcebergChangeWriter {
     }
 
     #[fastrace::trace]
-    async fn create(&mut self, source: &SourceTable) -> Result<()> {
+    async fn create(&self, source: &SourceTable) -> Result<Table> {
         let name = Self::table_name(source)?;
         let creation = TableCreation::builder()
             .name(name.clone())
@@ -308,10 +314,7 @@ impl IcebergChangeWriter {
                 (TABLE_PROPERTY.to_owned(), source.table.clone()),
             ]))
             .build();
-        let table = self.catalog.create_table(&self.namespace, creation).await?;
-        self.record(&table)?;
-        self.tables.insert(source.clone(), table);
-        Ok(())
+        Ok(self.catalog.create_table(&self.namespace, creation).await?)
     }
 
     /// Requires one writer per namespace at a time. An `iceberg` commit rebases
@@ -337,6 +340,7 @@ impl IcebergChangeWriter {
             // deployment replaced it with `users`.
             let ident = TableIdent::new(self.namespace.clone(), name);
             if let Some(table) = self.load_existing(&ident).await? {
+                self.unregistered.remove(ident.name());
                 self.catalog.drop_table(&ident).await?;
                 self.locations.remove(ident.name());
                 // The recreated table starts unmarked.
@@ -345,33 +349,49 @@ impl IcebergChangeWriter {
                 }
                 self.tables.remove(&source_of(&table)?);
             }
-            self.create(source).await?;
+            let table = self.create(source).await?;
+            self.record(&table)?;
+            self.tables.insert(source.clone(), table);
         }
         let mut by_table: BTreeMap<SourceTable, Vec<Change>> = BTreeMap::new();
         for (source, change) in changes {
             by_table.entry(source).or_default().push(change);
         }
-        for (source, changes) in by_table {
-            if !self.tables.contains_key(&source) {
-                let ident = TableIdent::new(self.namespace.clone(), Self::table_name(&source)?);
-                if let Some(table) = self.load_existing(&ident).await? {
-                    ensure!(
-                        source_of(&table)? == source,
-                        "Glue table {} belongs to another source table",
-                        ident.name()
-                    );
-                    self.tables.insert(source.clone(), table);
+        // Unique names give each task exclusive ownership of its catalog table.
+        // Collect every result before advancing the page's metadata locations.
+        let writer = &*self;
+        let written: Vec<_> = stream::iter(by_table)
+            .map(|(source, changes)| async move {
+                let table = if let Some(table) = writer.tables.get(&source) {
+                    table.clone()
                 } else {
-                    self.create(&source).await?;
-                }
-            }
-            let (table, bytes_written) = append(
-                &*self.catalog,
-                &self.tables[&source],
-                &changes,
-                &self.snapshot_properties,
-            )
+                    let name = Self::table_name(&source)?;
+                    let ident = TableIdent::new(writer.namespace.clone(), name);
+                    if let Some(table) = writer.load_existing(&ident).await? {
+                        ensure!(
+                            source_of(&table)? == source,
+                            "Glue table {} belongs to another source table",
+                            ident.name()
+                        );
+                        table
+                    } else {
+                        writer.create(&source).await?
+                    }
+                };
+                let (table, bytes_written) = append(
+                    &*writer.catalog,
+                    &table,
+                    &changes,
+                    &writer.snapshot_properties,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>((source, table, bytes_written))
+            })
+            .buffer_unordered(*S3_EXPORT_MAX_CONCURRENT_TABLE_WRITES)
+            .try_collect()
             .await?;
+        for (source, table, bytes_written) in written {
+            self.unregistered.remove(table.identifier().name());
             self.bytes_written += bytes_written;
             self.record(&table)?;
             self.tables.insert(source, table);
@@ -402,6 +422,7 @@ impl IcebergChangeWriter {
         // Retirement needs the full catalog, including tables untouched by this page.
         for name in self.unregistered.keys().cloned().collect::<Vec<_>>() {
             self.register(&name).await?;
+            self.unregistered.remove(&name);
         }
         for ident in self.catalog.list_tables(&self.namespace).await? {
             if let Some(table) = self.load_existing(&ident).await? {

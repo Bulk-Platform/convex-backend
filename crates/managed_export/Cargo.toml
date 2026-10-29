@@ -16,8 +16,10 @@ aws-sdk-glue = { version = "1.85", default-features = false, features = [
     "rt-tokio",
 ] }
 aws-sdk-s3 = { workspace = true }
+common = { workspace = true }
 errors = { workspace = true }
 fastrace = { workspace = true }
+futures = { workspace = true }
 iceberg = "=0.10.1"
 iceberg-storage-opendal = { version = "=0.10.1", default-features = false, features = ["opendal-s3"] }
 parquet_iceberg = { package = "parquet", version = "58", default-features = false }
@@ -26,8 +28,9 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
+common = { workspace = true, features = ["testing"] }
 errors = { workspace = true, features = ["testing"] }
-futures = { workspace = true }
 iceberg-storage-opendal = { version = "=0.10.1", default-features = false, features = ["opendal-memory"] }
 tokio = { workspace = true }
 

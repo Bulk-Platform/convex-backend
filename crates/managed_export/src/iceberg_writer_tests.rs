@@ -1,4 +1,21 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{
+        AtomicUsize,
+        Ordering,
+    },
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use iceberg::{
+    Namespace,
+    TableCommit,
+};
+use tokio::sync::{
+    Notify,
+    Semaphore,
+};
 
 use super::{
     super::tests::{
@@ -43,6 +60,257 @@ async fn changes(writer: &IcebergChangeWriter, table: &str) -> Result<Vec<Change
         IcebergChangeWriter::table_name(&source(table))?,
     );
     read(&writer.catalog.load_table(&ident).await?).await
+}
+
+#[derive(Debug)]
+struct BlockingCatalog {
+    inner: Arc<dyn Catalog>,
+    active_loads: AtomicUsize,
+    max_active_loads: AtomicUsize,
+    started: Notify,
+    gate: Semaphore,
+    fail_table: Option<String>,
+}
+
+impl BlockingCatalog {
+    fn new(inner: Arc<dyn Catalog>, fail_table: Option<String>) -> Self {
+        Self {
+            inner,
+            active_loads: AtomicUsize::new(0),
+            max_active_loads: AtomicUsize::new(0),
+            started: Notify::new(),
+            gate: Semaphore::new(0),
+            fail_table,
+        }
+    }
+}
+
+struct ActiveLoad<'a>(&'a AtomicUsize);
+
+impl Drop for ActiveLoad<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Catalog for BlockingCatalog {
+    async fn list_namespaces(
+        &self,
+        parent: Option<&NamespaceIdent>,
+    ) -> iceberg::Result<Vec<NamespaceIdent>> {
+        self.inner.list_namespaces(parent).await
+    }
+
+    async fn create_namespace(
+        &self,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
+    ) -> iceberg::Result<Namespace> {
+        self.inner.create_namespace(namespace, properties).await
+    }
+
+    async fn get_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<Namespace> {
+        self.inner.get_namespace(namespace).await
+    }
+
+    async fn namespace_exists(&self, namespace: &NamespaceIdent) -> iceberg::Result<bool> {
+        self.inner.namespace_exists(namespace).await
+    }
+
+    async fn update_namespace(
+        &self,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
+    ) -> iceberg::Result<()> {
+        self.inner.update_namespace(namespace, properties).await
+    }
+
+    async fn drop_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<()> {
+        self.inner.drop_namespace(namespace).await
+    }
+
+    async fn list_tables(&self, namespace: &NamespaceIdent) -> iceberg::Result<Vec<TableIdent>> {
+        self.inner.list_tables(namespace).await
+    }
+
+    async fn create_table(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> iceberg::Result<Table> {
+        self.inner.create_table(namespace, creation).await
+    }
+
+    async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
+        let active = self.active_loads.fetch_add(1, Ordering::SeqCst) + 1;
+        let _active = ActiveLoad(&self.active_loads);
+        self.max_active_loads.fetch_max(active, Ordering::SeqCst);
+        self.started.notify_one();
+        if self.fail_table.as_deref() == Some(table.name()) {
+            return Err(iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                "injected load failure",
+            ));
+        }
+        let _permit = self.gate.acquire().await.expect("the test gate stays open");
+        self.inner.load_table(table).await
+    }
+
+    async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+        self.inner.drop_table(table).await
+    }
+
+    async fn purge_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+        self.inner.purge_table(table).await
+    }
+
+    async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
+        self.inner.table_exists(table).await
+    }
+
+    async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> iceberg::Result<()> {
+        self.inner.rename_table(src, dest).await
+    }
+
+    async fn register_table(
+        &self,
+        table: &TableIdent,
+        metadata_location: String,
+    ) -> iceberg::Result<Table> {
+        self.inner.register_table(table, metadata_location).await
+    }
+
+    async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
+        self.inner.update_table(commit).await
+    }
+}
+
+#[tokio::test]
+async fn table_appends_overlap_with_bounded_concurrency() -> Result<()> {
+    let concurrency = *S3_EXPORT_MAX_CONCURRENT_TABLE_WRITES;
+    let catalog = memory_catalog().await?;
+    let sources: Vec<_> = (0..2 * concurrency + 3)
+        .map(|i| source(&format!("table_{i:02}")))
+        .collect();
+    open(catalog.clone()).await?.apply(&sources, vec![]).await?;
+    let blocking = Arc::new(BlockingCatalog::new(catalog.clone(), None));
+    let mut writer = open(blocking.clone()).await?;
+    writer.snapshot_properties = HashMap::from([("convex.page".to_owned(), "7".to_owned())]);
+    let entries = sources
+        .iter()
+        .flat_map(|source| {
+            [
+                (source.clone(), change("document", 1, Some("{}"))),
+                (source.clone(), change("document", 2, None)),
+            ]
+        })
+        .collect();
+    let task = tokio::spawn(async move {
+        writer.apply(&[], entries).await?;
+        Ok::<_, anyhow::Error>(writer)
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let started = blocking.started.notified();
+            if blocking.active_loads.load(Ordering::SeqCst) >= concurrency {
+                break;
+            }
+            started.await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        blocking.max_active_loads.load(Ordering::SeqCst),
+        concurrency
+    );
+    assert!(!task.is_finished());
+    blocking.gate.add_permits(concurrency);
+    let writer = tokio::time::timeout(Duration::from_secs(5), task).await???;
+    assert_eq!(blocking.active_loads.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        blocking.max_active_loads.load(Ordering::SeqCst),
+        concurrency
+    );
+    assert_eq!(writer.locations().len(), sources.len());
+    assert!(writer.bytes_written() > 0);
+    for source in sources {
+        let table = catalog
+            .load_table(&TableIdent::new(
+                writer.namespace.clone(),
+                IcebergChangeWriter::table_name(&source)?,
+            ))
+            .await?;
+        assert_eq!(
+            read(&table).await?,
+            vec![
+                change("document", 1, Some("{}")),
+                change("document", 2, None)
+            ]
+        );
+        assert_eq!(
+            writer.locations()[table.identifier().name()],
+            table.metadata_location_result()?
+        );
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .additional_properties["convex.page"],
+            "7"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_table_cancels_pending_appends_and_preserves_locations() -> Result<()> {
+    let concurrency = *S3_EXPORT_MAX_CONCURRENT_TABLE_WRITES;
+    let catalog = memory_catalog().await?;
+    let sources: Vec<_> = (0..concurrency)
+        .map(|i| source(&format!("table_{i:02}")))
+        .collect();
+    let mut initial = open(catalog.clone()).await?;
+    initial.apply(&sources, vec![]).await?;
+    let blocking = Arc::new(BlockingCatalog::new(
+        catalog.clone(),
+        Some(IcebergChangeWriter::table_name(sources.last().unwrap())?),
+    ));
+    let mut writer = open(blocking.clone()).await?;
+    writer.locations = initial.locations().clone();
+    let error = writer
+        .apply(
+            &[],
+            sources
+                .iter()
+                .map(|source| (source.clone(), change("document", 1, Some("{}"))))
+                .collect(),
+        )
+        .await
+        .expect_err("one failed table must fail the page");
+    assert!(
+        error.to_string().contains("injected load failure"),
+        "{error:#}"
+    );
+    assert_eq!(
+        blocking.max_active_loads.load(Ordering::SeqCst),
+        concurrency
+    );
+    assert_eq!(blocking.active_loads.load(Ordering::SeqCst), 0);
+    assert_eq!(writer.locations(), initial.locations());
+    assert_eq!(writer.bytes_written(), 0);
+    for source in sources {
+        let table = catalog
+            .load_table(&TableIdent::new(
+                initial.namespace.clone(),
+                IcebergChangeWriter::table_name(&source)?,
+            ))
+            .await?;
+        assert!(read(&table).await?.is_empty());
+    }
+    Ok(())
 }
 
 #[tokio::test]

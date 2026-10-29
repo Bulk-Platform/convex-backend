@@ -278,6 +278,11 @@ pub static DATA_SYNC_PAGE_SIZE_LIMIT: LazyLock<usize> =
 pub static DATA_SYNC_PAGE_BYTES_LIMIT: LazyLock<usize> =
     LazyLock::new(|| env_config("DATA_SYNC_PAGE_BYTES_LIMIT", 1 << 26)); // 64 MiB
 
+/// Each active table in an S3 export page can buffer Parquet data and issue S3
+/// requests.
+pub static S3_EXPORT_MAX_CONCURRENT_TABLE_WRITES: LazyLock<usize> =
+    LazyLock::new(|| env_config("S3_EXPORT_MAX_CONCURRENT_TABLE_WRITES", 8).max(1));
+
 /// Max number of rows `DataSyncIterator` will read from persistence when
 /// computing a single page. A page can read many more rows than it emits when
 /// catching up the document log with a narrow table filter (lots of skipping).
