@@ -35,7 +35,7 @@
   },
   "dependencies": {
     "@babel/code-frame": "^7.27.1",
-    "@sentry/node": "^8.55.2",
+    "@sentry/node": "^9.47.2",
     "@types/babel__code-frame": "^7.0.6",
     "chalk": "5",
     "commander": "^14.0.3",
