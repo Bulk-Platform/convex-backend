@@ -12,7 +12,6 @@ import { TimestampDistance } from "@common/elements/TimestampDistance";
 import { useDeploymentUris } from "hooks/useDeploymentUris";
 import { cn } from "@ui/cn";
 import Link from "next/link";
-import { useRouter } from "next/router";
 import { ReactNode, useState } from "react";
 import { ProjectDetails } from "generatedApi";
 import {
@@ -36,7 +35,6 @@ export function ProjectCard({
   listItem?: boolean;
   searchQuery?: string;
 }) {
-  const router = useRouter();
   const { id, slug, name } = project;
   const team = useCurrentTeam();
 
@@ -71,26 +69,18 @@ export function ProjectCard({
   );
   const canDeleteProject = hasAdminPermissions || canDeleteCustom === true;
 
-  function openSettings() {
-    void router.push(`/t/${team?.slug}/${project.slug}/settings`);
-  }
-
-  function openDeploymentsList() {
-    void router.push(
-      `/t/${team?.slug}?view=deployments&projectId=${project.id}`,
-    );
-  }
+  const deploymentsListHref = `/t/${team?.slug}?view=deployments&projectId=${project.id}`;
 
   const dropdownItems: NonNullable<CardProps["dropdownItems"]> = [
     {
       Icon: LayersIcon,
       text: "View Deployments",
-      action: openDeploymentsList,
+      href: deploymentsListHref,
     },
     {
       Icon: GearIcon,
       text: "Settings",
-      action: openSettings,
+      href: `/t/${team?.slug}/${project.slug}/settings`,
     },
     {
       Icon: TrashIcon,
@@ -110,7 +100,6 @@ export function ProjectCard({
   // For custom-role members, redirect to the deployments list view scoped
   // to this project so they can still discover any deployments their role
   // allows (e.g. preview).
-  const deploymentsListHref = `/t/${team?.slug}?view=deployments&projectId=${project.id}`;
   const cardHref = isCustomRoleMember ? deploymentsListHref : defaultHref;
 
   const linkLabel = name?.length ? name : "Untitled Project";

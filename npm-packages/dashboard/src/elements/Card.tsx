@@ -10,14 +10,16 @@ export type CardProps = {
   contentClassName?: string;
   href?: string | UrlObject;
   children: ReactNode;
-  dropdownItems?: {
+  dropdownItems?: ({
     Icon: React.FC<{ className: string | undefined }>;
     text: string;
-    action: () => void;
     destructive?: boolean;
     disabled?: boolean;
     tip?: ReactNode;
-  }[];
+  } & (
+    | { action: () => void; href?: never }
+    | { action?: never; href: string }
+  ))[];
   // Will be rendered as sibling to Card content
   overlayed?: ReactNode;
   // Accessible label for the card's overlay link (used as sr-only text)
@@ -90,7 +92,9 @@ export function CardMenu({
           <MenuItem
             key={item.text}
             variant={item.destructive ? "danger" : "default"}
-            action={item.action}
+            {...(item.href !== undefined
+              ? { href: item.href }
+              : { action: item.action })}
             disabled={item.disabled}
             tip={item.tip}
             tipSide="right"
