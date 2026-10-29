@@ -4886,23 +4886,11 @@
       "GetPricesPlanResponse": {
         "type": "object",
         "required": [
-          "planType",
-          "planVersion"
+          "planType"
         ],
         "properties": {
           "planType": {
             "type": "string"
-          },
-          "planVersion": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "activePhase": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
           }
         }
       },

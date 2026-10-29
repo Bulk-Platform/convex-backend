@@ -2284,10 +2284,6 @@ export interface components {
         };
         GetPricesPlanResponse: {
             planType: string;
-            /** Format: int64 */
-            planVersion: number;
-            /** Format: int64 */
-            activePhase?: number | null;
         };
         GetPricesResponse: {
             currency: string;
