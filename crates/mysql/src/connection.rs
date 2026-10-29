@@ -96,7 +96,7 @@ fn classify_mysql_error(e: mysql_async::Error) -> anyhow::Error {
             DriverError::PoolDisconnected | DriverError::ConnectionClosed,
         )
         | mysql_async::Error::Server(mysql_async::ServerError {
-            // Expected operational Vitess errors:
+            // Expected operational MySQL/Aurora errors:
             code:
             | 1290 // EROptionPreventsStatement "The MySQL server is running with the --read-only option so it cannot execute this statement"
             | 2013 // CRServerLost
@@ -114,11 +114,7 @@ fn classify_mysql_error(e: mysql_async::Error) -> anyhow::Error {
             code: 1105,
             ref message,
             ..
-        }) if message.contains("primary is not serving")
-            || message.contains("for tx killer rollback")
-            || message.contains("connection pool timed out")
-            || message.contains("connection timed out") =>
-        {
+        }) if message.contains("connection timed out") =>         {
             database_operational_error(e.into())
         },
         mysql_async::Error::Server(mysql_async::ServerError {
@@ -151,21 +147,6 @@ pub(crate) fn is_no_such_table_error(error: &anyhow::Error) -> bool {
         .chain()
         .filter_map(|error| error.downcast_ref::<mysql_async::ServerError>())
         .any(|database_error| database_error.code == ER_NO_SUCH_TABLE)
-}
-
-/// Recognizes the Vitess error returned when a result exceeds its 64 MiB
-/// message limit, allowing callers to retry with a smaller page.
-pub(crate) fn is_message_too_large_error(
-    error: &anyhow::Error,
-) -> Option<&mysql_async::ServerError> {
-    error
-        .chain()
-        .find_map(|error| error.downcast_ref::<mysql_async::ServerError>())
-        .filter(|database_error| {
-            database_error.state == "HY000"
-                && database_error.code == 1105
-                && database_error.message.contains("message larger than max")
-        })
 }
 
 // Guard against connections hanging during bootstrapping -- which means
