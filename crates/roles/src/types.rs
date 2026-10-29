@@ -23,6 +23,9 @@ pub(crate) enum ProjectSelector {
     Any,
     Id(ProjectId),
     Slug(ProjectSlug),
+    /// `tag=prod` — every project carrying this tag, compared exactly as
+    /// stored (the same comparison as the project list's tag filter).
+    Tag(String),
 }
 
 /// Selectors valid on deployment resources.
@@ -1298,8 +1301,8 @@ pub struct RoleStatement {
     pub effect: RoleStatementEffect,
     #[schema(value_type = RoleStatementActions)]
     pub actions: ActionPattern,
-    /// Resource path like `project:*`, `project:slug=my-app`, or
-    /// `project:*:deployment:type=prod`.
+    /// Resource path like `project:*`, `project:slug=my-app`,
+    /// `project:tag=prod`, or `project:*:deployment:type=prod`.
     #[schema(value_type = String, example = "project:*")]
     pub resource: ResourceSpecifier,
 }
@@ -1398,6 +1401,7 @@ pub struct ConcreteProject {
     pub id: ProjectId,
     pub slug: ProjectSlug,
     pub name: ProjectName,
+    pub tags: Vec<String>,
 }
 
 /// Minimal representation of a deployment needed for custom role enforcement.
@@ -1432,8 +1436,9 @@ pub enum ConcreteSegment {
     Team,
     Project(ConcreteProject),
     /// A project that does not yet exist (the create-project authorization
-    /// path). `ProjectSelector::Id` cannot match — there is no id — but
-    /// `Slug` and `Any` selectors evaluate against the proposed slug.
+    /// path). `ProjectSelector::Id` and `Tag` cannot match — there is no id
+    /// and no tags yet — but `Slug` and `Any` selectors evaluate against the
+    /// proposed slug.
     ProposedProject {
         slug: ProjectSlug,
     },
@@ -1491,12 +1496,20 @@ impl ConcreteSegment {
     /// attribute-less singletons (Team, Member, Billing, etc.).
     fn describe_attributes(&self) -> Option<String> {
         match self {
-            ConcreteSegment::Project(p) => Some(format!(
-                "id={}, name={:?}, slug={:?}",
-                p.id,
-                p.name.as_str(),
-                p.slug.as_str(),
-            )),
+            ConcreteSegment::Project(p) => {
+                let mut attrs = format!(
+                    "id={}, name={:?}, slug={:?}",
+                    p.id,
+                    p.name.as_str(),
+                    p.slug.as_str(),
+                );
+                // Tags are only loaded for roles that select on them, so an
+                // empty list doesn't mean the project is untagged.
+                if !p.tags.is_empty() {
+                    attrs.push_str(&format!(", tags={:?}", p.tags));
+                }
+                Some(attrs)
+            },
             ConcreteSegment::ProposedProject { slug } => Some(format!("slug={:?}", slug.as_str())),
             ConcreteSegment::Deployment(d) => {
                 let creator = match d.creator {

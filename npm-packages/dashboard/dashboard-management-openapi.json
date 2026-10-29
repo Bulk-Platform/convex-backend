@@ -6527,7 +6527,7 @@
           },
           "resource": {
             "type": "string",
-            "description": "Resource path like `project:*`, `project:slug=my-app`, or\n`project:*:deployment:type=prod`.",
+            "description": "Resource path like `project:*`, `project:slug=my-app`,\n`project:tag=prod`, or `project:*:deployment:type=prod`.",
             "example": "project:*"
           }
         }

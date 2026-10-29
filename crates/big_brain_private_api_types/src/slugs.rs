@@ -31,6 +31,30 @@ pub fn validate_slug(slug: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub const MAX_PROJECT_TAG_LEN: usize = 32;
+
+pub fn validate_project_tag(tag: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !tag.is_empty(),
+        ErrorMetadata::bad_request("InvalidProjectTag", "A tag can't be empty.")
+    );
+    anyhow::ensure!(
+        tag.chars().count() <= MAX_PROJECT_TAG_LEN,
+        ErrorMetadata::bad_request(
+            "InvalidProjectTag",
+            format!("Tag `{tag}` is longer than {MAX_PROJECT_TAG_LEN} characters."),
+        )
+    );
+    anyhow::ensure!(
+        is_slug_charset(tag),
+        ErrorMetadata::bad_request(
+            "InvalidProjectTag",
+            format!("Tag `{tag}` must contain only numbers, letters, '-', and '_'."),
+        )
+    );
+    Ok(())
+}
+
 pub fn validate_team_slug(team_slug: &str) -> anyhow::Result<()> {
     validate_slug(team_slug)?;
     if team_slug.contains("convex") {

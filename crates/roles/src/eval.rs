@@ -47,6 +47,7 @@ impl ProjectSelector {
             ProjectSelector::Any => true,
             ProjectSelector::Id(id) => project.id == *id,
             ProjectSelector::Slug(slug) => project.slug == *slug,
+            ProjectSelector::Tag(tag) => project.tags.contains(tag),
         }
     }
 }
@@ -102,7 +103,7 @@ impl ResourceSegment {
             (ResourceSegment::Project(selectors), ConcreteSegment::ProposedProject { slug }) => {
                 selectors.iter().any(|s| match s {
                     ProjectSelector::Any => true,
-                    ProjectSelector::Id(_) => false,
+                    ProjectSelector::Id(_) | ProjectSelector::Tag(_) => false,
                     ProjectSelector::Slug(s) => s == slug,
                 })
             },
@@ -206,6 +207,20 @@ impl CustomRole {
             return AccessDecision::Denied;
         };
         evaluate_statements(self.statements.iter(), stmt_action, resource, actor)
+    }
+
+    /// Whether any statement targets projects by `tag=`, i.e. whether
+    /// evaluating this role needs the project's tags loaded.
+    pub fn selects_project_tags(&self) -> bool {
+        self.statements.iter().any(|stmt| {
+            stmt.resource.segments.iter().any(|segment| {
+                matches!(
+                    segment,
+                    ResourceSegment::Project(selectors)
+                        if selectors.iter().any(|s| matches!(s, ProjectSelector::Tag(_)))
+                )
+            })
+        })
     }
 }
 
