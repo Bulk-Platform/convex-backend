@@ -858,7 +858,9 @@ export interface paths {
          * Update default environment variables
          * @description Creates, updates, or deletes default environment variables for the specified
          *     project. When `value` is a string, the variable is upserted. When `value` is
-         *     null, the variable is deleted.
+         *     null, the variable is deleted. Each item in `changes` can set
+         *     `applyToExistingDeployments` to true to asynchronously upsert or delete the
+         *     variable on every existing cloud deployment of that item's `deploymentType`.
          */
         post: operations["update default environment variables"];
         delete?: never;
@@ -1104,6 +1106,9 @@ export interface components {
              *     environment variable with the given name and deployment
              *     type if it exists (and do nothing if it doesn’t exist). */
             value?: string | null;
+            /** @description Apply this change to every existing cloud deployment of the selected
+             *     type, overwriting/deleting any existing values. Defaults to false. */
+            applyToExistingDeployments?: boolean;
         };
         DefaultEnvironmentVariableResponse: {
             name: string;

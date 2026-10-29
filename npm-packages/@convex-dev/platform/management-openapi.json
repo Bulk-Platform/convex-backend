@@ -2392,7 +2392,7 @@
           "Environment Variables"
         ],
         "summary": "Update default environment variables",
-        "description": "Creates, updates, or deletes default environment variables for the specified\nproject. When `value` is a string, the variable is upserted. When `value` is\nnull, the variable is deleted.",
+        "description": "Creates, updates, or deletes default environment variables for the specified\nproject. When `value` is a string, the variable is upserted. When `value` is\nnull, the variable is deleted. Each item in `changes` can set\n`applyToExistingDeployments` to true to asynchronously upsert or delete the\nvariable on every existing cloud deployment of that item's `deploymentType`.",
         "operationId": "update default environment variables",
         "parameters": [
           {
@@ -3161,6 +3161,10 @@
               "null"
             ],
             "description": "Set to a value to upsert the default environment variable\nwith the given name and type. If null, will delete the\nenvironment variable with the given name and deployment\ntype if it exists (and do nothing if it doesn’t exist)."
+          },
+          "applyToExistingDeployments": {
+            "type": "boolean",
+            "description": "Apply this change to every existing cloud deployment of the selected\ntype, overwriting/deleting any existing values. Defaults to false."
           }
         },
         "additionalProperties": false
