@@ -250,7 +250,7 @@ export function quickCreateUrl({
     param_GlueDatabase: glueDatabase,
     param_CreateBucket: String(createBucket),
   });
-  return `https://${region}.console.aws.amazon.com/cloudformation/home?region=${region}#/stacks/quickcreate?${params}`;
+  return `https://console.aws.amazon.com/cloudformation/home?${new URLSearchParams({ region })}#/stacks/quickcreate?${params}`;
 }
 
 /**
@@ -346,7 +346,9 @@ export function S3ExportConfigurationForm({
     () =>
       Yup.object().shape({
         bucket: bucketSchema,
-        region: Yup.string().required("Region is required"),
+        region: Yup.string()
+          .required("Region is required")
+          .max(63, "Region must be at most 63 characters"),
         // IAM reads `*` and `?` as wildcards, which would widen the generated
         // policy beyond the export's directory.
         // Mirrors `validate_s3_prefix` in crates/local_backend/src/log_sinks.rs.

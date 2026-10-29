@@ -519,6 +519,14 @@ fn validate_s3_prefix(prefix: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_s3_region(region: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (1..=63).contains(&region.len()),
+        ErrorMetadata::bad_request("InvalidS3Region", "Region must be between 1 and 63 bytes")
+    );
+    Ok(())
+}
+
 fn validate_s3_bucket(bucket: &str) -> anyhow::Result<()> {
     // https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html
     let is_lower_alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
@@ -582,6 +590,7 @@ impl TryFrom<CreateS3ExportLogStreamArgs> for S3ExportConfig {
 
     fn try_from(value: CreateS3ExportLogStreamArgs) -> Result<Self, Self::Error> {
         validate_s3_bucket(&value.bucket)?;
+        validate_s3_region(&value.region)?;
         validate_s3_prefix(value.prefix.as_deref().unwrap_or_default())?;
         let selection = value.selection.unwrap_or_default();
         validate_s3_selection(&selection)?;
