@@ -99,8 +99,9 @@ pub struct AiGatewayJwtClaims {
     )]
     pub member_id: Option<MemberId>,
     /// The team and project that own the deployment, for any consumer.
-    /// Stable and unique, but opaque: don't parse them. Both or neither.
-    /// Optional so gateways can be deployed before every token minter.
+    /// Stable and unique, but opaque: don't parse them.
+    /// TODO: require these once every minter sends them. They're optional so
+    /// gateways can be deployed first.
     #[serde(
         rename = "convex.team",
         default,
@@ -289,6 +290,8 @@ fn verify_claims(
 /// The one place that turns real IDs into the opaque `convex.team` and
 /// `convex.project` claims, so the encoding can change without touching
 /// signers' callers or consumers.
+/// TODO: these are the raw IDs as strings for now, not yet obfuscated. Switch
+/// to per-audience opaque IDs before vendors outside Convex read them.
 fn team_and_project_claims(team_id: TeamId, project_id: ProjectId) -> (String, String) {
     (team_id.0.to_string(), project_id.0.to_string())
 }
