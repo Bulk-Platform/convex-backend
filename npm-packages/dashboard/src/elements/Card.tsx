@@ -65,33 +65,41 @@ export function Card({
       </div>
 
       {overlayed}
-      {dropdownItems && (
-        <div className="relative z-10">
-          <Menu
-            placement="bottom-start"
-            buttonProps={{
-              "aria-label": "Open project settings",
-              variant: "neutral",
-              inline: true,
-              icon: <DotsVerticalIcon className="text-content-secondary" />,
-            }}
+      {dropdownItems && <CardMenu items={dropdownItems} />}
+    </div>
+  );
+}
+
+export function CardMenu({
+  items,
+}: {
+  items: NonNullable<CardProps["dropdownItems"]>;
+}) {
+  return (
+    <div className="relative z-10">
+      <Menu
+        placement="bottom-start"
+        buttonProps={{
+          "aria-label": "Open project settings",
+          variant: "neutral",
+          inline: true,
+          icon: <DotsVerticalIcon className="text-content-secondary" />,
+        }}
+      >
+        {items.map((item) => (
+          <MenuItem
+            key={item.text}
+            variant={item.destructive ? "danger" : "default"}
+            action={item.action}
+            disabled={item.disabled}
+            tip={item.tip}
+            tipSide="right"
           >
-            {dropdownItems?.map((item) => (
-              <MenuItem
-                key={item.text}
-                variant={item.destructive ? "danger" : "default"}
-                action={item.action}
-                disabled={item.disabled}
-                tip={item.tip}
-                tipSide="right"
-              >
-                <item.Icon className="size-4" />
-                {item.text}
-              </MenuItem>
-            ))}
-          </Menu>
-        </div>
-      )}
+            <item.Icon className="size-4" />
+            {item.text}
+          </MenuItem>
+        ))}
+      </Menu>
     </div>
   );
 }
