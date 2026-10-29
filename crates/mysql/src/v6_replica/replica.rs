@@ -336,18 +336,26 @@ impl<RT: Runtime> ReplicaWriter<RT> {
     }
 
     /// Retention retries marker discovery periodically, so a stale result is
-    /// safe. Marker deletions queue behind the reconciliation they depend on.
-    pub(crate) async fn index_backfill_marker_indexes(self: &Arc<Self>) -> Vec<PersistenceIndexId> {
+    /// safe and a failed read is only reported: a read cannot leave replay
+    /// incomplete. Marker deletions queue behind the reconciliation they
+    /// depend on.
+    pub(crate) async fn index_backfill_marker_indexes(&self) -> Vec<PersistenceIndexId> {
         let Some(v6) = self.v6.get().filter(|_| !self.is_stopped()) else {
             return Vec::new();
         };
         match v6.index_backfill_marker_indexes().await {
             Ok(indexes) => indexes,
-            Err(error) => {
-                self.retire(metrics::RetireReason::JobFailed, &error);
-                Vec::new()
-            },
+            Err(error) => self.report_marker_read_failure(error),
         }
+    }
+
+    fn report_marker_read_failure(&self, error: anyhow::Error) -> Vec<PersistenceIndexId> {
+        metrics::log_marker_read_failure(&self.cluster_name);
+        tracing::warn!(
+            instance_name = %self.instance_name,
+            "Could not list V6 replica backfill markers: {error:#}"
+        );
+        Vec::new()
     }
 
     /// The caller must finish all source calls before starting replica

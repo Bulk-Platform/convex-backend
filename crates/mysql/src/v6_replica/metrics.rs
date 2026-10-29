@@ -48,6 +48,18 @@ pub(crate) fn log_retirement(cluster_name: &str, reason: RetireReason) {
 }
 
 register_convex_counter!(
+    MYSQL_V6_REPLICA_MARKER_READ_FAILURES_TOTAL,
+    "Failed reads of a V6 replica's index backfill markers. Retention retries the read, so a \
+     failure does not retire the replica",
+    &["cluster_name"]
+);
+pub(crate) fn log_marker_read_failure(cluster_name: &str) {
+    MYSQL_V6_REPLICA_MARKER_READ_FAILURES_TOTAL
+        .with_label_values(&[cluster_name])
+        .inc();
+}
+
+register_convex_counter!(
     MYSQL_V6_REPLICA_COMPARISONS_TOTAL,
     "Sampled V5 index scans by comparison outcome against the V6 replica",
     &["cluster_name", "outcome"]
@@ -164,4 +176,7 @@ pub(crate) fn initialize(cluster_name: &str) {
             .with_label_values(&[cluster_name, outcome.into()])
             .inc_by(0);
     }
+    MYSQL_V6_REPLICA_MARKER_READ_FAILURES_TOTAL
+        .with_label_values(&[cluster_name])
+        .inc_by(0);
 }
