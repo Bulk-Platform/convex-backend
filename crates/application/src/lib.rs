@@ -209,7 +209,6 @@ use keybroker::{
     Identity,
     KeyBroker,
 };
-use log_streaming::add_local_log_sink_on_startup;
 use maplit::{
     btreemap,
     btreeset,
@@ -747,7 +746,6 @@ impl<RT: Runtime> Application<RT> {
         cache: QueryCache,
         fetch_client: Arc<dyn FetchClient>,
         sentry_transport: Arc<dyn sentry::TransportFactory>,
-        local_log_sink: Option<String>,
         lease_lost_shutdown: ShutdownSignal,
         export_provider: Arc<dyn ExportProvider<RT>>,
         deleted_tablet_receiver: tokio::sync::mpsc::Receiver<TabletId>,
@@ -819,18 +817,9 @@ impl<RT: Runtime> Application<RT> {
             runtime.spawn("system_table_cleanup_worker", system_table_cleanup_worker),
         ));
 
-        // If local_log_sink is passed in, this is a local instance, so we enable log
-        // streaming by default. Otherwise, it's hard to grant the
-        // entitlement in testing and in load generator. If not local, we
-        // read the entitlement from the database.
         let mut tx = database.begin(Identity::system()).await?;
         let mut bi = BackendInfoModel::new(&mut tx);
-        let log_streaming_allowed = if let Some(path) = local_log_sink {
-            add_local_log_sink_on_startup(database.clone(), path).await?;
-            true
-        } else {
-            bi.is_log_streaming_allowed().await?
-        };
+        let log_streaming_allowed = bi.is_log_streaming_allowed().await?;
 
         let usage_counter = UsageCounter::new(usage_event_logger.clone());
         let log_manager_client = LogManager::start(
