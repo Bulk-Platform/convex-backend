@@ -7,6 +7,7 @@
 //! and schedules deletion of the replica's data.
 mod comparison;
 mod config;
+mod in_flight;
 mod metrics;
 mod persistence;
 mod replica;

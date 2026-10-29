@@ -44,6 +44,7 @@ use tokio::sync::{
 
 use super::{
     comparison::ComparingV5Reader,
+    in_flight::InFlightCalls,
     metrics,
     replica::{
         ReplayOperation,
@@ -58,6 +59,7 @@ pub(crate) struct ReplicatedV5Persistence<RT: Runtime> {
     _writer_state_gauge: Arc<metrics::WriterStateGauge>,
     pub(super) closing: AtomicBool,
     calls: Arc<RwLock<()>>,
+    in_flight: Arc<InFlightCalls>,
 }
 
 /// A cancelled or failed source call may have committed before replay was
@@ -87,6 +89,7 @@ impl<RT: Runtime> ReplicatedV5Persistence<RT> {
             _writer_state_gauge: writer_state_gauge,
             closing: AtomicBool::new(false),
             calls: Arc::new(RwLock::new(())),
+            in_flight: Default::default(),
         }
     }
 
@@ -123,6 +126,7 @@ impl<RT: Runtime> ReplicatedV5Persistence<RT> {
         let Some(replica) = &self.replica else {
             return Ok((call.await?, None));
         };
+        let _in_flight = self.in_flight.begin();
         let mut replay_guard = SourceWriteReplayGuard(Some(replica));
         let value = match call.await {
             Ok(value) => value,
@@ -169,7 +173,7 @@ impl<RT: Runtime> PersistenceTrait for ReplicatedV5Persistence<RT> {
             Some(replica) => Arc::new(ComparingV5Reader::new(
                 reader,
                 replica.clone(),
-                self.calls.clone(),
+                self.in_flight.clone(),
             )),
             None => reader,
         }

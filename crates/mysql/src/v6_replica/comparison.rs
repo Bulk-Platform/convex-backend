@@ -12,7 +12,6 @@ use std::{
         Context,
         Poll,
     },
-    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -54,12 +53,10 @@ use futures::{
     TryStreamExt as _,
 };
 use serde_json::Value as JsonValue;
-use tokio::sync::{
-    OwnedSemaphorePermit,
-    RwLock,
-};
+use tokio::sync::OwnedSemaphorePermit;
 
 use super::{
+    in_flight::InFlightCalls,
     metrics::{
         self,
         ComparisonOutcome,
@@ -70,19 +67,19 @@ use super::{
 pub(crate) struct ComparingV5Reader<RT: Runtime> {
     v5: Arc<dyn PersistenceReader>,
     replica: Arc<ReplicaWriter<RT>>,
-    source_calls: Arc<RwLock<()>>,
+    in_flight: Arc<InFlightCalls>,
 }
 
 impl<RT: Runtime> ComparingV5Reader<RT> {
     pub(crate) fn new(
         v5: Arc<dyn PersistenceReader>,
         replica: Arc<ReplicaWriter<RT>>,
-        source_calls: Arc<RwLock<()>>,
+        in_flight: Arc<InFlightCalls>,
     ) -> Self {
         Self {
             v5,
             replica,
-            source_calls,
+            in_flight,
         }
     }
 }
@@ -163,7 +160,7 @@ impl<RT: Runtime> PersistenceReader for ComparingV5Reader<RT> {
         );
         let Some(comparison) = IndexScanComparison::try_sample(
             &self.replica,
-            &self.source_calls,
+            &self.in_flight,
             IndexScanRequest {
                 index,
                 tablet_id,
@@ -254,7 +251,7 @@ impl IndexEntryMetadata {
 
 struct IndexScanComparison<RT: Runtime> {
     replica: Arc<ReplicaWriter<RT>>,
-    source_calls: Arc<RwLock<()>>,
+    in_flight: Arc<InFlightCalls>,
     scan: IndexScanRequest,
     // Held from sampling through outcome logging to bound capture buffers and
     // let tests wait for recorded outcomes.
@@ -264,7 +261,7 @@ struct IndexScanComparison<RT: Runtime> {
 impl<RT: Runtime> IndexScanComparison<RT> {
     fn try_sample(
         replica: &Arc<ReplicaWriter<RT>>,
-        source_calls: &Arc<RwLock<()>>,
+        in_flight: &Arc<InFlightCalls>,
         scan: IndexScanRequest,
     ) -> Option<Self> {
         if rand::random::<f64>() >= replica.settings.comparison_sample_rate {
@@ -282,7 +279,7 @@ impl<RT: Runtime> IndexScanComparison<RT> {
         };
         Some(Self {
             replica: replica.clone(),
-            source_calls: source_calls.clone(),
+            in_flight: in_flight.clone(),
             scan,
             _permit: permit,
         })
@@ -293,9 +290,11 @@ impl<RT: Runtime> IndexScanComparison<RT> {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
+        // Calls begun after the scan ended cannot have been visible to it.
+        let calls_through = self.in_flight.latest();
         common::runtime::tokio_spawn("v6_replica_comparison", async move {
             let outcome = self
-                .compare_with_replica(source_entries, source_exhausted)
+                .compare_with_replica(source_entries, source_exhausted, calls_through)
                 .await;
             metrics::log_comparison(&self.replica.cluster_name, outcome);
         });
@@ -305,22 +304,20 @@ impl<RT: Runtime> IndexScanComparison<RT> {
         &self,
         source_entries: Vec<IndexEntryMetadata>,
         source_exhausted: bool,
+        calls_through: Option<u64>,
     ) -> ComparisonOutcome {
         let scan = &self.scan;
         let deadline = tokio::time::Instant::now() + self.replica.settings.apply_wait;
-        // V5 commits can be visible before their replay is queued. Once source
-        // calls are idle, every write observed by this scan has queued replay
-        // or retired the replica. A busy deployment is rarely idle on the
-        // first look, so poll until the deadline; each successful try drops
-        // the lock at once so queued source calls are not held up.
-        loop {
-            if self.source_calls.try_write().is_ok() {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return ComparisonOutcome::Invalidated;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        // V5 commits can be visible before their replay is queued. Once every
+        // call begun before the scan ended has finished, each write the scan
+        // observed has queued replay or retired the replica.
+        if let Some(calls_through) = calls_through
+            && !self
+                .in_flight
+                .wait_finished_through(calls_through, deadline)
+                .await
+        {
+            return ComparisonOutcome::Invalidated;
         }
         if !self.replica.wait_for_prior_replay(Some(deadline)).await {
             return ComparisonOutcome::Invalidated;
