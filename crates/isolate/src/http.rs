@@ -1,22 +1,17 @@
 use std::{
     mem,
-    pin::Pin,
     str::FromStr,
 };
 
-use common::{
-    http::{
-        HttpRequestStream,
-        HttpResponse,
-        HttpResponseStream,
-    },
-    sync::spsc,
+use common::http::{
+    HttpRequestStream,
+    HttpResponse,
+    HttpResponseStream,
 };
 use errors::ErrorMetadata;
 use futures::{
     stream::BoxStream,
     FutureExt,
-    Stream,
     StreamExt,
 };
 use headers::{
@@ -36,10 +31,7 @@ use udf::HttpActionRequestHead;
 use url::Url;
 use value::heap_size::HeapSize;
 
-use crate::{
-    ops::V8OpProvider,
-    request_scope::StreamListener,
-};
+use crate::ops::BodyReceiver;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,9 +44,9 @@ pub struct HttpRequestV8 {
 }
 
 impl HttpRequestV8 {
-    pub fn into_stream<'b, P: V8OpProvider<'b>>(
+    pub fn into_stream(
         self,
-        provider: &mut P,
+        mut listen: impl FnMut(uuid::Uuid) -> anyhow::Result<BodyReceiver>,
     ) -> anyhow::Result<HttpRequestStream> {
         let mut header_map = HeaderMap::new();
         for (name, value) in &self.header_pairs {
@@ -68,21 +60,16 @@ impl HttpRequestV8 {
         // correctly over HTTP/2 -- do not substitute an empty stream.
         let body = match self.stream_id {
             Some(stream_id) => {
-                let (body_sender, body_receiver) = spsc::unbounded_channel();
-                provider.new_stream_listener(stream_id, StreamListener::RustStream(body_sender))?;
-                Some(Box::pin(body_receiver.into_stream())
-                    as Pin<
-                        Box<dyn Stream<Item = anyhow::Result<bytes::Bytes>> + Sync + Send>,
-                    >)
+                let body_receiver = listen(stream_id)?;
+                Some(body_receiver.into_stream().boxed())
             },
             None => None,
         };
-        let signal = {
-            let (signal_sender, signal_receiver) = spsc::unbounded_channel();
-            provider.new_stream_listener(self.signal, StreamListener::RustStream(signal_sender))?;
-            let signal_stream = signal_receiver.into_stream();
-            Box::pin(signal_stream.into_future().map(|_| ()))
-        };
+        let signal = listen(self.signal)?
+            .into_stream()
+            .into_future()
+            .map(|_| ())
+            .boxed();
 
         Ok(HttpRequestStream {
             body,

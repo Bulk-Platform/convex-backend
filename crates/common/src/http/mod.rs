@@ -198,7 +198,7 @@ impl From<HttpRequest> for HttpRequestStream {
     fn from(value: HttpRequest) -> Self {
         let body = value.body.map(|b| {
             Box::pin(futures::stream::once(async move { Ok(b) }))
-                as Pin<Box<dyn Stream<Item = anyhow::Result<bytes::Bytes>> + Sync + Send>>
+                as Pin<Box<dyn Stream<Item = anyhow::Result<bytes::Bytes>> + Send>>
         });
 
         Self {
@@ -234,8 +234,8 @@ pub struct HttpRequestStream {
     /// by inspecting the stream, because the stream may be a full-duplex
     /// body whose first chunk is only produced after the response headers
     /// arrive.
-    pub body: Option<Pin<Box<dyn Stream<Item = anyhow::Result<bytes::Bytes>> + Sync + Send>>>,
-    pub signal: Pin<Box<dyn Future<Output = ()> + Sync + Send + 'static>>,
+    pub body: Option<Pin<Box<dyn Stream<Item = anyhow::Result<bytes::Bytes>> + Send>>>,
+    pub signal: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
 }
 
 impl std::fmt::Debug for HttpRequestStream {

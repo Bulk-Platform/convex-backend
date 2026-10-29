@@ -18,6 +18,7 @@ import { setupHeaders } from "udf-runtime/src/20_headers";
 import { setupFormData } from "udf-runtime/src/21_formdata";
 import { setupRequest } from "udf-runtime/src/23_request";
 import { setupResponse } from "udf-runtime/src/23_response";
+import { setupFetch } from "udf-runtime/src/26_fetch";
 import { setupPerformance } from "udf-runtime/src/27_performance";
 import { setupJsSyscall } from "udf-runtime/src/js_syscall";
 import { setupTextEncodingStreams } from "./text-encoding-streams";
@@ -38,13 +39,6 @@ setupHeaders(globalThis);
 setupFormData(globalThis);
 setupRequest(globalThis);
 setupResponse(globalThis);
+setupFetch(globalThis);
 setupPerformance(globalThis);
 setupJsSyscall(globalThis);
-
-// TODO: `fetch` in actions, which needs the host to carry the request and
-// response bodies' streams. Until then actions fail the way queries do.
-globalThis.fetch = async function fetch(_input: unknown) {
-  throw new TypeError(
-    "Can't use fetch() in queries and mutations. Please consider using an action. See https://docs.convex.dev/functions/actions for more details.",
-  );
-};

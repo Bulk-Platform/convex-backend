@@ -26,7 +26,7 @@ pub fn async_op_sleep<'b, P: V8OpProvider<'b>>(
     provider.start_async_op(request, resolver)
 }
 
-pub(super) fn sleep_request<P: OpProvider>(
+pub fn sleep_request<P: OpProvider>(
     provider: &mut P,
     name: String,
     mut millis: f64,
