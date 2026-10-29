@@ -20,10 +20,16 @@ pub(super) fn parse_url(url: &str) -> anyhow::Result<(Url, String)> {
 
 #[derive(Clone)]
 pub(super) struct Settings {
-    /// Shared by comparisons, backfill waits, shutdown, and startup's wait
-    /// for the previous writer to set clean_shutdown.
+    /// Shared by comparisons, backfill waits, and shutdown's wait for
+    /// in-flight source calls.
     pub(super) apply_wait: Duration,
-    /// Queue overflow retires the replica to bound memory use.
+    /// Shutdown's budget to drain the queue and write the clean-shutdown
+    /// certificate once source calls have finished. With `apply_wait` for
+    /// those calls, the total stays under Nomad's 15 s kill timeout.
+    pub(super) shutdown_wait: Duration,
+    /// Queue overflow retires the replica to bound memory use. A pending
+    /// writer applies nothing until its predecessor certifies, so the queue
+    /// must hold the busiest deployment's commits for that window.
     pub(super) max_queued_jobs: usize,
     /// Consecutive write jobs one V6 transaction may replay, bounding the work
     /// a transient failure retries and the locks a transaction holds.
@@ -71,7 +77,8 @@ pub(super) static MYSQL_V6_REPLICA_MAX_CONCURRENT_REPLICA_READS: LazyLock<usize>
 /// constants until operating the replica shows which of them need tuning.
 pub(super) static SETTINGS: LazyLock<Settings> = LazyLock::new(|| Settings {
     apply_wait: Duration::from_secs(2),
-    max_queued_jobs: 1024,
+    shutdown_wait: Duration::from_secs(10),
+    max_queued_jobs: 4096,
     max_merged_writes: 64,
     job_retry: Duration::from_secs(30),
     init_timeout: Duration::from_secs(10),

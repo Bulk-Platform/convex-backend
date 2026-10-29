@@ -517,7 +517,7 @@ impl<RT: Runtime> ReplicaWriter<RT> {
             );
             return;
         }
-        let result = tokio::time::timeout(self.settings.apply_wait, async {
+        let result = tokio::time::timeout(self.settings.shutdown_wait, async {
             anyhow::ensure!(
                 self.wait_for_prior_replay(None).await,
                 "replica queue closed"
