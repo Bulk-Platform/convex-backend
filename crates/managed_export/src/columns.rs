@@ -32,6 +32,7 @@ use iceberg::{
         schema_to_arrow_schema,
         UTC_TIME_ZONE,
     },
+    metadata_columns,
     spec::{
         NestedField,
         PrimitiveType,
@@ -58,7 +59,8 @@ use super::Change;
 
 pub(crate) const ID_COLUMN: &str = "_id";
 pub(crate) const TS_COLUMN: &str = "_ts";
-pub(crate) const DELETED_COLUMN: &str = "_deleted";
+// Iceberg reserves `_deleted`; see `RESERVED_COLUMNS`.
+pub(crate) const DELETED_COLUMN: &str = "_is_deleted";
 /// The document's `_creationTime`, as an Iceberg `timestamptz` so readers get
 /// a timestamp instead of epoch milliseconds in a `double`.
 pub(crate) const CREATION_TIME_COLUMN: &str = "_creationTime";
@@ -72,6 +74,21 @@ const METADATA_COLUMNS: [&str; 5] = [
 ];
 /// The largest magnitude an `int64` keeps exactly in a `double` column.
 const EXACT_IN_DOUBLE: u64 = 1 << 53;
+/// Names Iceberg readers resolve to their own metadata columns before the
+/// table's, so a document field with one of these names is rescued. Iceberg
+/// also reserves `file_path` and `pos`, but only inside delete files.
+const RESERVED_COLUMNS: [&str; 10] = [
+    metadata_columns::RESERVED_COL_NAME_FILE,
+    metadata_columns::RESERVED_COL_NAME_POS,
+    metadata_columns::RESERVED_COL_NAME_DELETED,
+    metadata_columns::RESERVED_COL_NAME_SPEC_ID,
+    metadata_columns::RESERVED_COL_NAME_PARTITION,
+    metadata_columns::RESERVED_COL_NAME_CHANGE_TYPE,
+    metadata_columns::RESERVED_COL_NAME_CHANGE_ORDINAL,
+    metadata_columns::RESERVED_COL_NAME_COMMIT_SNAPSHOT_ID,
+    metadata_columns::RESERVED_COL_NAME_ROW_ID,
+    metadata_columns::RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+];
 /// Doc of a string column that holds JSON: arrays, objects, and fields whose
 /// values have more than one kind. Every value fits such a column as its JSON
 /// encoding, while a plain string column takes strings only.
@@ -173,7 +190,10 @@ enum Target<'a> {
 /// identifiers, so those values are rescued. A `double` column takes an
 /// `int64` it can hold exactly.
 fn target<'a>(schema: &'a Schema, name: &str, value: &ConvexValue) -> Result<Target<'a>> {
-    if !is_valid_identifier(name) || METADATA_COLUMNS.contains(&name) {
+    if !is_valid_identifier(name)
+        || METADATA_COLUMNS.contains(&name)
+        || RESERVED_COLUMNS.contains(&name)
+    {
         return Ok(Target::Rescue);
     }
     Ok(match schema.field_by_name_case_insensitive(name) {

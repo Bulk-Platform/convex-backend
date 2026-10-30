@@ -214,6 +214,7 @@ async fn values_that_do_not_fit_are_rescued() -> Result<()> {
             "N" => 2.0,
             "Name" => "same",
             "name" => "case",
+            "_deleted" => true,
         )?),
     )];
     let table = add_columns(catalog.as_ref(), &table, &second).await?;
@@ -223,6 +224,8 @@ async fn values_that_do_not_fit_are_rescued() -> Result<()> {
     assert!(schema.field_by_name("name").is_none());
     assert!(schema.field_by_name("N").is_none());
     assert!(schema.field_by_name("has space").is_none());
+    // Iceberg readers would resolve `_deleted` to their own metadata column.
+    assert!(schema.field_by_name("_deleted").is_none());
 
     let batch = batch(schema, &second)?;
     let numbers: &Float64Array = array(&batch, "n");
@@ -231,7 +234,7 @@ async fn values_that_do_not_fit_are_rescued() -> Result<()> {
     assert_eq!(strings(&batch, "Name").value(0), "same");
     assert_eq!(
         strings(&batch, RESCUED_COLUMN).value(0),
-        r#"{"N":2.0,"has space":1.0,"n":"oops","name":"case","s":{"nested":1.0}}"#
+        r#"{"N":2.0,"_deleted":true,"has space":1.0,"n":"oops","name":"case","s":{"nested":1.0}}"#
     );
     Ok(())
 }

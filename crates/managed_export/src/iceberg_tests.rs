@@ -1,12 +1,17 @@
 use std::{
-    collections::HashMap,
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     sync::Arc,
 };
 
 use arrow_iceberg::{
     Array,
     BooleanArray,
+    Float64Array,
     Int64Array,
+    LargeBinaryArray,
     StringArray,
 };
 use futures::TryStreamExt;
@@ -15,6 +20,10 @@ use iceberg::{
         MemoryCatalogBuilder,
         MEMORY_CATALOG_WAREHOUSE,
     },
+    spec::{
+        PrimitiveType,
+        Type,
+    },
     CatalogBuilder,
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
@@ -22,7 +31,10 @@ use serde_json::{
     json,
     Value as JsonValue,
 };
-use value::ConvexValue;
+use value::{
+    ConvexValue,
+    FieldName,
+};
 
 use super::*;
 
@@ -66,18 +78,86 @@ pub(crate) async fn read(table: &Table) -> Result<Vec<Change>> {
         .await?
         .try_collect()
         .await?;
+    let schema = table.metadata().current_schema();
     let mut changes = vec![];
     for batch in batches {
-        let column = |i: usize| batch.column(i).as_any();
-        let ids = column(0).downcast_ref::<StringArray>().unwrap();
-        let ts = column(1).downcast_ref::<Int64Array>().unwrap();
-        let deleted = column(2).downcast_ref::<BooleanArray>().unwrap();
-        let payloads = column(3).downcast_ref::<StringArray>().unwrap();
+        let column = |name: &str| batch.column_by_name(name).unwrap().as_any();
+        let ids = column(columns::ID_COLUMN)
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let ts = column(columns::TS_COLUMN)
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let deleted = column(columns::DELETED_COLUMN)
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let rescued = column(columns::RESCUED_COLUMN)
+            .downcast_ref::<StringArray>()
+            .unwrap();
         for row in 0..batch.num_rows() {
-            assert_eq!(deleted.value(row), payloads.is_null(row));
-            let document = (!payloads.is_null(row))
-                .then(|| document(serde_json::from_str(payloads.value(row))?))
-                .transpose()?;
+            let document = if deleted.value(row) {
+                None
+            } else {
+                // Rebuild the document from its typed columns and `_rescued`,
+                // so a round trip compares whole documents.
+                let mut fields: BTreeMap<FieldName, ConvexValue> = BTreeMap::new();
+                if !rescued.is_null(row) {
+                    let ConvexValue::Object(misfits) = ConvexValue::from_clean_lossless(
+                        serde_json::from_str(rescued.value(row))?,
+                    )?
+                    else {
+                        anyhow::bail!("_rescued is not an object");
+                    };
+                    fields.extend(misfits);
+                }
+                let metadata = [
+                    columns::ID_COLUMN,
+                    columns::TS_COLUMN,
+                    columns::DELETED_COLUMN,
+                    columns::CREATION_TIME_COLUMN,
+                    columns::RESCUED_COLUMN,
+                ];
+                for field in schema.as_struct().fields() {
+                    let name = field.name.as_str();
+                    let array = batch.column_by_name(name).unwrap();
+                    if metadata.contains(&name) || array.is_null(row) {
+                        continue;
+                    }
+                    let value = match &*field.field_type {
+                        Type::Primitive(PrimitiveType::String)
+                            if field.doc.as_deref() == Some(columns::JSON_DOC) =>
+                        {
+                            let text = array.as_any().downcast_ref::<StringArray>().unwrap();
+                            ConvexValue::from_clean_lossless(serde_json::from_str(
+                                text.value(row),
+                            )?)?
+                        },
+                        Type::Primitive(PrimitiveType::String) => {
+                            let text = array.as_any().downcast_ref::<StringArray>().unwrap();
+                            ConvexValue::try_from(text.value(row).to_owned())?
+                        },
+                        Type::Primitive(PrimitiveType::Double) => {
+                            let doubles = array.as_any().downcast_ref::<Float64Array>().unwrap();
+                            ConvexValue::Float64(doubles.value(row))
+                        },
+                        Type::Primitive(PrimitiveType::Long) => {
+                            let longs = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                            ConvexValue::Int64(longs.value(row))
+                        },
+                        Type::Primitive(PrimitiveType::Boolean) => {
+                            let bools = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                            ConvexValue::Boolean(bools.value(row))
+                        },
+                        Type::Primitive(PrimitiveType::Binary) => {
+                            let bytes = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+                            ConvexValue::try_from(bytes.value(row).to_vec())?
+                        },
+                        other => anyhow::bail!("read() does not handle {other}"),
+                    };
+                    fields.insert(name.parse()?, value);
+                }
+                Some(ConvexObject::try_from(fields)?)
+            };
             changes.push(Change {
                 id: ids.value(row).to_owned(),
                 ts: ts.value(row).try_into()?,

@@ -46,12 +46,13 @@ use iceberg_storage_opendal::OpenDalStorageFactory;
 
 use super::{
     append,
-    change_log_schema,
+    columns::metadata_schema,
+    json,
     Change,
+    Format,
 };
 
-const ENCODING_PROPERTY: &str = "convex.porter.encoding";
-const ENCODING: &str = "convex-change-log-json-v1";
+const FORMAT_PROPERTY: &str = "convex.porter.encoding";
 const RETIRED_PROPERTY: &str = "convex.porter.retired";
 // Glue lowercases names, so these record the exact source table.
 const COMPONENT_PROPERTY: &str = "convex.porter.component";
@@ -81,6 +82,7 @@ pub struct SourceTable {
 
 pub struct IcebergChangeWriter {
     catalog: Arc<dyn Catalog>,
+    format: Format,
     namespace: NamespaceIdent,
     warehouse_uri: String,
     selected: Vec<SourceTable>,
@@ -112,6 +114,7 @@ impl IcebergChangeWriter {
         locations: &BTreeMap<String, String>,
         retired: &BTreeSet<String>,
         snapshot_properties: HashMap<String, String>,
+        format: Format,
     ) -> Result<Self> {
         ensure!(
             warehouse_uri.starts_with(&format!("s3://{}/", destination.bucket)),
@@ -142,7 +145,14 @@ impl IcebergChangeWriter {
             }))
             .load("porter", props)
             .await?;
-        let mut writer = Self::open(Arc::new(catalog), namespace, warehouse_uri, selected).await?;
+        let mut writer = Self::open(
+            Arc::new(catalog),
+            namespace,
+            warehouse_uri,
+            selected,
+            format,
+        )
+        .await?;
         writer.locations = locations.clone();
         writer.unregistered = locations.clone();
         writer.retired = Some(retired.clone());
@@ -190,6 +200,7 @@ impl IcebergChangeWriter {
         namespace: &str,
         warehouse_uri: &str,
         selected: Vec<SourceTable>,
+        format: Format,
     ) -> Result<Self> {
         ensure!(
             is_glue_name(namespace),
@@ -202,6 +213,7 @@ impl IcebergChangeWriter {
         }
         let writer = Self {
             catalog,
+            format,
             namespace,
             warehouse_uri: warehouse_uri.trim_end_matches('/').to_owned(),
             selected,
@@ -254,9 +266,14 @@ impl IcebergChangeWriter {
                     == Self::location(&self.warehouse_uri, source),
             "Iceberg table name or location does not match its source"
         );
+        let fields = metadata.current_schema().as_struct().fields();
+        let schema_matches = match self.format {
+            Format::Json => fields == json::change_log_schema()?.as_struct().fields(),
+            // Field columns follow the metadata columns and differ per table.
+            Format::Typed => fields.starts_with(metadata_schema()?.as_struct().fields()),
+        };
         ensure!(
-            metadata.current_schema().as_struct() == change_log_schema()?.as_struct()
-                && metadata.default_partition_spec().is_unpartitioned(),
+            schema_matches && metadata.default_partition_spec().is_unpartitioned(),
             "Iceberg table schema or partitioning mismatch"
         );
         Ok(())
@@ -297,7 +314,7 @@ impl IcebergChangeWriter {
             return Ok(None);
         }
         let table = self.catalog.load_table(ident).await?;
-        self.validate(&source_of(&table)?, &table)?;
+        self.validate(&source_of(&table, self.format)?, &table)?;
         Ok(Some(table))
     }
 
@@ -307,9 +324,12 @@ impl IcebergChangeWriter {
         let creation = TableCreation::builder()
             .name(name.clone())
             .location(Self::location(&self.warehouse_uri, source))
-            .schema(change_log_schema()?)
+            .schema(match self.format {
+                Format::Json => json::change_log_schema()?,
+                Format::Typed => metadata_schema()?,
+            })
             .properties(HashMap::from([
-                (ENCODING_PROPERTY.to_owned(), ENCODING.to_owned()),
+                (FORMAT_PROPERTY.to_owned(), self.format.to_string()),
                 (COMPONENT_PROPERTY.to_owned(), source.component.clone()),
                 (TABLE_PROPERTY.to_owned(), source.table.clone()),
             ]))
@@ -347,7 +367,7 @@ impl IcebergChangeWriter {
                 if let Some(retired) = &mut self.retired {
                     retired.remove(ident.name());
                 }
-                self.tables.remove(&source_of(&table)?);
+                self.tables.remove(&source_of(&table, self.format)?);
             }
             let table = self.create(source).await?;
             self.record(&table)?;
@@ -369,7 +389,7 @@ impl IcebergChangeWriter {
                     let ident = TableIdent::new(writer.namespace.clone(), name);
                     if let Some(table) = writer.load_existing(&ident).await? {
                         ensure!(
-                            source_of(&table)? == source,
+                            source_of(&table, writer.format)? == source,
                             "Glue table {} belongs to another source table",
                             ident.name()
                         );
@@ -383,6 +403,7 @@ impl IcebergChangeWriter {
                     &table,
                     &changes,
                     &writer.snapshot_properties,
+                    writer.format,
                 )
                 .await?;
                 Ok::<_, anyhow::Error>((source, table, bytes_written))
@@ -427,7 +448,7 @@ impl IcebergChangeWriter {
         for ident in self.catalog.list_tables(&self.namespace).await? {
             if let Some(table) = self.load_existing(&ident).await? {
                 self.record(&table)?;
-                self.tables.insert(source_of(&table)?, table);
+                self.tables.insert(source_of(&table, self.format)?, table);
             }
         }
         let retired = unselected(&self.locations);
@@ -456,12 +477,23 @@ impl IcebergChangeWriter {
     }
 }
 
-fn source_of(table: &Table) -> Result<SourceTable> {
+/// The Convex table behind `table`, which must be in `format`. An export
+/// never changes format, so a table in another format belongs to a retired
+/// export or to an older Porter mid-deploy; its rows may be the only copy, so
+/// the export stops rather than dropping it.
+fn source_of(table: &Table, format: Format) -> Result<SourceTable> {
     let property = |key| table.metadata().properties().get(key).cloned();
+    let encoding = property(FORMAT_PROPERTY).with_context(|| {
+        format!(
+            "Glue table {} was not written by a Convex export",
+            table.identifier()
+        )
+    })?;
+    // An unknown encoding is a format a newer Porter writes.
     ensure!(
-        property(ENCODING_PROPERTY).as_deref() == Some(ENCODING),
-        "Glue table {} was not written by a Convex export",
-        table.identifier()
+        encoding == format.to_string(),
+        "Glue table {} is in the {encoding} format, but this export writes {format}",
+        table.identifier(),
     );
     Ok(SourceTable {
         component: property(COMPONENT_PROPERTY).context("Missing component property")?,

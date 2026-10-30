@@ -50,6 +50,7 @@ async fn open_selecting(
         "convex_chess_wandering_fish_513",
         "memory://warehouse",
         selected,
+        Format::Typed,
     )
     .await
 }
@@ -536,7 +537,7 @@ async fn foreign_tables_are_checked_when_used_or_reconciled() -> Result<()> {
             &NamespaceIdent::new("convex_chess_wandering_fish_513".to_owned()),
             TableCreation::builder()
                 .name("app__menu".to_owned())
-                .schema(change_log_schema()?)
+                .schema(metadata_schema()?)
                 .build(),
         )
         .await?;
@@ -616,6 +617,49 @@ async fn a_known_retired_set_loads_only_the_tables_a_page_uses() -> Result<()> {
     assert_eq!(
         writer.tables[&source("orders")].metadata().properties()[RETIRED_PROPERTY],
         "true"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_export_in_the_json_format_keeps_its_payload_column() -> Result<()> {
+    let catalog = memory_catalog().await?;
+    let mut writer = IcebergChangeWriter::open(
+        catalog.clone(),
+        "convex_chess_wandering_fish_513",
+        "memory://warehouse",
+        vec![],
+        Format::Json,
+    )
+    .await?;
+    writer
+        .apply(
+            &[],
+            vec![(source("menu"), change("burger", 10, Some("10")))],
+        )
+        .await?;
+    let ident = TableIdent::new(
+        writer.namespace.clone(),
+        IcebergChangeWriter::table_name(&source("menu"))?,
+    );
+    let table = catalog.load_table(&ident).await?;
+    assert_eq!(
+        table.metadata().current_schema().as_struct(),
+        json::change_log_schema()?.as_struct()
+    );
+    assert_eq!(
+        table.metadata().properties()[FORMAT_PROPERTY],
+        "convex-change-log-json-v1"
+    );
+    // A typed writer stops at a JSON table instead of appending to it.
+    let mut typed = open(catalog).await?;
+    let error = typed
+        .apply(&[], vec![(source("menu"), change("soup", 11, None))])
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("convex-change-log-json-v1"),
+        "{error}"
     );
     Ok(())
 }
