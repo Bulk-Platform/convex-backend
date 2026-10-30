@@ -102,13 +102,14 @@ The upstream CLA confirmation and AWS-runner build jobs apply only to
 GitHub-hosted image release workflow, published binary smoke and isolated dev
 canary. Formatting CI selects Node from `.nvmrc` as well.
 
-Bulk's build toolchain and self-hosted Node action executor use Node.js 24.21.0,
-pinned in `.nvmrc`. The backend Dockerfile installs that exact NodeSource
-version and copies the binary into the final runtime image. The release smoke
-test checks the final image's Node version against `.nvmrc`, exercises crypto,
-and verifies the fetch API before reporting an immutable digest. Upstream's Node
-executor already accepts Node 24; this change does not upgrade the Rust/V8 query
-runtime or change application schema and function contracts.
+Bulk's build toolchain and self-hosted Node action executor use the Node.js 24
+version pinned in `.nvmrc` (currently 24.22.1, matching upstream since upstream
+moved its monorepo to Node 24). The backend Dockerfile installs that exact
+NodeSource version and copies the binary into the final runtime image. The
+release smoke test checks the final image's Node version against `.nvmrc`,
+exercises crypto, and verifies the fetch API before reporting an immutable
+digest. When syncing, keep `.nvmrc` on Node 24 or later; take upstream's patch
+version unless a Bulk canary has shown a regression.
 
 For an isolated dev-slot test before merging, run the GitHub Actions workflow
 from a `codex/upgrade-convex-*` branch:
