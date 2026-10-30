@@ -46,6 +46,10 @@ use value::{
     ConvexObject,
 };
 
+// The typed writer, which follows, is the caller.
+#[allow(dead_code)]
+#[path = "columns.rs"]
+mod columns;
 #[path = "iceberg_writer.rs"]
 mod writer;
 pub use writer::{
