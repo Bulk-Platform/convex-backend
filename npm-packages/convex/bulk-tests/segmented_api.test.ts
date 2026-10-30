@@ -106,8 +106,9 @@ type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B 
 type IsAny<T> = 0 extends 1 & T ? true : false;
 type Seg<T, K extends PropertyKey> = K extends keyof T ? T[K] : {};
 
-export type ApiKeys = Expect<Equal<Exclude<keyof typeof mono.api, keyof typeof api>, never>>;
-export type InternalKeys = Expect<Equal<Exclude<keyof typeof mono.internal, keyof typeof internal>, never>>;
+// Top-level entries without matching functions stay as \`{}\` (see BULK.md).
+export type ApiKeys = Expect<Equal<keyof typeof api, keyof typeof mono.api | "helpers" | "jobsInternal">>;
+export type InternalKeys = Expect<Equal<keyof typeof internal, keyof typeof mono.internal | "helpers" | "crons" | "ApiSegment">>;
 ${["auth", "production", "helpers", "jobsInternal", "crons", "ApiSegment"]
   .map(
     (k) =>

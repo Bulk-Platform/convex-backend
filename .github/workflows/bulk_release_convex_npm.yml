@@ -59,6 +59,8 @@ jobs:
       - name: Type check
         run: pnpm run typecheck
 
+      # The scale tests type-check with typescript@7.0.2 through npx, as Bulk
+      # does; the package's own TypeScript 5.0 does not show the cliff.
       - name: Test Bulk patches
         run: pnpm exec vitest run bulk-tests
 
@@ -75,4 +77,6 @@ jobs:
       - name: Publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm publish "./bulk-platform-convex-${VERSION}.tgz"
+        # npm 11 refuses prerelease versions without an explicit dist-tag.
+        # Every release of this package is `<upstream>-bulk.<n>`.
+        run: npm publish --tag latest "./bulk-platform-convex-${VERSION}.tgz"
