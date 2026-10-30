@@ -9,6 +9,11 @@ use arrow_iceberg::{
     StringArray,
     TimestampMicrosecondArray,
 };
+use common::shapes::reduced::{
+    ReducedField,
+    ReducedFloatRange,
+    ReducedShape,
+};
 use iceberg::{
     spec::NestedFieldRef,
     NamespaceIdent,
@@ -17,6 +22,7 @@ use iceberg::{
 use value::{
     obj,
     ConvexObject,
+    TableNumber,
 };
 
 use super::{
@@ -236,5 +242,111 @@ async fn values_that_do_not_fit_are_rescued() -> Result<()> {
         strings(&batch, RESCUED_COLUMN).value(0),
         r#"{"N":2.0,"_deleted":true,"has space":1.0,"n":"oops","name":"case","s":{"nested":1.0}}"#
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn seeds_follow_the_table_shape() -> Result<()> {
+    let catalog = memory_catalog().await?;
+    let table = table(catalog.as_ref()).await?;
+    let field = |shape| ReducedField {
+        optional: false,
+        shape,
+    };
+    let float = ReducedShape::Float64(ReducedFloatRange {
+        has_special_values: false,
+    });
+    let users = TableNumber::try_from(7u32)?;
+    let object = ReducedShape::Object(BTreeMap::from([
+        ("_id".parse()?, field(ReducedShape::Id(users))),
+        ("_creationTime".parse()?, field(float.clone())),
+        ("name".parse()?, field(ReducedShape::String)),
+        (
+            "price".parse()?,
+            field(ReducedShape::Union(BTreeSet::from([
+                ReducedShape::Int64,
+                float.clone(),
+            ]))),
+        ),
+        ("count".parse()?, field(ReducedShape::Int64)),
+        ("ok".parse()?, field(ReducedShape::Boolean)),
+        ("blob".parse()?, field(ReducedShape::Bytes)),
+        (
+            "tags".parse()?,
+            field(ReducedShape::Array(Box::new(ReducedShape::String))),
+        ),
+        (
+            "owner".parse()?,
+            field(ReducedShape::Union(BTreeSet::from([
+                ReducedShape::Id(users),
+                ReducedShape::Null,
+            ]))),
+        ),
+        (
+            "note".parse()?,
+            field(ReducedShape::Union(BTreeSet::from([
+                ReducedShape::String,
+                ReducedShape::Null,
+            ]))),
+        ),
+        (
+            "mixed".parse()?,
+            field(ReducedShape::Union(BTreeSet::from([
+                ReducedShape::String,
+                ReducedShape::Int64,
+            ]))),
+        ),
+        ("nothing".parse()?, field(ReducedShape::Null)),
+        ("later".parse()?, field(ReducedShape::Unknown)),
+        ("_deleted".parse()?, field(ReducedShape::Boolean)),
+    ]));
+    // One document with too many fields makes the table a union of an object
+    // and a record; the object still seeds.
+    let shape = ReducedShape::Union(BTreeSet::from([
+        object,
+        ReducedShape::Record {
+            key_shape: Box::new(ReducedShape::String),
+            value_shape: Box::new(field(ReducedShape::Unknown)),
+        },
+    ]));
+    let table_name = |n: TableNumber| (n == users).then(|| "users".parse().unwrap());
+    let columns = seeds(&shape, table_name)?;
+    assert_eq!(columns.len(), 9);
+    let table = commit_columns(catalog.as_ref(), &table, columns).await?;
+    let schema = table.metadata().current_schema();
+    let string = Type::Primitive(PrimitiveType::String);
+    assert_eq!(column(schema, "name"), (&string, None));
+    assert_eq!(
+        column(schema, "price"),
+        (&Type::Primitive(PrimitiveType::Double), None)
+    );
+    assert_eq!(
+        column(schema, "count"),
+        (&Type::Primitive(PrimitiveType::Long), None)
+    );
+    assert_eq!(
+        column(schema, "ok"),
+        (&Type::Primitive(PrimitiveType::Boolean), None)
+    );
+    assert_eq!(
+        column(schema, "blob"),
+        (&Type::Primitive(PrimitiveType::Binary), None)
+    );
+    assert_eq!(column(schema, "tags"), (&string, Some(JSON_DOC)));
+    assert_eq!(column(schema, "owner"), (&string, Some("convex:id:users")));
+    assert_eq!(column(schema, "note"), (&string, None));
+    assert_eq!(column(schema, "mixed"), (&string, Some(JSON_DOC)));
+    // Metadata and reserved names, null-only and unknown fields seed nothing.
+    for absent in ["_deleted", "nothing", "later"] {
+        assert!(
+            schema.field_by_name(absent).is_none(),
+            "{absent} should not seed"
+        );
+    }
+    assert_eq!(
+        schema.as_struct().fields().len(),
+        METADATA_COLUMNS.len() + 9
+    );
+    assert!(seeds(&ReducedShape::Unknown, |_| None)?.is_empty());
     Ok(())
 }

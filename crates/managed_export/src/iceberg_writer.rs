@@ -46,7 +46,11 @@ use iceberg_storage_opendal::OpenDalStorageFactory;
 
 use super::{
     append,
-    columns::metadata_schema,
+    columns::{
+        self,
+        metadata_schema,
+        AddColumn,
+    },
     json,
     Change,
     Format,
@@ -158,6 +162,10 @@ impl IcebergChangeWriter {
         writer.retired = Some(retired.clone());
         writer.snapshot_properties = snapshot_properties;
         Ok(writer)
+    }
+
+    pub fn format(&self) -> Format {
+        self.format
     }
 
     /// Metadata location of every table after this page, by Glue name.
@@ -318,8 +326,26 @@ impl IcebergChangeWriter {
         Ok(Some(table))
     }
 
+    /// The tables a page creates: those without a location yet, and the
+    /// truncated ones [`Self::apply`] drops and recreates. Their seed columns
+    /// come from the caller, which knows the tables' shapes.
+    pub fn new_tables(
+        &self,
+        truncated: &[SourceTable],
+        changes: &[(SourceTable, Change)],
+    ) -> Result<BTreeSet<SourceTable>> {
+        let mut new: BTreeSet<SourceTable> = truncated.iter().cloned().collect();
+        for (source, _) in changes {
+            if !self.locations.contains_key(&Self::table_name(source)?) {
+                new.insert(source.clone());
+            }
+        }
+        Ok(new)
+    }
+
+    /// Creates `source`'s table with the metadata columns and `seeds`.
     #[fastrace::trace]
-    async fn create(&self, source: &SourceTable) -> Result<Table> {
+    async fn create(&self, source: &SourceTable, seeds: Vec<AddColumn>) -> Result<Table> {
         let name = Self::table_name(source)?;
         let creation = TableCreation::builder()
             .name(name.clone())
@@ -334,17 +360,28 @@ impl IcebergChangeWriter {
                 (TABLE_PROPERTY.to_owned(), source.table.clone()),
             ]))
             .build();
-        Ok(self.catalog.create_table(&self.namespace, creation).await?)
+        let table = self.catalog.create_table(&self.namespace, creation).await?;
+        Ok(match self.format {
+            Format::Json => {
+                ensure!(seeds.is_empty(), "The JSON format takes no seed columns");
+                table
+            },
+            Format::Typed => columns::commit_columns(&*self.catalog, &table, seeds).await?,
+        })
     }
 
     /// Requires one writer per namespace at a time. An `iceberg` commit rebases
     /// onto the table it reloads by name, so an append that overlaps another
     /// writer's drop and recreate would land in the new table.
+    ///
+    /// `seeds` holds the columns each table in [`Self::new_tables`] starts
+    /// with; a table without an entry starts with the metadata columns only.
     #[fastrace::trace]
     pub async fn apply(
         &mut self,
         truncated: &[SourceTable],
         changes: Vec<(SourceTable, Change)>,
+        mut seeds: BTreeMap<SourceTable, Vec<AddColumn>>,
     ) -> Result<()> {
         Self::check_names(
             &self.warehouse_uri,
@@ -369,7 +406,9 @@ impl IcebergChangeWriter {
                 }
                 self.tables.remove(&source_of(&table, self.format)?);
             }
-            let table = self.create(source).await?;
+            let table = self
+                .create(source, seeds.remove(source).unwrap_or_default())
+                .await?;
             self.record(&table)?;
             self.tables.insert(source.clone(), table);
         }
@@ -380,8 +419,15 @@ impl IcebergChangeWriter {
         // Unique names give each task exclusive ownership of its catalog table.
         // Collect every result before advancing the page's metadata locations.
         let writer = &*self;
+        let by_table: Vec<_> = by_table
+            .into_iter()
+            .map(|(source, changes)| {
+                let seeds = seeds.remove(&source).unwrap_or_default();
+                (source, changes, seeds)
+            })
+            .collect();
         let written: Vec<_> = stream::iter(by_table)
-            .map(|(source, changes)| async move {
+            .map(|(source, changes, seeds)| async move {
                 let table = if let Some(table) = writer.tables.get(&source) {
                     table.clone()
                 } else {
@@ -395,7 +441,7 @@ impl IcebergChangeWriter {
                         );
                         table
                     } else {
-                        writer.create(&source).await?
+                        writer.create(&source, seeds).await?
                     }
                 };
                 let (table, bytes_written) = append(

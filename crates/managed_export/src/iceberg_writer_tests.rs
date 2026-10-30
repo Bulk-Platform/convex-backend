@@ -1,5 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     sync::atomic::{
         AtomicUsize,
         Ordering,
@@ -8,6 +11,10 @@ use std::{
 };
 
 use async_trait::async_trait;
+use common::shapes::reduced::{
+    ReducedField,
+    ReducedShape,
+};
 use iceberg::{
     Namespace,
     TableCommit,
@@ -194,7 +201,10 @@ async fn table_appends_overlap_with_bounded_concurrency() -> Result<()> {
     let sources: Vec<_> = (0..2 * concurrency + 3)
         .map(|i| source(&format!("table_{i:02}")))
         .collect();
-    open(catalog.clone()).await?.apply(&sources, vec![]).await?;
+    open(catalog.clone())
+        .await?
+        .apply(&sources, vec![], BTreeMap::new())
+        .await?;
     let blocking = Arc::new(BlockingCatalog::new(catalog.clone(), None));
     let mut writer = open(blocking.clone()).await?;
     writer.snapshot_properties = HashMap::from([("convex.page".to_owned(), "7".to_owned())]);
@@ -208,7 +218,7 @@ async fn table_appends_overlap_with_bounded_concurrency() -> Result<()> {
         })
         .collect();
     let task = tokio::spawn(async move {
-        writer.apply(&[], entries).await?;
+        writer.apply(&[], entries, BTreeMap::new()).await?;
         Ok::<_, anyhow::Error>(writer)
     });
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -274,7 +284,7 @@ async fn a_failed_table_cancels_pending_appends_and_preserves_locations() -> Res
         .map(|i| source(&format!("table_{i:02}")))
         .collect();
     let mut initial = open(catalog.clone()).await?;
-    initial.apply(&sources, vec![]).await?;
+    initial.apply(&sources, vec![], BTreeMap::new()).await?;
     let blocking = Arc::new(BlockingCatalog::new(
         catalog.clone(),
         Some(IcebergChangeWriter::table_name(sources.last().unwrap())?),
@@ -288,6 +298,7 @@ async fn a_failed_table_cancels_pending_appends_and_preserves_locations() -> Res
                 .iter()
                 .map(|source| (source.clone(), change("document", 1, Some("{}"))))
                 .collect(),
+            BTreeMap::new(),
         )
         .await
         .expect_err("one failed table must fail the page");
@@ -322,10 +333,15 @@ async fn truncates_recreate_tables_and_changes_append() -> Result<()> {
         .apply(
             &[source("menu"), source("empty")],
             vec![(source("menu"), change("burger", 10, Some("10")))],
+            BTreeMap::new(),
         )
         .await?;
     writer
-        .apply(&[], vec![(source("menu"), change("burger", 12, None))])
+        .apply(
+            &[],
+            vec![(source("menu"), change("burger", 12, None))],
+            BTreeMap::new(),
+        )
         .await?;
     assert_eq!(
         changes(&writer, "menu").await?,
@@ -340,6 +356,7 @@ async fn truncates_recreate_tables_and_changes_append() -> Result<()> {
         .apply(
             &[source("menu")],
             vec![(source("menu"), change("soup", 5, Some("6")))],
+            BTreeMap::new(),
         )
         .await?;
     assert_eq!(
@@ -352,6 +369,7 @@ async fn truncates_recreate_tables_and_changes_append() -> Result<()> {
         .apply(
             &[],
             vec![(source("menu"), change("burger", 20, Some("12")))],
+            BTreeMap::new(),
         )
         .await?;
     assert_eq!(
@@ -373,6 +391,7 @@ async fn locations_track_every_commit_and_summaries_name_the_page() -> Result<()
         .apply(
             &[source("menu"), source("empty")],
             vec![(source("menu"), change("burger", 10, Some("10")))],
+            BTreeMap::new(),
         )
         .await?;
     for name in ["app__menu", "app__empty"] {
@@ -391,7 +410,9 @@ async fn locations_track_every_commit_and_summaries_name_the_page() -> Result<()
     let after_one_row = writer.bytes_written();
     assert!(after_one_row > 0, "one Parquet file was written");
 
-    writer.apply(&[source("menu")], vec![]).await?;
+    writer
+        .apply(&[source("menu")], vec![], BTreeMap::new())
+        .await?;
     assert_eq!(
         writer.bytes_written(),
         after_one_row,
@@ -415,7 +436,11 @@ async fn names_follow_components_and_keep_case_in_directories() -> Result<()> {
     let mut writer = open(memory_catalog().await?).await?;
     let node = component_source("aggregate/inner", "btreeNode");
     writer
-        .apply(&[source("authRefreshTokens"), node.clone()], vec![])
+        .apply(
+            &[source("authRefreshTokens"), node.clone()],
+            vec![],
+            BTreeMap::new(),
+        )
         .await?;
     assert_eq!(writer.tables.len(), 2);
     for (source, name, location) in [
@@ -441,12 +466,14 @@ async fn names_follow_components_and_keep_case_in_directories() -> Result<()> {
 async fn colliding_sources_fail_before_any_write() -> Result<()> {
     let mut writer = open(memory_catalog().await?).await?;
     let error = writer
-        .apply(&[source("Users"), source("users")], vec![])
+        .apply(&[source("Users"), source("users")], vec![], BTreeMap::new())
         .await
         .expect_err("a colliding page must be rejected");
     assert!(error.to_string().contains("both map to"), "{error:#}");
     assert!(writer.tables.is_empty());
-    writer.apply(&[source("menu")], vec![]).await?;
+    writer
+        .apply(&[source("menu")], vec![], BTreeMap::new())
+        .await?;
     let error = open_selecting(
         writer.catalog.clone(),
         vec![source("Users"), source("users")],
@@ -473,6 +500,7 @@ async fn a_new_table_replaces_a_leftover_with_the_same_name() -> Result<()> {
         .apply(
             &[source("Users")],
             vec![(source("Users"), change("ada", 1, Some("{}")))],
+            BTreeMap::new(),
         )
         .await?;
     for replacement in [source("users"), component_source("app", "users")] {
@@ -481,6 +509,7 @@ async fn a_new_table_replaces_a_leftover_with_the_same_name() -> Result<()> {
             .apply(
                 &[],
                 vec![(replacement.clone(), change("grace", 2, Some("{}")))],
+                BTreeMap::new(),
             )
             .await
             .expect_err("a different source must truncate before reusing a Glue name");
@@ -492,6 +521,7 @@ async fn a_new_table_replaces_a_leftover_with_the_same_name() -> Result<()> {
             .apply(
                 std::slice::from_ref(&replacement),
                 vec![(replacement.clone(), change("grace", 2, Some("{}")))],
+                BTreeMap::new(),
             )
             .await?;
         assert_eq!(writer.tables.keys().collect::<Vec<_>>(), [&replacement]);
@@ -508,7 +538,7 @@ async fn retirement_follows_the_selection() -> Result<()> {
     let catalog = memory_catalog().await?;
     let mut writer = open(catalog).await?;
     writer
-        .apply(&[source("menu"), source("orders")], vec![])
+        .apply(&[source("menu"), source("orders")], vec![], BTreeMap::new())
         .await?;
     let retired = |writer: &IcebergChangeWriter, table: &str| {
         writer.tables[&source(table)]
@@ -546,17 +576,22 @@ async fn foreign_tables_are_checked_when_used_or_reconciled() -> Result<()> {
         .apply(
             &[],
             vec![(source("orders"), change("order", 1, Some("{}")))],
+            BTreeMap::new(),
         )
         .await?;
     assert_eq!(changes(&writer, "orders").await?.len(), 1);
 
     let error = writer
-        .apply(&[], vec![(source("menu"), change("burger", 1, Some("{}")))])
+        .apply(
+            &[],
+            vec![(source("menu"), change("burger", 1, Some("{}")))],
+            BTreeMap::new(),
+        )
         .await
         .expect_err("appending to a foreign table must fail");
     assert!(error.to_string().contains("not written by"), "{error:#}");
     let error = writer
-        .apply(&[source("menu")], vec![])
+        .apply(&[source("menu")], vec![], BTreeMap::new())
         .await
         .expect_err("truncating a foreign table must fail");
     assert!(error.to_string().contains("not written by"), "{error:#}");
@@ -573,7 +608,7 @@ async fn a_known_retired_set_loads_only_the_tables_a_page_uses() -> Result<()> {
     let catalog = memory_catalog().await?;
     let mut writer = open(catalog.clone()).await?;
     writer
-        .apply(&[source("menu"), source("orders")], vec![])
+        .apply(&[source("menu"), source("orders")], vec![], BTreeMap::new())
         .await?;
     writer
         .retire_unselected(&[source("menu"), source("orders")])
@@ -601,7 +636,11 @@ async fn a_known_retired_set_loads_only_the_tables_a_page_uses() -> Result<()> {
     };
 
     writer
-        .apply(&[], vec![(source("menu"), change("burger", 1, Some("{}")))])
+        .apply(
+            &[],
+            vec![(source("menu"), change("burger", 1, Some("{}")))],
+            BTreeMap::new(),
+        )
         .await?;
     writer
         .retire_unselected(&[source("menu"), source("orders")])
@@ -636,6 +675,7 @@ async fn an_export_in_the_json_format_keeps_its_payload_column() -> Result<()> {
         .apply(
             &[],
             vec![(source("menu"), change("burger", 10, Some("10")))],
+            BTreeMap::new(),
         )
         .await?;
     let ident = TableIdent::new(
@@ -654,12 +694,71 @@ async fn an_export_in_the_json_format_keeps_its_payload_column() -> Result<()> {
     // A typed writer stops at a JSON table instead of appending to it.
     let mut typed = open(catalog).await?;
     let error = typed
-        .apply(&[], vec![(source("menu"), change("soup", 11, None))])
+        .apply(
+            &[],
+            vec![(source("menu"), change("soup", 11, None))],
+            BTreeMap::new(),
+        )
         .await
         .unwrap_err();
     assert!(
         error.to_string().contains("convex-change-log-json-v1"),
         "{error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_new_table_starts_with_its_seeds() -> Result<()> {
+    let catalog = memory_catalog().await?;
+    let mut writer = open(catalog.clone()).await?;
+    let page = vec![(source("menu"), change("burger", 10, Some("10")))];
+    assert_eq!(
+        writer.new_tables(&[source("empty")], &page)?,
+        BTreeSet::from([source("empty"), source("menu")])
+    );
+    let shape = ReducedShape::Object(BTreeMap::from([(
+        "v".parse()?,
+        ReducedField {
+            optional: false,
+            shape: ReducedShape::Union(BTreeSet::from([ReducedShape::Int64, ReducedShape::String])),
+        },
+    )]));
+    let seeds = BTreeMap::from([
+        (source("menu"), columns::seeds(&shape, |_| None)?),
+        (source("empty"), columns::seeds(&shape, |_| None)?),
+    ]);
+    writer.apply(&[source("empty")], page, seeds).await?;
+    // A truncated table is recreated with its seeds too.
+    let empty = TableIdent::new(
+        writer.namespace.clone(),
+        IcebergChangeWriter::table_name(&source("empty"))?,
+    );
+    let empty = catalog.load_table(&empty).await?;
+    assert!(empty
+        .metadata()
+        .current_schema()
+        .field_by_name("v")
+        .is_some());
+    // The seed typed `v` as JSON before the page's int64 could make it a long.
+    let ident = TableIdent::new(
+        writer.namespace.clone(),
+        IcebergChangeWriter::table_name(&source("menu"))?,
+    );
+    let table = catalog.load_table(&ident).await?;
+    let v = table
+        .metadata()
+        .current_schema()
+        .field_by_name("v")
+        .context("seeded column")?;
+    assert_eq!(v.doc.as_deref(), Some(columns::JSON_DOC));
+    assert_eq!(changes(&writer, "menu").await?.len(), 1);
+    // Known tables are not new again; truncated ones are.
+    let next = vec![(source("menu"), change("soup", 11, Some("\"x\"")))];
+    assert!(writer.new_tables(&[], &next)?.is_empty());
+    assert_eq!(
+        writer.new_tables(&[source("menu")], &[])?,
+        BTreeSet::from([source("menu")])
     );
     Ok(())
 }

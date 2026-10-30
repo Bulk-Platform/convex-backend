@@ -36,7 +36,7 @@ use strum::{
 use value::ConvexObject;
 
 #[path = "columns.rs"]
-pub(crate) mod columns;
+pub mod columns;
 #[path = "json.rs"]
 mod json;
 #[path = "iceberg_writer.rs"]

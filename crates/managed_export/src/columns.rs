@@ -1,6 +1,8 @@
 //! Typed columns: one Iceberg column per top-level document field, after the
-//! metadata columns every table has. A value that does not fit its column
-//! goes to `_rescued`, so the shape of the data never fails a page.
+//! metadata columns every table has. A new table's columns come from its
+//! shape ([`seeds`]); later fields come from the pages that carry them
+//! ([`new_columns`]). A value that does not fit its column goes to
+//! `_rescued`, so the shape of the data never fails a page.
 
 use std::{
     collections::{
@@ -27,6 +29,8 @@ use arrow_iceberg::{
     ArrayRef,
     RecordBatch,
 };
+use common::shapes::reduced::ReducedShape;
+pub use iceberg::transaction::AddColumn;
 use iceberg::{
     arrow::{
         schema_to_arrow_schema,
@@ -41,7 +45,6 @@ use iceberg::{
     },
     table::Table,
     transaction::{
-        AddColumn,
         ApplyTransactionAction,
         Transaction,
     },
@@ -52,6 +55,8 @@ use value::{
     export::ValueFormat,
     identifier::is_valid_identifier,
     ConvexValue,
+    TableName,
+    TableNumber,
     MAX_OBJECT_FIELDS,
 };
 
@@ -93,6 +98,9 @@ const RESERVED_COLUMNS: [&str; 10] = [
 /// values have more than one kind. Every value fits such a column as its JSON
 /// encoding, while a plain string column takes strings only.
 pub(crate) const JSON_DOC: &str = "convex:json";
+/// Doc prefix of a string column that holds Ids of one table, which the shape
+/// knows and a page's values do not. `convex:id:users` points at `users`.
+pub(crate) const ID_DOC_PREFIX: &str = "convex:id:";
 /// The lossless, readable encoding that the data sync API and snapshot
 /// exports use: int64 is a JSON number, bytes are `{"$bytes": ...}`.
 const JSON_FORMAT: ValueFormat = ValueFormat::ConvexExportJSON;
@@ -159,7 +167,7 @@ impl Kind {
         })
     }
 
-    fn column(self, name: &str) -> AddColumn {
+    fn column(self, name: &str, doc: Option<&str>) -> AddColumn {
         let primitive = match self {
             Self::String | Self::Json => PrimitiveType::String,
             Self::Double => PrimitiveType::Double,
@@ -170,10 +178,33 @@ impl Kind {
         let column = AddColumn::builder()
             .name(name)
             .field_type(Type::Primitive(primitive));
-        match self {
-            Self::Json => column.doc(JSON_DOC).build(),
-            _ => column.build(),
+        match (self, doc) {
+            (Self::Json, _) => column.doc(JSON_DOC).build(),
+            (_, Some(doc)) => column.doc(doc).build(),
+            (_, None) => column.build(),
         }
+    }
+
+    /// The kinds a shape's values have. Nothing for null, never and unknown,
+    /// which decide no column.
+    fn of_shape(shape: &ReducedShape, kinds: &mut BTreeSet<Kind>) {
+        kinds.insert(match shape {
+            ReducedShape::Unknown | ReducedShape::Never | ReducedShape::Null => return,
+            ReducedShape::Union(members) => {
+                for member in members {
+                    Self::of_shape(member, kinds);
+                }
+                return;
+            },
+            ReducedShape::Id(_) | ReducedShape::String => Self::String,
+            ReducedShape::Int64 => Self::Long,
+            ReducedShape::Float64(_) => Self::Double,
+            ReducedShape::Boolean => Self::Boolean,
+            ReducedShape::Bytes => Self::Binary,
+            ReducedShape::Object(_) | ReducedShape::Array(_) | ReducedShape::Record { .. } => {
+                Self::Json
+            },
+        });
     }
 }
 
@@ -185,15 +216,21 @@ enum Target<'a> {
     Rescue,
 }
 
+/// Whether a document field may have its own column. Glue, Athena and
+/// BigQuery reject names that are not plain identifiers, and the metadata and
+/// Iceberg-reserved names are taken.
+fn accepts_name(name: &str) -> bool {
+    is_valid_identifier(name)
+        && !METADATA_COLUMNS.contains(&name)
+        && !RESERVED_COLUMNS.contains(&name)
+}
+
 /// Where a non-null `value` of field `name` lands. Glue, Athena and BigQuery
-/// treat column names as case-insensitive and reject names that are not plain
-/// identifiers, so those values are rescued. A `double` column takes an
-/// `int64` it can hold exactly.
+/// treat column names as case-insensitive, so a field that differs from a
+/// column only by case is rescued. A `double` column takes an `int64` it can
+/// hold exactly.
 fn target<'a>(schema: &'a Schema, name: &str, value: &ConvexValue) -> Result<Target<'a>> {
-    if !is_valid_identifier(name)
-        || METADATA_COLUMNS.contains(&name)
-        || RESERVED_COLUMNS.contains(&name)
-    {
+    if !accepts_name(name) {
         return Ok(Target::Rescue);
     }
     Ok(match schema.field_by_name_case_insensitive(name) {
@@ -211,14 +248,24 @@ fn target<'a>(schema: &'a Schema, name: &str, value: &ConvexValue) -> Result<Tar
 }
 
 /// Adds the columns `changes` need to `table` and returns the table that has
-/// them. Iceberg assigns the new field IDs at commit, and the Parquet writer
-/// matches columns by ID, so this commits before the page's data is written.
+/// them.
 pub(crate) async fn add_columns(
     catalog: &dyn Catalog,
     table: &Table,
     changes: &[Change],
 ) -> Result<Table> {
     let columns = new_columns(table.metadata().current_schema(), changes)?;
+    commit_columns(catalog, table, columns).await
+}
+
+/// Adds `columns` to `table` and returns the table that has them. Iceberg
+/// assigns the new field IDs at commit, and the Parquet writer matches
+/// columns by ID, so this commits before any data is written.
+pub(crate) async fn commit_columns(
+    catalog: &dyn Catalog,
+    table: &Table,
+    columns: Vec<AddColumn>,
+) -> Result<Table> {
     if columns.is_empty() {
         return Ok(table.clone());
     }
@@ -230,10 +277,8 @@ pub(crate) async fn add_columns(
     Ok(action.apply(tx)?.commit(catalog).await?)
 }
 
-/// The columns `schema` lacks for the fields in `changes`. A field whose
-/// values all have one kind gets that kind; one with both `int64` and
-/// `float64` gets a `double` column, as Fivetran does; one with any other mix
-/// gets a JSON column. Null values decide nothing.
+/// The columns `schema` lacks for the fields in `changes`. Null values decide
+/// nothing.
 pub(crate) fn new_columns(schema: &Schema, changes: &[Change]) -> Result<Vec<AddColumn>> {
     let mut kinds: BTreeMap<&str, BTreeSet<Kind>> = BTreeMap::new();
     for document in changes.iter().filter_map(|c| c.document.as_ref()) {
@@ -242,11 +287,82 @@ pub(crate) fn new_columns(schema: &Schema, changes: &[Change]) -> Result<Vec<Add
             let Some(kind) = Kind::of(value) else {
                 continue;
             };
-            if name != ID_COLUMN && matches!(target(schema, name, value)?, Target::New) {
+            if matches!(target(schema, name, value)?, Target::New) {
                 kinds.entry(name).or_default().insert(kind);
             }
         }
     }
+    Ok(choose(schema, kinds, &BTreeMap::new()))
+}
+
+/// The columns a new table starts with, from its shape. The shape is a sound
+/// supertype of every live document, so a column typed from it fits the whole
+/// backfill, where a column typed from the first page fits only that sample.
+/// `table_name` resolves the table an Id field points at, for its doc. Fields
+/// the shape does not resolve are left to [`new_columns`].
+pub fn seeds(
+    shape: &ReducedShape,
+    table_name: impl Fn(TableNumber) -> Option<TableName>,
+) -> Result<Vec<AddColumn>> {
+    let fields = match shape {
+        ReducedShape::Object(fields) => Some(fields),
+        // One document with too many fields or a key that is not an identifier
+        // makes the table a union of an object and a record. The object still
+        // describes every other document.
+        ReducedShape::Union(members) => members.iter().find_map(|member| match member {
+            ReducedShape::Object(fields) => Some(fields),
+            _ => None,
+        }),
+        _ => None,
+    };
+    let Some(fields) = fields else {
+        return Ok(vec![]);
+    };
+    let mut kinds: BTreeMap<&str, BTreeSet<Kind>> = BTreeMap::new();
+    let mut docs: BTreeMap<&str, String> = BTreeMap::new();
+    for (name, field) in fields {
+        let name: &str = name;
+        if !accepts_name(name) {
+            continue;
+        }
+        let mut field_kinds = BTreeSet::new();
+        Kind::of_shape(&field.shape, &mut field_kinds);
+        if field_kinds.is_empty() {
+            continue;
+        }
+        if let Some(table) = id_target(&field.shape).and_then(&table_name) {
+            docs.insert(name, format!("{ID_DOC_PREFIX}{table}"));
+        }
+        kinds.insert(name, field_kinds);
+    }
+    Ok(choose(&metadata_schema()?, kinds, &docs))
+}
+
+/// The table a shape's Ids point at, when every non-null value is such an Id.
+fn id_target(shape: &ReducedShape) -> Option<TableNumber> {
+    match shape {
+        ReducedShape::Id(table) => Some(*table),
+        ReducedShape::Union(members) => {
+            let mut values = members.iter().filter(|m| **m != ReducedShape::Null);
+            match (values.next(), values.next()) {
+                (Some(ReducedShape::Id(table)), None) => Some(*table),
+                _ => None,
+            }
+        },
+        _ => None,
+    }
+}
+
+/// One column per field in `kinds` that `schema` has room for. A field whose
+/// values all have one kind gets that kind; one with both `int64` and
+/// `float64` gets a `double` column, as Fivetran does; one with any other mix
+/// gets a JSON column. Seeded and page-inferred tables type a field the same
+/// way because both come through here.
+fn choose(
+    schema: &Schema,
+    kinds: BTreeMap<&str, BTreeSet<Kind>>,
+    docs: &BTreeMap<&str, String>,
+) -> Vec<AddColumn> {
     let fields = schema.as_struct().fields();
     // The cap counts field columns, after the metadata columns. A document has
     // at most `MAX_OBJECT_FIELDS` top-level fields, so a table whose documents
@@ -267,10 +383,10 @@ pub(crate) fn new_columns(schema: &Schema, changes: &[Change]) -> Result<Vec<Add
             _ if kinds == BTreeSet::from([Kind::Double, Kind::Long]) => Kind::Double,
             _ => Kind::Json,
         };
-        columns.push(kind.column(name));
+        columns.push(kind.column(name, docs.get(name).map(String::as_str)));
         room -= 1;
     }
-    Ok(columns)
+    columns
 }
 
 /// `changes` as one Arrow batch with `schema`'s columns. A tombstone fills
