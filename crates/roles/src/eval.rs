@@ -100,13 +100,15 @@ impl ResourceSegment {
             (ResourceSegment::Project(selectors), ConcreteSegment::Project(project)) => {
                 selectors.iter().any(|s| s.matches(project))
             },
-            (ResourceSegment::Project(selectors), ConcreteSegment::ProposedProject { slug }) => {
-                selectors.iter().any(|s| match s {
-                    ProjectSelector::Any => true,
-                    ProjectSelector::Id(_) | ProjectSelector::Tag(_) => false,
-                    ProjectSelector::Slug(s) => s == slug,
-                })
-            },
+            (
+                ResourceSegment::Project(selectors),
+                ConcreteSegment::ProposedProject { slug, tags },
+            ) => selectors.iter().any(|s| match s {
+                ProjectSelector::Any => true,
+                ProjectSelector::Id(_) => false,
+                ProjectSelector::Slug(s) => s == slug,
+                ProjectSelector::Tag(t) => tags.contains(t),
+            }),
             (ResourceSegment::Deployment(selectors), ConcreteSegment::Deployment(deployment)) => {
                 selectors.iter().any(|s| s.matches(deployment, actor))
             },

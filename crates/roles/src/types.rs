@@ -173,15 +173,22 @@ pub enum RolePolicyAction {
     UpdateTeam,
     DeleteTeam,
     // Projects
-    CreateProject(ProjectSlug),
+    /// Carries the tags the request will set on the new project, so `tag=`
+    /// selectors can scope project creation.
+    CreateProject {
+        slug: ProjectSlug,
+        tags: Vec<String>,
+    },
     TransferProject(ProjectId),
     /// Authorizes accepting a project transfer on the destination team.
     /// Carries the inbound project's slug — not its id — because the
     /// project still belongs to the source team when this check runs, so
     /// authorization targets a proposed-project slot on the destination
-    /// team (symmetric with [`Self::ReceiveDeployment`]).
+    /// team (symmetric with [`Self::ReceiveDeployment`]). `tags` are the
+    /// project's current tags, which move with it to the destination team.
     ReceiveProject {
         slug: ProjectSlug,
+        tags: Vec<String>,
     },
     UpdateProject(ProjectId),
     DeleteProject(ProjectId),
@@ -378,9 +385,12 @@ pub enum ActionResourcePath {
     ProjectDefaultEnvVar(ProjectId),
     /// `[Project(loaded by deployment.project_id), Deployment(loaded by id)]`.
     Deployment(DeploymentId),
-    /// `[ProposedProject { slug }]` — create-project authorization. No id
-    /// exists yet.
-    ProposedProject(ProjectSlug),
+    /// `[ProposedProject { slug, tags }]` — create-project authorization. No
+    /// id exists yet.
+    ProposedProject {
+        slug: ProjectSlug,
+        tags: Vec<String>,
+    },
     /// `[Project(loaded by id), ProposedDeployment { type, creator }]` —
     /// create-deployment / receive-deployment authorization.
     ProposedDeploymentInProject {
@@ -511,8 +521,11 @@ impl RolePolicyAction {
             // `Path::Project(id)` because the project still belongs to the
             // source team at perm-check time, so the cross-team load would
             // bail.
-            P::CreateProject(slug) | P::ReceiveProject { slug } => {
-                Path::ProposedProject(slug.clone())
+            P::CreateProject { slug, tags } | P::ReceiveProject { slug, tags } => {
+                Path::ProposedProject {
+                    slug: slug.clone(),
+                    tags: tags.clone(),
+                }
             },
             // Deployment create / receive — synthesize a proposed-deployment
             // segment under the (existing) parent project.
@@ -606,7 +619,7 @@ impl RolePolicyAction {
         Some(match self {
             P::UpdateTeam => S::UpdateTeam,
             P::DeleteTeam => S::DeleteTeam,
-            P::CreateProject(_) => S::CreateProject,
+            P::CreateProject { .. } => S::CreateProject,
             P::TransferProject(_) => S::TransferProject,
             P::ReceiveProject { .. } => S::ReceiveProject,
             P::UpdateProject(_) => S::UpdateProject,
@@ -1436,11 +1449,12 @@ pub enum ConcreteSegment {
     Team,
     Project(ConcreteProject),
     /// A project that does not yet exist (the create-project authorization
-    /// path). `ProjectSelector::Id` and `Tag` cannot match — there is no id
-    /// and no tags yet — but `Slug` and `Any` selectors evaluate against the
-    /// proposed slug.
+    /// path). `ProjectSelector::Id` cannot match — there is no id — but
+    /// `Slug`, `Tag`, and `Any` selectors evaluate against the proposed slug
+    /// and tags.
     ProposedProject {
         slug: ProjectSlug,
+        tags: Vec<String>,
     },
     Deployment(ConcreteDeployment),
     /// A deployment that does not yet exist (the create-deployment and
@@ -1510,7 +1524,12 @@ impl ConcreteSegment {
                 }
                 Some(attrs)
             },
-            ConcreteSegment::ProposedProject { slug } => Some(format!("slug={:?}", slug.as_str())),
+            ConcreteSegment::ProposedProject { slug, tags } if tags.is_empty() => {
+                Some(format!("slug={:?}", slug.as_str()))
+            },
+            ConcreteSegment::ProposedProject { slug, tags } => {
+                Some(format!("slug={:?}, tags={tags:?}", slug.as_str()))
+            },
             ConcreteSegment::Deployment(d) => {
                 let creator = match d.creator {
                     Some(m) => m.to_string(),
