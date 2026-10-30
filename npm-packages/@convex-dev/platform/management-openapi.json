@@ -253,6 +253,69 @@
         ]
       }
     },
+    "/teams/{team_id}/list_project_tags": {
+      "get": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "List project tags",
+        "description": "List a page of the distinct tags used by a team's projects, ordered by tag\nname. Pass the `nextCursor` from the previous response as `cursor` to fetch\nthe next page.",
+        "operationId": "list project tags",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TeamId"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Cursor for pagination",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of tags to return (default: 100, max: 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectTagsResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          }
+        ]
+      }
+    },
     "/projects/{project_id}/list_deployments": {
       "get": {
         "tags": [
@@ -4548,6 +4611,35 @@
       "ProjectSlug": {
         "type": "string"
       },
+      "ProjectTagResponse": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "ProjectTagsResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "pagination"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProjectTagResponse"
+            }
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/PaginationMetadata"
+          }
+        }
+      },
       "ProposedTeamName": {
         "type": "string"
       },
@@ -4650,6 +4742,7 @@
           "team:domain:create",
           "team:domain:delete",
           "team:domain:view",
+          "team:projectTags:view",
           "team:token:create",
           "team:token:update",
           "team:token:delete",

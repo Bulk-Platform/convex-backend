@@ -6582,6 +6582,7 @@
           "team:domain:create",
           "team:domain:delete",
           "team:domain:view",
+          "team:projectTags:view",
           "team:token:create",
           "team:token:update",
           "team:token:delete",

@@ -269,6 +269,9 @@ pub enum RolePolicyAction {
     CreateTeamDomain,
     DeleteTeamDomain,
     ViewTeamDomains,
+    /// Lists every tag on the team's projects, including tags carried only by
+    /// projects the member can't view.
+    ViewProjectTags,
     // Team Access Tokens
     CreateTeamAccessToken {
         creator: Option<MemberId>,
@@ -440,6 +443,7 @@ impl RolePolicyAction {
             | P::CreateTeamDomain
             | P::DeleteTeamDomain
             | P::ViewTeamDomains
+            | P::ViewProjectTags
             | P::ViewUsage => Path::Singleton(ResourceKind::Team),
             // Billing singletons.
             P::UpdatePaymentMethod
@@ -666,6 +670,7 @@ impl RolePolicyAction {
             P::CreateTeamDomain => S::CreateTeamDomain,
             P::DeleteTeamDomain => S::DeleteTeamDomain,
             P::ViewTeamDomains => S::ViewTeamDomains,
+            P::ViewProjectTags => S::ViewProjectTags,
             P::CreateTeamAccessToken { .. } => S::CreateTeamAccessToken,
             P::UpdateTeamAccessToken { .. } => S::UpdateTeamAccessToken,
             P::DeleteTeamAccessToken { .. } => S::DeleteTeamAccessToken,
@@ -867,6 +872,10 @@ pub enum RoleStatementAction {
     #[serde(rename = "team:domain:view")]
     #[strum(serialize = "team:domain:view")]
     ViewTeamDomains,
+    // Project Tags
+    #[serde(rename = "team:projectTags:view")]
+    #[strum(serialize = "team:projectTags:view")]
+    ViewProjectTags,
     // Team Access Tokens
     #[serde(rename = "team:token:create")]
     #[strum(serialize = "team:token:create")]
@@ -1073,6 +1082,7 @@ impl RoleStatementAction {
             | A::CreateTeamDomain
             | A::DeleteTeamDomain
             | A::ViewTeamDomains
+            | A::ViewProjectTags
             | A::ViewUsage => ResourceKind::Team,
             // Billing
             A::UpdatePaymentMethod
