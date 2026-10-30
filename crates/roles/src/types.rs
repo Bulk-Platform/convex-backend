@@ -23,6 +23,9 @@ pub(crate) enum ProjectSelector {
     Any,
     Id(ProjectId),
     Slug(ProjectSlug),
+    /// `tag=prod` — every project carrying this tag, compared exactly as
+    /// stored (the same comparison as the project list's tag filter).
+    Tag(String),
 }
 
 /// Selectors valid on deployment resources.
@@ -48,7 +51,7 @@ pub(crate) enum TokenSelector {
 /// matched as a string (the canonical slash-joined path; the root app component
 /// is `""`). A leading `/` on the written path is optional and ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum ComponentSelector {
+pub enum ComponentSelector {
     /// `*` — every component in the deployment.
     Any,
     /// `path=foo/bar` — exactly this component (`path=/` selects the root app
@@ -170,15 +173,22 @@ pub enum RolePolicyAction {
     UpdateTeam,
     DeleteTeam,
     // Projects
-    CreateProject(ProjectSlug),
+    /// Carries the tags the request will set on the new project, so `tag=`
+    /// selectors can scope project creation.
+    CreateProject {
+        slug: ProjectSlug,
+        tags: Vec<String>,
+    },
     TransferProject(ProjectId),
     /// Authorizes accepting a project transfer on the destination team.
     /// Carries the inbound project's slug — not its id — because the
     /// project still belongs to the source team when this check runs, so
     /// authorization targets a proposed-project slot on the destination
-    /// team (symmetric with [`Self::ReceiveDeployment`]).
+    /// team (symmetric with [`Self::ReceiveDeployment`]). `tags` are the
+    /// project's current tags, which move with it to the destination team.
     ReceiveProject {
         slug: ProjectSlug,
+        tags: Vec<String>,
     },
     UpdateProject(ProjectId),
     DeleteProject(ProjectId),
@@ -212,6 +222,11 @@ pub enum RolePolicyAction {
     UpdateDeploymentType(DeploymentId),
     DeleteDeployment(DeploymentId),
     ViewDeployments(DeploymentId),
+    WriteDeploymentEnvironmentVariables(DeploymentId),
+    UseAiGateway {
+        project_id: ProjectId,
+        owner: MemberId,
+    },
     /// Read access to deployment-scoped integration metadata (e.g. WorkOS
     /// environment association). Granted to any team member.
     ViewDeploymentIntegrations(DeploymentId),
@@ -248,6 +263,15 @@ pub enum RolePolicyAction {
     ViewInvoices,
     // Audit Log
     ViewTeamAuditLog,
+    // Team Domains — the domains the team has claimed in WorkOS, shared by SSO
+    // and directory sync. Creation happens in the WorkOS admin portal, so
+    // `CreateTeamDomain` gates the portal link rather than a write of ours.
+    CreateTeamDomain,
+    DeleteTeamDomain,
+    ViewTeamDomains,
+    /// Reads the tags on the team's projects, and lists every tag on them,
+    /// including tags carried only by projects the member can't view.
+    ViewProjectTags,
     // Team Access Tokens
     CreateTeamAccessToken {
         creator: Option<MemberId>,
@@ -364,15 +388,23 @@ pub enum ActionResourcePath {
     ProjectDefaultEnvVar(ProjectId),
     /// `[Project(loaded by deployment.project_id), Deployment(loaded by id)]`.
     Deployment(DeploymentId),
-    /// `[ProposedProject { slug }]` — create-project authorization. No id
-    /// exists yet.
-    ProposedProject(ProjectSlug),
+    /// `[ProposedProject { slug, tags }]` — create-project authorization. No
+    /// id exists yet.
+    ProposedProject {
+        slug: ProjectSlug,
+        tags: Vec<String>,
+    },
     /// `[Project(loaded by id), ProposedDeployment { type, creator }]` —
     /// create-deployment / receive-deployment authorization.
     ProposedDeploymentInProject {
         project_id: ProjectId,
         deployment_type: DeploymentType,
         creator: Option<MemberId>,
+    },
+    /// `[Project(loaded by id), LocalDeployment { owner }]`.
+    LocalDeploymentInProject {
+        project_id: ProjectId,
+        owner: MemberId,
     },
     /// `[Team, Token(ConcreteToken { creator })]`.
     TeamToken { creator: Option<MemberId> },
@@ -408,6 +440,10 @@ impl RolePolicyAction {
             | P::DeleteTeam
             | P::ApplyReferralCode
             | P::ViewTeamAuditLog
+            | P::CreateTeamDomain
+            | P::DeleteTeamDomain
+            | P::ViewTeamDomains
+            | P::ViewProjectTags
             | P::ViewUsage => Path::Singleton(ResourceKind::Team),
             // Billing singletons.
             P::UpdatePaymentMethod
@@ -467,6 +503,7 @@ impl RolePolicyAction {
             | P::UpdateDeploymentType(id)
             | P::DeleteDeployment(id)
             | P::ViewDeployments(id)
+            | P::WriteDeploymentEnvironmentVariables(id)
             | P::ViewDeploymentIntegrations(id)
             | P::WriteDeploymentIntegrations(id)
             | P::CreateCustomDomain(id)
@@ -479,13 +516,20 @@ impl RolePolicyAction {
             | P::DisablePeriodicBackups(id)
             | P::DeleteBackups(id)
             | P::ViewBackups(id) => Path::Deployment(*id),
+            P::UseAiGateway { project_id, owner } => Path::LocalDeploymentInProject {
+                project_id: *project_id,
+                owner: *owner,
+            },
             // Project create / receive — synthesize a proposed-project
             // segment on the destination team. Receive can't use
             // `Path::Project(id)` because the project still belongs to the
             // source team at perm-check time, so the cross-team load would
             // bail.
-            P::CreateProject(slug) | P::ReceiveProject { slug } => {
-                Path::ProposedProject(slug.clone())
+            P::CreateProject { slug, tags } | P::ReceiveProject { slug, tags } => {
+                Path::ProposedProject {
+                    slug: slug.clone(),
+                    tags: tags.clone(),
+                }
             },
             // Deployment create / receive — synthesize a proposed-deployment
             // segment under the (existing) parent project.
@@ -579,7 +623,7 @@ impl RolePolicyAction {
         Some(match self {
             P::UpdateTeam => S::UpdateTeam,
             P::DeleteTeam => S::DeleteTeam,
-            P::CreateProject(_) => S::CreateProject,
+            P::CreateProject { .. } => S::CreateProject,
             P::TransferProject(_) => S::TransferProject,
             P::ReceiveProject { .. } => S::ReceiveProject,
             P::UpdateProject(_) => S::UpdateProject,
@@ -604,6 +648,7 @@ impl RolePolicyAction {
             P::UpdateDeploymentType(_) => S::UpdateDeploymentType,
             P::DeleteDeployment(_) => S::DeleteDeployment,
             P::ViewDeployments(_) => S::ViewDeployments,
+            P::WriteDeploymentEnvironmentVariables(_) => S::WriteEnvironmentVariables,
             P::ViewDeploymentIntegrations(_) => S::ViewDeploymentIntegrations,
             P::WriteDeploymentIntegrations(_) => S::WriteDeploymentIntegrations,
             P::CreateCustomDomain(_) => S::CreateCustomDomain,
@@ -622,6 +667,10 @@ impl RolePolicyAction {
             P::ViewBillingDetails => S::ViewBillingDetails,
             P::ViewInvoices => S::ViewInvoices,
             P::ViewTeamAuditLog => S::ViewTeamAuditLog,
+            P::CreateTeamDomain => S::CreateTeamDomain,
+            P::DeleteTeamDomain => S::DeleteTeamDomain,
+            P::ViewTeamDomains => S::ViewTeamDomains,
+            P::ViewProjectTags => S::ViewProjectTags,
             P::CreateTeamAccessToken { .. } => S::CreateTeamAccessToken,
             P::UpdateTeamAccessToken { .. } => S::UpdateTeamAccessToken,
             P::DeleteTeamAccessToken { .. } => S::DeleteTeamAccessToken,
@@ -640,6 +689,7 @@ impl RolePolicyAction {
             P::ViewOAuthApplications => S::ViewOAuthApplications,
             P::GenerateOAuthClientSecret => S::GenerateOAuthClientSecret,
             P::ViewUsage => S::ViewUsage,
+            P::UseAiGateway { .. } => S::UseAiGateway,
             P::ViewInsights(_) => S::ViewInsights,
             P::CreateBackups(_) => S::CreateBackups,
             P::ImportBackups(_) => S::ImportBackups,
@@ -812,6 +862,20 @@ pub enum RoleStatementAction {
     #[serde(rename = "team:auditLog:view")]
     #[strum(serialize = "team:auditLog:view")]
     ViewTeamAuditLog,
+    // Team Domains
+    #[serde(rename = "team:domain:create")]
+    #[strum(serialize = "team:domain:create")]
+    CreateTeamDomain,
+    #[serde(rename = "team:domain:delete")]
+    #[strum(serialize = "team:domain:delete")]
+    DeleteTeamDomain,
+    #[serde(rename = "team:domain:view")]
+    #[strum(serialize = "team:domain:view")]
+    ViewTeamDomains,
+    // Project Tags
+    #[serde(rename = "team:projectTags:view")]
+    #[strum(serialize = "team:projectTags:view")]
+    ViewProjectTags,
     // Team Access Tokens
     #[serde(rename = "team:token:create")]
     #[strum(serialize = "team:token:create")]
@@ -1012,9 +1076,14 @@ impl RoleStatementAction {
         use RoleStatementAction as A;
         match self {
             // Team
-            A::UpdateTeam | A::DeleteTeam | A::ViewTeamAuditLog | A::ViewUsage => {
-                ResourceKind::Team
-            },
+            A::UpdateTeam
+            | A::DeleteTeam
+            | A::ViewTeamAuditLog
+            | A::CreateTeamDomain
+            | A::DeleteTeamDomain
+            | A::ViewTeamDomains
+            | A::ViewProjectTags
+            | A::ViewUsage => ResourceKind::Team,
             // Billing
             A::UpdatePaymentMethod
             | A::UpdateBillingContact
@@ -1146,6 +1215,18 @@ impl RoleStatementAction {
             _ => None,
         }
     }
+
+    pub fn is_component_scopable(&self) -> bool {
+        use RoleStatementAction as A;
+        matches!(
+            self,
+            A::ViewData
+                | A::WriteData
+                | A::RunInternalQueries
+                | A::RunInternalMutations
+                | A::RunInternalActions
+        )
+    }
 }
 
 /// A parsed resource specifier describing which resources a rule applies to.
@@ -1243,17 +1324,35 @@ pub struct RoleStatement {
     pub effect: RoleStatementEffect,
     #[schema(value_type = RoleStatementActions)]
     pub actions: ActionPattern,
-    /// Resource path like `project:*`, `project:slug=my-app`, or
-    /// `project:*:deployment:type=prod`.
+    /// Resource path like `project:*`, `project:slug=my-app`,
+    /// `project:tag=prod`, or `project:*:deployment:type=prod`.
     #[schema(value_type = String, example = "project:*")]
     pub resource: ResourceSpecifier,
 }
 
 impl RoleStatement {
+    pub(crate) fn leaf_kind(&self) -> Option<ResourceKind> {
+        self.resource.segments.last().map(|s| s.kind())
+    }
+
+    /// Whether this statement's action pattern applies to `action`, taking
+    /// into account that on a `component` leaf the wildcard spans only the
+    /// component-scopable actions.
+    pub(crate) fn covers_action(&self, action: RoleStatementAction) -> bool {
+        let pattern_match = match &self.actions {
+            ActionPattern::Wildcard => true,
+            ActionPattern::Specific(actions) => actions.contains(&action),
+        };
+        pattern_match
+            && (self.leaf_kind() != Some(ResourceKind::Component) || action.is_component_scopable())
+    }
+
     /// Validates that every action in this rule targets the same resource kind
     /// as the leaf segment of the resource specifier. For token actions, also
     /// requires the parent segment kind to match the action's token scope so
-    /// e.g. `team:*:token:*` rejects `createProjectAccessToken`.
+    /// e.g. `team:*:token:*` rejects `createProjectAccessToken`. A `component`
+    /// leaf is the one place an action may target a *parent* kind: it accepts
+    /// exactly the component-scopable deployment actions.
     pub fn validate(&self) -> anyhow::Result<()> {
         let leaf_kind = self
             .resource
@@ -1284,7 +1383,14 @@ impl RoleStatement {
                     anyhow::bail!("Duplicate action {action} in statement");
                 }
                 let action_kind = action.resource_kind();
-                if action_kind != leaf_kind {
+                if leaf_kind == ResourceKind::Component {
+                    if !action.is_component_scopable() {
+                        anyhow::bail!(
+                            "Action {action} cannot be scoped to a component; a statement \
+                             granting it must target a deployment"
+                        );
+                    }
+                } else if action_kind != leaf_kind {
                     anyhow::bail!(
                         "Action {action} targets {action_kind} resources, but statement resource \
                          specifier targets {leaf_kind}"
@@ -1318,6 +1424,7 @@ pub struct ConcreteProject {
     pub id: ProjectId,
     pub slug: ProjectSlug,
     pub name: ProjectName,
+    pub tags: Vec<String>,
 }
 
 /// Minimal representation of a deployment needed for custom role enforcement.
@@ -1326,6 +1433,11 @@ pub struct ConcreteDeployment {
     pub id: DeploymentId,
     pub deployment_type: DeploymentType,
     pub creator: Option<MemberId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcreteComponent {
+    pub path: String,
 }
 
 /// Minimal representation of an access token needed for custom role
@@ -1348,9 +1460,11 @@ pub enum ConcreteSegment {
     Project(ConcreteProject),
     /// A project that does not yet exist (the create-project authorization
     /// path). `ProjectSelector::Id` cannot match — there is no id — but
-    /// `Slug` and `Any` selectors evaluate against the proposed slug.
+    /// `Slug`, `Tag`, and `Any` selectors evaluate against the proposed slug
+    /// and tags.
     ProposedProject {
         slug: ProjectSlug,
+        tags: Vec<String>,
     },
     Deployment(ConcreteDeployment),
     /// A deployment that does not yet exist (the create-deployment and
@@ -1361,6 +1475,12 @@ pub enum ConcreteSegment {
         deployment_type: DeploymentType,
         creator: Option<MemberId>,
     },
+    /// An existing local deployment. For role matching it behaves as a Dev
+    /// deployment, has no cloud deployment id, and is created by `owner`.
+    LocalDeployment {
+        owner: MemberId,
+    },
+    Component(ConcreteComponent),
     Member,
     Token(ConcreteToken),
     CustomRole,
@@ -1379,9 +1499,10 @@ impl ConcreteSegment {
             ConcreteSegment::Project(_) | ConcreteSegment::ProposedProject { .. } => {
                 ResourceKind::Project
             },
-            ConcreteSegment::Deployment(_) | ConcreteSegment::ProposedDeployment { .. } => {
-                ResourceKind::Deployment
-            },
+            ConcreteSegment::Deployment(_)
+            | ConcreteSegment::ProposedDeployment { .. }
+            | ConcreteSegment::LocalDeployment { .. } => ResourceKind::Deployment,
+            ConcreteSegment::Component(_) => ResourceKind::Component,
             ConcreteSegment::Member => ResourceKind::Member,
             ConcreteSegment::Token(_) => ResourceKind::Token,
             ConcreteSegment::CustomRole => ResourceKind::CustomRole,
@@ -1399,13 +1520,26 @@ impl ConcreteSegment {
     /// attribute-less singletons (Team, Member, Billing, etc.).
     fn describe_attributes(&self) -> Option<String> {
         match self {
-            ConcreteSegment::Project(p) => Some(format!(
-                "id={}, name={:?}, slug={:?}",
-                p.id,
-                p.name.as_str(),
-                p.slug.as_str(),
-            )),
-            ConcreteSegment::ProposedProject { slug } => Some(format!("slug={:?}", slug.as_str())),
+            ConcreteSegment::Project(p) => {
+                let mut attrs = format!(
+                    "id={}, name={:?}, slug={:?}",
+                    p.id,
+                    p.name.as_str(),
+                    p.slug.as_str(),
+                );
+                // Tags are only loaded for roles that select on them, so an
+                // empty list doesn't mean the project is untagged.
+                if !p.tags.is_empty() {
+                    attrs.push_str(&format!(", tags={:?}", p.tags));
+                }
+                Some(attrs)
+            },
+            ConcreteSegment::ProposedProject { slug, tags } if tags.is_empty() => {
+                Some(format!("slug={:?}", slug.as_str()))
+            },
+            ConcreteSegment::ProposedProject { slug, tags } => {
+                Some(format!("slug={:?}, tags={tags:?}", slug.as_str()))
+            },
             ConcreteSegment::Deployment(d) => {
                 let creator = match d.creator {
                     Some(m) => m.to_string(),
@@ -1426,6 +1560,13 @@ impl ConcreteSegment {
                 };
                 Some(format!("type={deployment_type}, creator={creator}"))
             },
+            ConcreteSegment::LocalDeployment { owner } => {
+                Some(format!("type=dev, creator={owner}"))
+            },
+            // Render the root app component as `/`, matching how it is
+            // written in a selector (`path=/`).
+            ConcreteSegment::Component(c) if c.path.is_empty() => Some("path=/".to_string()),
+            ConcreteSegment::Component(c) => Some(format!("path={}", c.path)),
             ConcreteSegment::Token(t) => {
                 let creator = match t.creator {
                     Some(m) => m.to_string(),

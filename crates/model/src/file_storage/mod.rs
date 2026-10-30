@@ -23,8 +23,8 @@ use common::{
     },
     runtime::Runtime,
     types::{
-        IndexId,
         IndexName,
+        IndexRef,
         StorageUuid,
     },
     virtual_system_mapping::AssociatedVirtualTable,
@@ -296,7 +296,7 @@ impl<'a, RT: Runtime> FileStorageModel<'a, RT> {
         &mut self,
         storage_id: FileStorageId,
         identity: Identity,
-    ) -> anyhow::Result<Option<FileStorageEntry>> {
+    ) -> anyhow::Result<Option<ParsedDocument<FileStorageEntry>>> {
         // We only expect this function to be called by the framework as part
         // of a storage syscall. We require passing in a system identity to confirm
         // that the caller isn't letting a user call this directly
@@ -306,11 +306,10 @@ impl<'a, RT: Runtime> FileStorageModel<'a, RT> {
         let Some(entry) = self.get_file(storage_id).await? else {
             return Ok(None);
         };
-        let document_id = entry.id();
         SystemMetadataModel::new(self.tx, self.namespace)
-            .delete(document_id)
+            .delete(entry.id())
             .await?;
-        Ok(Some(entry.into_value()))
+        Ok(Some(entry))
     }
 
     pub async fn get_total_storage_count(&mut self) -> anyhow::Result<u64> {
@@ -324,7 +323,7 @@ impl<'a, RT: Runtime> FileStorageModel<'a, RT> {
 async fn file_storage_target_tables<RT: Runtime>(
     identity: &Identity,
     snapshot: &DatabaseSnapshot<RT>,
-) -> anyhow::Result<BTreeMap<TabletId, IndexId>> {
+) -> anyhow::Result<BTreeMap<TabletId, IndexRef>> {
     let mut tx = snapshot.begin_tx(
         identity.clone(),
         Arc::new(SearchNotEnabled),
@@ -388,9 +387,10 @@ impl<RT: Runtime> FileStorageSizeTracker<RT> {
     pub async fn total_size(
         &mut self,
         identity: &Identity,
-        snapshot: &DatabaseSnapshot<RT>,
+        snapshot: DatabaseSnapshot<RT>,
     ) -> anyhow::Result<u64> {
-        let target_tables = file_storage_target_tables(identity, snapshot).await?;
+        let target_tables = file_storage_target_tables(identity, &snapshot).await?;
+        drop(snapshot);
         // Only resume when every table counted in the totals is still a target:
         // a dropped table's documents are baked into them, and the iterator
         // will never emit them again for us to subtract back out. Added tables
@@ -441,7 +441,7 @@ impl<RT: Runtime> FileStorageSizeTracker<RT> {
 async fn sync_totals<RT: Runtime>(
     iterator: &DataSyncIterator<RT>,
     resume: Option<SyncedTotals>,
-    target_tables: &BTreeMap<TabletId, IndexId>,
+    target_tables: &BTreeMap<TabletId, IndexRef>,
 ) -> anyhow::Result<SyncedTotals> {
     let (mut cursor, mut size, mut num_documents) = match resume {
         Some(SyncedTotals {
@@ -469,9 +469,9 @@ async fn sync_totals<RT: Runtime>(
         }
         match page.status {
             DataSyncStatus::UpToDate { .. } => break page.cursor,
-            // `Stale` is a consistent snapshot too, but one a page limit cut
-            // short of the latest commit — keep paging so the totals don't
-            // fall further behind on every call.
+            // `Stale` is a consistent snapshot too, but behind the latest
+            // repeatable timestamp — keep paging so the totals don't fall
+            // further behind on every call.
             DataSyncStatus::Stale { .. } | DataSyncStatus::Snapshotting { .. } => {},
         }
         cursor = Some(page.cursor);

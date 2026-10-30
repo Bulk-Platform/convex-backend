@@ -204,6 +204,9 @@ export class TableDefinition<
   private stagedVectorIndexes: VectorIndex[];
   // The type of documents stored in this table.
   validator: DocumentType;
+  // The proposed next validator for this table, validated against existing
+  // documents in the background while `validator` remains enforced.
+  private stagedValidator: Validator<any, any, any> | undefined;
 
   /**
    * @internal
@@ -223,8 +226,6 @@ export class TableDefinition<
    *
    * Returns indexes defined on this table.
    * Intended for the advanced use cases of dynamically deciding which index to use for a query.
-   * If you think you need this, please chime in on ths issue in the Convex JS GitHub repo.
-   * https://github.com/get-convex/convex-js/issues/49
    */
   " indexes"(): { indexDescriptor: string; fields: string[] }[] {
     return this.indexes;
@@ -558,6 +559,67 @@ export class TableDefinition<
   }
 
   /**
+   * Stage changes to this table's document validator.
+   *
+   * Convex validates the staged validator against the table's existing
+   * documents in the background, while the validator passed to
+   * {@link defineTable} remains the one enforced on writes. Once
+   * the background validation succeeds, apply the staged changes
+   * and remove `.staged()`.
+   *
+   * For an object validator, pass only the fields to add or replace. Fields
+   * omitted from the changes keep their enforced validators.
+   * Set a field to `undefined` to remove it from the staged validator.
+   * For nested objects, you must specify the full object validator.
+   *
+   * ```ts
+   * defineTable({
+   *   apple: v.string(),
+   *   banana: v.number(),
+   *   legacy: v.optional(v.string()),
+   * }).staged({
+   *   banana: v.union(v.string(), v.number()),
+   *   legacy: undefined,
+   * })
+   * ```
+   *
+   * See [Staged validators](https://docs.convex.dev/database/schemas#staged-validators).
+   *
+   * @param documentSchema - Field changes for a table defined as an object or
+   * `v.any()`, or a full schema validator specifying the proposed next document
+   * type. Use a full schema validator for a table defined as a union.
+   * @returns A {@link TableDefinition} with the staged validator attached.
+   */
+  staged(
+    documentSchema:
+      | Validator<Record<string, any>, "required", any>
+      | Record<string, GenericValidator | undefined>,
+  ): TableDefinition<DocumentType, Indexes, SearchIndexes, VectorIndexes> {
+    if (this.stagedValidator !== undefined) {
+      throw new Error("Table cannot have more than one staged validator.");
+    }
+    if (isValidator(documentSchema)) {
+      this.stagedValidator = documentSchema;
+    } else {
+      if (this.validator.kind !== "object" && this.validator.kind !== "any") {
+        throw new Error(
+          "Specifying top-level field changes is only supported for simple table definitions. For a table defined with a union or record validator, you must stage a fully defined object or union validator.",
+        );
+      }
+      const enforcedFields =
+        this.validator.kind === "object" ? this.validator.fields : {};
+      const fields: Record<string, GenericValidator> = Object.fromEntries(
+        Object.entries({ ...enforcedFields, ...documentSchema }).filter(
+          (entry): entry is [string, GenericValidator] =>
+            entry[1] !== undefined,
+        ),
+      );
+      this.stagedValidator = v.object(fields);
+    }
+    return this.self();
+  }
+
+  /**
    * Work around for https://github.com/microsoft/TypeScript/issues/57035
    */
   protected self(): TableDefinition<
@@ -582,6 +644,16 @@ export class TableDefinition<
       );
     }
 
+    let stagedDocumentType = undefined;
+    if (this.stagedValidator !== undefined) {
+      stagedDocumentType = this.stagedValidator.json;
+      if (typeof stagedDocumentType !== "object") {
+        throw new Error(
+          "Invalid staged validator: please make sure that the parameter of `.staged()` is valid (see https://docs.convex.dev/database/schemas)",
+        );
+      }
+    }
+
     return {
       indexes: this.indexes,
       stagedDbIndexes: this.stagedDbIndexes,
@@ -590,6 +662,7 @@ export class TableDefinition<
       vectorIndexes: this.vectorIndexes,
       stagedVectorIndexes: this.stagedVectorIndexes,
       documentType,
+      stagedDocumentType,
     };
   }
 }
@@ -884,6 +957,7 @@ export class SchemaDefinition<
           vectorIndexes,
           stagedVectorIndexes,
           documentType,
+          stagedDocumentType,
         } = definition.export();
         return {
           tableName,
@@ -894,6 +968,7 @@ export class SchemaDefinition<
           vectorIndexes,
           stagedVectorIndexes,
           documentType,
+          stagedDocumentType,
         };
       }),
       schemaValidation: this.schemaValidation,

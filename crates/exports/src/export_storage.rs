@@ -16,7 +16,7 @@ use common::{
     persistence::LatestDocument,
     runtime::Runtime,
     types::{
-        IndexId,
+        IndexRef,
         TableName,
     },
 };
@@ -72,7 +72,7 @@ pub(crate) async fn write_storage_table<'a, 'b: 'a, F, Fut, RT: Runtime>(
     namespace: TableNamespace,
     component_path: &ComponentPath,
     table_iterator: &mut MultiTableIterator<RT>,
-    by_id_indexes: &BTreeMap<TabletId, IndexId>,
+    by_id_indexes: &BTreeMap<TabletId, IndexRef>,
     system_tables: &BTreeMap<(TableNamespace, TableName), TabletId>,
     usage: &FunctionUsageTracker,
     requestor: ExportRequestor,
@@ -180,13 +180,7 @@ where
                     .map(|ct| ct.parse())
                     .transpose()?;
                 usage
-                    .track_storage_call(
-                        component_path.clone(),
-                        requestor.usage_tag(),
-                        file_storage_entry.storage_id.clone(),
-                        content_type,
-                        file_storage_entry.sha256.clone(),
-                    )
+                    .track_storage_call(component_path.clone(), requestor.usage_tag(), content_type)
                     .await;
                 usage
                     .track_storage_egress(

@@ -98,7 +98,7 @@ pub(crate) async fn delete_index_rows<RT: Runtime>(
         }
     });
     p.lease
-        .transact(async move |tx| {
+        .transact_read_committed("delete_index_rows", async move |tx| {
             let mut deleted_count = 0;
             for chunk in smart_chunks(&expired_entries) {
                 let mut params = Vec::with_capacity(
@@ -132,7 +132,7 @@ fn index_params(query: &mut Vec<mysql_async::Value>, update: &PersistenceIndexEn
             Some(internal_doc_id_param(*doc_id)),
         ),
     };
-    query.push(internal_id_param(update.index_id.0).into());
+    query.push(internal_id_param(update.index.id().0).into());
     query.push(i64::from(update.ts).into());
     query.push(key.prefix.into());
     query.push(

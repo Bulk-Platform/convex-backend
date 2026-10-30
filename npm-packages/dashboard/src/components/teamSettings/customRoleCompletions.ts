@@ -42,9 +42,9 @@ const RESOURCE_TEMPLATES: ResourceTemplate[] = [
   {
     label: "project:*",
     insertText: "project:*",
-    detail: "All projects (or filter by id/slug)",
+    detail: "All projects (or filter by id/slug/tag)",
     documentation:
-      "Matches projects. Use `*`, `id=<projectId>`, or `slug=<project-slug>`.",
+      "Matches projects. Use `*`, `id=<projectId>`, `slug=<project-slug>`, or `tag=<project-tag>`.",
     category: "project",
   },
   {
@@ -59,6 +59,14 @@ const RESOURCE_TEMPLATES: ResourceTemplate[] = [
     insertText: "project:slug=",
     detail: "A specific project by slug",
     documentation: "Matches one project by URL slug.",
+    category: "project",
+  },
+  {
+    label: "project:tag=",
+    insertText: "project:tag=",
+    detail: "Projects with a tag",
+    documentation:
+      "Matches every project carrying the tag, or for `project:create`, the tags the new project is created with. Tags are compared exactly.",
     category: "project",
   },
   {
@@ -164,6 +172,13 @@ const RESOURCE_TEMPLATES: ResourceTemplate[] = [
     category: "sso",
   },
   {
+    label: "directorySync:*",
+    insertText: "directorySync:*",
+    detail: "Directory Sync",
+    documentation: "Team Directory Sync (SCIM) configuration.",
+    category: "directorySync",
+  },
+  {
     label: "integration:*",
     insertText: "integration:*",
     detail: "Team integrations",
@@ -191,6 +206,7 @@ const RESOURCE_PATTERNS: Array<{ regex: RegExp; category: ActionCategory }> = [
   { regex: /^billing:[^:]+$/, category: "billing" },
   { regex: /^oauthApplication:[^:]+$/, category: "oauthApplication" },
   { regex: /^sso:[^:]+$/, category: "sso" },
+  { regex: /^directorySync:[^:]+$/, category: "directorySync" },
   { regex: /^integration:[^:]+$/, category: "integration" },
 ];
 

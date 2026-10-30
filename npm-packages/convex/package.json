@@ -1,12 +1,12 @@
 {
   "name": "convex",
   "description": "Client for the Convex Cloud",
-  "version": "1.45.0",
+  "version": "1.49.0",
   "author": "Convex, Inc. <no-reply@convex.dev>",
   "homepage": "https://convex.dev",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/get-convex/convex-backend.git",
+    "url": "git+https://github.com/convex/convex-backend.git",
     "directory": "npm-packages/convex"
   },
   "main": "./dist/cjs/index.js",
@@ -145,6 +145,9 @@
         "import": "./dist/esm/values/index.js"
       }
     },
+    "./bundle-analyzer-internal": {
+      "convex-internal-types": "./src/bundle-analyzer-internal/index.ts"
+    },
     "./package.json": "./package.json"
   },
   "@comment typesVersions": [
@@ -184,7 +187,7 @@
     "convex-bundled": "bin/main.js"
   },
   "scripts": {
-    "build": "npm run generateApiSpec && python3 scripts/build.py 2>&1",
+    "build": "npm run generateApiSpec && uv run --script scripts/build.py 2>&1",
     "bundle-server": "node scripts/bundle-server.mjs",
     "clean": "shx rm -rf dist tmpDist*",
     "lint": "eslint . --cache",
@@ -274,7 +277,7 @@
     "@babel/types": "^7.27.1",
     "@clerk/react": "^6.4.3",
     "@commander-js/extra-typings": "^14.0.0",
-    "@convex-dev/platform": "0.1.10",
+    "@convex-dev/platform": "0.1.11",
     "@eslint/compat": "~2.0.0",
     "@eslint/eslintrc": "^3",
     "@eslint/js": "~9.39.0",
@@ -283,22 +286,22 @@
     "@inquirer/search": "^4.1.0",
     "@inquirer/select": "^5.0.4",
     "@inquirer/testing": "^3.3.0",
-    "@modelcontextprotocol/server": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.3.0",
     "@octokit/openapi-types": "~27.0.0",
-    "@sentry/node": "^7.23.0",
-    "@sentry/tracing": "^7.23.0",
+    "@sentry/node": "^10.76.2",
     "@swc/core": "1.15.8",
     "@testing-library/react": "~16.3.0",
     "@types/babel__code-frame": "^7.0.6",
     "@types/deep-equal": "1.0.4",
-    "@types/node": "^18.17.0",
+    "@types/node": "^22.0.0",
     "@types/react": "^19.2.4",
     "@types/react-dom": "^19.2.3",
     "@types/semver": "^7.3.13",
     "@types/serve-handler": "~6.1.4",
     "@types/ws": "^8.5.13",
+    "@vercel/detect-agent": "^1.2.5",
     "@vitest/eslint-plugin": "~1.6.0",
-    "adm-zip": "^0.6.0",
+    "adm-zip": "^0.6.1",
     "bufferutil": "^4.0.7",
     "chalk": "5",
     "chokidar": "3.6.0",
@@ -339,7 +342,7 @@
     "typedoc": "^0.24.6",
     "typescript": "~5.0.3",
     "typescript-eslint": "~8.57.0",
-    "undici": "7.29.0",
+    "undici": "7.29.1",
     "vitest": "^4.1.0",
     "wait-for-expect": "~4.0.0",
     "zod": "^3.24.0",
@@ -347,6 +350,6 @@
   },
   "engines": {
     "npm": ">=7.0.0",
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   }
 }

@@ -45,8 +45,6 @@ const useQuery = createQueryHook(client, "big-brain");
 
 export const useMutate = createMutateHook(client, "big-brain", isMatch);
 
-export const useBBInfiniteQuery = createInfiniteHook(client, "big-brain");
-
 // Management API hooks
 const useManagementQuery = createQueryHook(
   managementApiClient,
@@ -64,7 +62,10 @@ export const useMutateManagementApi = createMutateHook(
   isMatch,
 );
 
-type Path<M extends "post" | "put" | "get"> = PathsWithMethod<BigBrainPaths, M>;
+type Path<M extends "post" | "put" | "get" | "delete"> = PathsWithMethod<
+  BigBrainPaths,
+  M
+>;
 type ManagementPath<M extends "post" | "put" | "get" | "delete" | "patch"> =
   PathsWithMethod<ManagementApiPaths, M>;
 
@@ -155,15 +156,11 @@ async function handleMutationSuccess(
   if (googleAnalyticsEvent) fireGoogleAnalyticsEvent(googleAnalyticsEvent);
 
   if (mutateKey && cachePrefix) {
-    await globalMutate(
-      (key) => {
-        if (!Array.isArray(key) || key.length < 3) return false;
-        const [prefix, keyPath] = key;
-        return prefix === cachePrefix && keyPath === mutateKey;
-      },
-      undefined,
-      { revalidate: true },
-    );
+    await globalMutate((key) => {
+      if (!Array.isArray(key) || key.length < 3) return false;
+      const [prefix, keyPath] = key;
+      return prefix === cachePrefix && keyPath === mutateKey;
+    });
   }
 }
 
@@ -282,7 +279,7 @@ export function useBBQuery<QueryPath extends Path<"get">>({
 export function useBBMutation<
   T extends Path<Method>,
   M extends Path<"get">,
-  Method extends "post" | "put" = "post",
+  Method extends "post" | "put" | "delete" = "post",
 >({
   path,
   pathParams,
@@ -328,7 +325,12 @@ export function useBBMutation<
     > => {
       validateAuthHeader(authHeader);
 
-      const call = method === "put" ? client.PUT : client.POST;
+      const call =
+        method === "put"
+          ? client.PUT
+          : method === "delete"
+            ? client.DELETE
+            : client.POST;
 
       const {
         error,

@@ -165,7 +165,7 @@ impl<'a, RT: Runtime> LogSinksModel<'a, RT> {
         id: DeveloperDocumentId,
         config: SinkConfig,
     ) -> anyhow::Result<()> {
-        let doc = self.must_get_including_tombstoned(id).await?;
+        let doc = self.must_get(id).await?;
         SystemMetadataModel::new_global(self.tx)
             .patch(
                 doc.id(),
@@ -176,8 +176,7 @@ impl<'a, RT: Runtime> LogSinksModel<'a, RT> {
     }
 
     pub async fn mark_for_removal(&mut self, id: DeveloperDocumentId) -> anyhow::Result<()> {
-        self.patch_status(id, SinkState::Tombstoned).await?;
-        Ok(())
+        self.patch_status(id, SinkState::Tombstoned).await
     }
 
     pub async fn add_or_update(
@@ -189,6 +188,17 @@ impl<'a, RT: Runtime> LogSinksModel<'a, RT> {
             status: SinkState::Pending,
             config,
         };
+
+        let existing = self.get_by_provider(sink_type.clone()).await?;
+        // Check within the insert transaction so concurrent creates cannot
+        // replace an export and restart it.
+        anyhow::ensure!(
+            existing.is_none() || sink_type != SinkType::S3Export,
+            ErrorMetadata::conflict(
+                "LogStreamAlreadyExists",
+                "An S3 export already exists. Delete it before creating a new one.",
+            )
+        );
 
         // Filter to non-tombstoned log sinks
         let sinks = self
@@ -205,7 +215,7 @@ impl<'a, RT: Runtime> LogSinksModel<'a, RT> {
             .into());
         }
 
-        if let Some(row) = self.get_by_provider(sink_type.clone()).await? {
+        if let Some(row) = existing {
             self.mark_for_removal(row.developer_id()).await?;
         }
 
@@ -215,27 +225,11 @@ impl<'a, RT: Runtime> LogSinksModel<'a, RT> {
         Ok(id.developer_id)
     }
 
-    // It's generally not safe to delete an existing sink without marking it
-    // Tombstoned first since the LogManager will not know to remove the sink.
-    // However, we can do this during startup before the LogManager has started
-    // (like when adding a local log sink)
-    pub async fn add_on_startup(&mut self, config: SinkConfig) -> anyhow::Result<()> {
-        // Search for matching provider
-        if let Some(sink) = self.get_by_provider(config.sink_type()).await? {
-            SystemMetadataModel::new_global(self.tx)
-                .delete(sink.id())
-                .await?;
-        };
-        self.add_or_update(config).await?;
-        Ok(())
-    }
-
     pub async fn clear(&mut self) -> anyhow::Result<()> {
         let providers = self.get_all().await?;
 
         for sink in providers {
-            self.patch_status(sink.developer_id(), SinkState::Tombstoned)
-                .await?;
+            self.mark_for_removal(sink.developer_id()).await?;
         }
         Ok(())
     }

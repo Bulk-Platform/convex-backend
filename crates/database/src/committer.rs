@@ -104,12 +104,15 @@ use parking_lot::Mutex;
 use prometheus::VMHistogram;
 use rand::Rng;
 use search::TextIndexWriteSize;
-use tokio::sync::{
-    mpsc::{
-        self,
-        error::TrySendError,
+use tokio::{
+    sync::{
+        mpsc::{
+            self,
+            error::TrySendError,
+        },
+        oneshot,
     },
-    oneshot,
+    time::Instant,
 };
 use tokio_util::task::AbortOnDropHandle;
 use usage_tracking::FunctionUsageTracker;
@@ -159,6 +162,7 @@ use crate::{
         WriteLogSnapshot,
         WriteSource,
     },
+    write_throughput_limiter::WriteVolume,
     ComponentRegistry,
     Snapshot,
     Transaction,
@@ -172,7 +176,7 @@ enum PersistenceWrite {
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         parent_trace: Option<SpanContext>,
         commit_id: usize,
-        write_bytes: u64,
+        write_volume: WriteVolume,
         index_key_writes: IndexKeyWrites,
     },
     MaxRepeatableTimestamp {
@@ -194,6 +198,9 @@ impl PersistenceWrite {
 
 pub const AFTER_PENDING_WRITE_SNAPSHOT: &str = "after_pending_write_snapshot";
 
+pub const AFTER_MAX_REPEATABLE_TIMESTAMP_PERSISTENCE: &str =
+    "after_max_repeatable_timestamp_persistence";
+
 /// Fires off the committer thread, once a batch's read sets have been checked
 /// against the write log snapshot and before the committer takes the result
 /// back.
@@ -202,7 +209,7 @@ pub const AFTER_COMMIT_PRE_VALIDATE: &str = "after_commit_pre_validate";
 /// A commit that has been taken off the queue but whose read set has not been
 /// conflict-checked yet.
 struct CommitRequest {
-    queue_timer: Timer<VMHistogram>,
+    submitted_at: Instant,
     transaction: FinalTransaction,
     result: oneshot::Sender<anyhow::Result<Timestamp>>,
     write_source: WriteSource,
@@ -358,6 +365,10 @@ impl<RT: Runtime> Committer<RT> {
         // None means a bump is ongoing. Avoid parallel bumps in case they
         // commit out of order and regress the repeatable timestamp.
         let mut next_bump_wait = Some(*MAX_REPEATABLE_TIMESTAMP_COMMIT_DELAY);
+        // A bump can intentionally stop before a pending commit. If that commit
+        // publishes before the bump does, it needs another short-delay bump rather
+        // than the normal idle-period bump.
+        let mut needs_follow_up_bump = false;
 
         // This span starts when a commit comes back from pre-validation and ends
         // with that same commit getting published.
@@ -430,6 +441,7 @@ impl<RT: Runtime> Committer<RT> {
                     // Advance the repeatable read timestamp so non-leaders can
                     // establish a recent repeatable snapshot.
                     next_bump_wait = None;
+                    needs_follow_up_bump = false;
                     let (tx, _rx) = oneshot::channel();
                     self.bump_max_repeatable_ts(tx, commit_id, committer_span);
                     commit_id += 1;
@@ -445,7 +457,7 @@ impl<RT: Runtime> Committer<RT> {
                             commit_timer,
                             result,
                             parent_trace,
-                            write_bytes,
+                            write_volume,
                             index_key_writes,
                             ..
                         } => {
@@ -456,13 +468,15 @@ impl<RT: Runtime> Committer<RT> {
                             );
                             let _guard = publish_commit_span.set_local_parent();
                             let commit_ts = pending_write.must_commit_ts();
-                            self.publish_commit(pending_write, write_bytes, index_key_writes);
+                            self.publish_commit(pending_write, write_volume, index_key_writes);
                             let _ = result.send(Ok(commit_ts));
 
                             // When we next get free cycles and there is no ongoing bump,
                             // bump max_repeatable_ts so followers can read this commit.
                             if next_bump_wait.is_some() {
                                 next_bump_wait = Some(*MAX_REPEATABLE_TIMESTAMP_COMMIT_DELAY);
+                            } else {
+                                needs_follow_up_bump = true;
                             }
                             commit_timer.finish();
                         },
@@ -480,12 +494,14 @@ impl<RT: Runtime> Committer<RT> {
                                 .unwrap_or_else(Span::noop);
                             let _guard = span.set_local_parent();
                             self.publish_max_repeatable_ts(new_max_repeatable)?;
-                            let base_period = *MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY;
-                            next_bump_wait = Some(
+                            next_bump_wait = Some(if needs_follow_up_bump {
+                                *MAX_REPEATABLE_TIMESTAMP_COMMIT_DELAY
+                            } else {
+                                let base_period = *MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY;
                                 self.runtime
                                     .rng()
-                                    .random_range(base_period..base_period * 2),
-                            );
+                                    .random_range(base_period..base_period * 2)
+                            });
                             let _ = result.send(new_max_repeatable);
                             drop(timer);
                         },
@@ -507,20 +523,29 @@ impl<RT: Runtime> Committer<RT> {
                                 (request, validated_through)
                             },
                             PreValidation::Failed { request, error } => {
-                                let CommitRequest { transaction, result, .. } = request;
+                                let CommitRequest {
+                                    submitted_at,
+                                    transaction,
+                                    result,
+                                    ..
+                                } = request;
                                 // A commit failed off-thread never reaches
                                 // `start_commit`, which is where a commit records these.
                                 // `commit_timer` is labeled `status=error` unless
                                 // `finish()` is called, so dropping it records the
                                 // failure.
                                 let _commit_timer = metrics::commit_timer();
+                                metrics::log_commit_dequeued(submitted_at.elapsed());
                                 metrics::log_write_tx(&transaction);
+                                // Release the read set before replying. See
+                                // `CommitterClient::_commit`.
+                                drop(transaction);
                                 let _ = result.send(Err(error));
                                 continue;
                             },
                         };
                         let CommitRequest {
-                            queue_timer,
+                            submitted_at,
                             transaction,
                             result,
                             write_source,
@@ -530,6 +555,7 @@ impl<RT: Runtime> Committer<RT> {
                             span_commit_id = Some(commit_id);
                             get_sampled_span(&self.deployment_name, "commit", &mut self.runtime.rng())
                         });
+                        let time_in_queue = submitted_at.elapsed();
                         let start_commit_span = make_committer_span(
                             "handle_commit_message",
                             Some(committer_span_ref),
@@ -537,11 +563,11 @@ impl<RT: Runtime> Committer<RT> {
                         ).with_property(|| {
                             (
                                 "time_in_queue_ms",
-                                format!("{}", queue_timer.elapsed().as_secs_f64() * 1000.0),
+                                format!("{}", time_in_queue.as_secs_f64() * 1000.0),
                             )
                         });
                         let _guard = start_commit_span.set_local_parent();
-                        drop(queue_timer);
+                        metrics::log_commit_dequeued(time_in_queue);
                         if let Some(persistence_write_future) = self.start_commit(
                             transaction,
                             result,
@@ -550,6 +576,7 @@ impl<RT: Runtime> Committer<RT> {
                             commit_id,
                             committer_span_ref,
                             validated_through,
+                            submitted_at,
                         ) {
                             self.persistence_writes.push_back(persistence_write_future);
                             commit_id += 1;
@@ -576,23 +603,19 @@ impl<RT: Runtime> Committer<RT> {
                             return Ok(());
                         },
                         Some(CommitterMessage::Commit {
-                            queue_timer,
+                            submitted_at,
                             transaction,
                             result,
                             write_source,
                             parent_trace,
                         }) => {
-                            if transaction.is_readonly() {
-                                let _ = result.send(Ok(*transaction.begin_timestamp));
-                            } else {
-                                awaiting_pre_validation.push_back(CommitRequest {
-                                    queue_timer,
-                                    transaction,
-                                    result,
-                                    write_source,
-                                    parent_trace,
-                                });
-                            }
+                            awaiting_pre_validation.push_back(CommitRequest {
+                                submitted_at,
+                                transaction,
+                                result,
+                                write_source,
+                                parent_trace,
+                            });
                         },
                         Some(CommitterMessage::FinishTextAndVectorBootstrap {
                             bootstrapped_indexes,
@@ -844,6 +867,10 @@ impl<RT: Runtime> Committer<RT> {
                     {
                         Ok(()) => {
                             backoff.reset();
+                            runtime
+                                .pause_client()
+                                .wait(AFTER_MAX_REPEATABLE_TIMESTAMP_PERSISTENCE)
+                                .await;
                             break;
                         },
                         Err(mut e) => {
@@ -917,9 +944,10 @@ impl<RT: Runtime> Committer<RT> {
         // The updates are ordered using table_dependency_sort_key,
         // which is the same order they should be applied to database metadata
         // and index data structures
+        let bootstrap_tables = BootstrapTableIds::new(&transaction.table_mapping);
         ordered_updates.sort_by_key(|update| {
             table_dependency_sort_key(
-                BootstrapTableIds::new(&transaction.table_mapping),
+                bootstrap_tables,
                 InternalDocumentId::from(update.id),
                 update.new_document.as_ref(),
             )
@@ -1013,7 +1041,7 @@ impl<RT: Runtime> Committer<RT> {
         if let Some(conflicting_read) = self.log.is_stale(reads, validated_through, commit_ts)? {
             return Ok(Some(conflicting_read));
         }
-        if let Some(conflicting_read) = self.pending_writes.is_stale(reads)? {
+        if let Some(conflicting_read) = self.pending_writes.is_stale(reads) {
             return Ok(Some(conflicting_read));
         }
         Ok(None)
@@ -1039,7 +1067,8 @@ impl<RT: Runtime> Committer<RT> {
         component_registry: ComponentRegistry,
         virtual_system_mapping: VirtualSystemMapping,
         write_source: WriteSource,
-    ) -> anyhow::Result<(u64, IndexKeyWrites)> {
+        submitted_at: Instant,
+    ) -> anyhow::Result<(WriteVolume, IndexKeyWrites)> {
         Self::track_commit(
             usage_tracking,
             &index_writes,
@@ -1070,20 +1099,28 @@ impl<RT: Runtime> Committer<RT> {
                 entry
             })
             .collect_vec();
+        let mut index_write_metrics = metrics::CommitIndexWriteMetrics::default();
         let index_writes = index_writes
             .into_iter()
             .map(|update| {
                 let entry = PersistenceIndexEntry::from_index_update(commit_ts, &update);
+                index_write_metrics.record(&entry, update.is_system_index);
                 write_bytes += entry.size();
                 entry
             })
             .collect_vec();
         metrics::commit_index_rows(index_writes.len() as u64);
+        let write_volume = WriteVolume {
+            bytes: write_bytes,
+            rows: (document_writes.len() + index_writes.len()) as u64,
+        };
         write_batcher
             .write(document_writes, index_writes, write_bytes)
             .await
             .with_context(|| format!("Commit ({write_source:?}) failed to write to persistence"))?;
-        Ok((write_bytes, index_key_writes))
+        metrics::log_commit_persisted(submitted_at.elapsed());
+        index_write_metrics.log();
+        Ok((write_volume, index_key_writes))
     }
 
     /// After writing the new rows to persistence, mark the commit as complete
@@ -1092,19 +1129,19 @@ impl<RT: Runtime> Committer<RT> {
     fn publish_commit(
         &mut self,
         pending_write: PendingWriteHandle,
-        write_bytes: u64,
+        write_volume: WriteVolume,
         writes: IndexKeyWrites,
     ) {
         let apply_timer = metrics::commit_apply_timer();
         let commit_ts = pending_write.must_commit_ts();
 
-        let (ordered_updates, _, new_snapshot) = self.pending_writes.pop_first(pending_write);
+        let (ordered_updates, new_snapshot) = self.pending_writes.pop_first(pending_write);
 
         // Write transaction state at the commit ts to the document store.
         metrics::commit_rows(ordered_updates.len() as u64);
         drop(ordered_updates);
 
-        metrics::write_log_commit_bytes(write_bytes as usize);
+        metrics::write_log_commit_bytes(write_volume.bytes as usize);
 
         let timer = metrics::write_log_append_timer();
         let index_registry = &new_snapshot.index_registry;
@@ -1133,7 +1170,7 @@ impl<RT: Runtime> Committer<RT> {
 
         // Publish the new version of our database metadata and the index.
         let mut snapshot_manager = self.snapshot_manager.write();
-        snapshot_manager.push(commit_ts, new_snapshot, write_bytes);
+        snapshot_manager.push(commit_ts, new_snapshot, write_volume);
 
         apply_timer.finish();
     }
@@ -1175,6 +1212,7 @@ impl<RT: Runtime> Committer<RT> {
         commit_id: usize,
         root_span: &Span,
         validated_through: Timestamp,
+        submitted_at: Instant,
     ) -> Option<BoxFuture<'static, anyhow::Result<PersistenceWrite>>> {
         let commit_timer = metrics::commit_timer();
         metrics::log_write_tx(&transaction);
@@ -1236,10 +1274,11 @@ impl<RT: Runtime> Committer<RT> {
                         component_registry,
                         virtual_system_mapping,
                         write_source,
+                        submitted_at,
                     )
                     .in_span(Span::enter_with_local_parent(name)),
                 ));
-                let (write_bytes, index_key_writes) = handle.await??;
+                let (write_volume, index_key_writes) = handle.await??;
                 pause_client.wait(AFTER_PENDING_WRITE_SNAPSHOT).await;
                 Ok(PersistenceWrite::Commit {
                     pending_write,
@@ -1247,7 +1286,7 @@ impl<RT: Runtime> Committer<RT> {
                     result,
                     parent_trace,
                     commit_id,
-                    write_bytes,
+                    write_volume,
                     index_key_writes,
                 })
             }
@@ -1534,16 +1573,27 @@ impl CommitterClient {
         // Finish reading everything from persistence.
         let transaction = transaction.finalize()?;
 
+        if transaction.is_readonly() {
+            // If there is nothing to write, skip the roundtrip through the
+            // committer. The transaction is serialized at the _begin_ timestamp
+            // rather than a freshly allocated one.
+            return Ok(*transaction.begin_timestamp);
+        }
+
         // Note that we do a best effort validation for memory index sizes. We
         // use the latest snapshot instead of the transaction base snapshot. This
         // is both more accurate and also avoids pedant hitting transient errors.
         let latest_snapshot = self.snapshot_reader.lock().latest_snapshot();
         transaction.validate_memory_index_sizes(&latest_snapshot, &self.search_flusher_wake)?;
 
-        let queue_timer = metrics::commit_queue_timer();
+        // Freeing a large read set is expensive, so it should happen on this
+        // task rather than the single committer thread. The committer releases
+        // its reference before replying, so holding this one until the reply
+        // makes this task free the read set.
+        let reads = transaction.reads.clone();
         let (tx, rx) = oneshot::channel();
         let message = CommitterMessage::Commit {
-            queue_timer,
+            submitted_at: rt.monotonic_now(),
             transaction,
             result: tx,
             write_source,
@@ -1564,6 +1614,7 @@ impl CommitterClient {
         let Ok(result) = rx.await else {
             anyhow::bail!(metrics::shutdown_error());
         };
+        drop(reads);
         if let Err(e) = result {
             return Err(recapture_stacktrace(e).await);
         }
@@ -1636,7 +1687,7 @@ impl CommitterClient {
 
 enum CommitterMessage {
     Commit {
-        queue_timer: Timer<VMHistogram>,
+        submitted_at: Instant,
         transaction: FinalTransaction,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         write_source: WriteSource,

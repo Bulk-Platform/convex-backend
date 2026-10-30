@@ -2,22 +2,27 @@ import { Button } from "@ui/Button";
 import { Sheet } from "@ui/Sheet";
 import { Tooltip } from "@ui/Tooltip";
 import { Spinner } from "@ui/Spinner";
-import { Callout } from "@ui/Callout";
 import { formatBytes, formatNumberCompact } from "@common/lib/format";
 import { UsageSummaryRow } from "hooks/usageMetrics";
+import { useLaunchDarkly } from "hooks/useLaunchDarkly";
 import { formatQuantity } from "./lib/formatQuantity";
 import { ReactNode } from "react";
 import { TeamEntitlementsResponse } from "generatedApi";
+
 import {
   QuestionMarkCircledIcon,
   CrossCircledIcon,
   ChevronRightIcon,
-  InfoCircledIcon,
+  ExclamationTriangleIcon,
 } from "@radix-ui/react-icons";
 import { cn } from "@ui/cn";
 import { useRouter } from "next/router";
 import { Donut } from "@ui/Donut";
 import { Loading } from "@ui/Loading";
+import { formatDistanceToNowStrict } from "date-fns";
+import type { UsagePricing } from "./lib/usagePrices";
+import { getUsageSpend, formatSpend } from "./lib/usageSpend";
+import type { UsageSpend } from "./lib/usageSpend";
 
 const BUSINESS_METRIC_TO_SECTION: Record<string, string> = {
   functionCalls: "functionCalls",
@@ -56,8 +61,11 @@ type BusinessMetricKey =
 
 type Section = {
   metric: BusinessMetricKey;
-  // TODO: Remove string fallback once teamMaxSearchQueries is in generated types
-  entitlement?: keyof TeamEntitlementsResponse | string;
+  entitlement?: {
+    [K in keyof TeamEntitlementsResponse]: TeamEntitlementsResponse[K] extends number
+      ? K
+      : never;
+  }[keyof TeamEntitlementsResponse];
   format: (value: number) => string;
   detail: string;
   title: string;
@@ -232,28 +240,38 @@ export function BusinessPlanSummary({
   error,
   aiGatewayCost,
   aiGatewayCostError,
-  showAiGatewayUsage,
   isBusinessPlan = true,
   entitlements,
   hasSubscription = false,
   showEntitlements = false,
+  pricing = { status: "unavailable", reason: "unsupported-period" },
+  spendApplicable = true,
 }: {
   summary?: UsageSummaryRow[];
   error?: any;
   aiGatewayCost?: number;
   aiGatewayCostError?: any;
-  showAiGatewayUsage?: boolean;
   isBusinessPlan?: boolean;
   entitlements?: TeamEntitlementsResponse;
   hasSubscription?: boolean;
   showEntitlements?: boolean;
+  pricing?: UsagePricing;
+  spendApplicable?: boolean;
 }) {
   const router = useRouter();
+  const { dashboardShowCashUsage } = useLaunchDarkly();
+  const showSpend = dashboardShowCashUsage && pricing.status !== "unavailable";
+  const gridColumns = hasSubscription
+    ? showSpend
+      ? "grid-cols-[4fr_3fr_2fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_2fr_auto]"
+      : "grid-cols-[4fr_3fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_auto]"
+    : showSpend
+      ? "grid-cols-[5fr_4fr_2fr_auto]"
+      : "grid-cols-[5fr_4fr_auto]";
   const activeSections = isBusinessPlan ? businessSections : selfServeSections;
 
   // Deployment counts live on the summary rows but are team-wide (the gauge has
-  // no project/component dimension we filter on), so sum across every row and
-  // apply the same total to both the full and primary-region aggregates.
+  // no project/component dimension we filter on), so sum across every row.
   const deploymentCount = summary
     ? summary.reduce((sum, row) => sum + row.deploymentCount, 0)
     : undefined;
@@ -308,273 +326,323 @@ export function BusinessPlanSummary({
     aggregated.aiGatewayCost = aiGatewayCost;
   }
 
-  // For self-serve plans, aggregate only primary region (aws-us-east-1)
-  // so that included limits only apply to US-hosted deployments.
-  const primaryRegionAggregated =
-    !isBusinessPlan && summary
-      ? aggregateRows(summary.filter((row) => row.region === "aws-us-east-1"))
-      : undefined;
-
-  // Deployment count is team-wide, so its primary-region value is the full
-  // count rather than a region-filtered subset.
-  if (primaryRegionAggregated && deploymentCount !== undefined) {
-    primaryRegionAggregated.deploymentCount = deploymentCount;
-  }
-  // AI spend has no region dimension, so the primary-region aggregate carries
-  // the same team-wide total.
-  if (primaryRegionAggregated && aiGatewayCost !== undefined) {
-    primaryRegionAggregated.aiGatewayCost = aiGatewayCost;
-  }
-
   const sectionToRoute = isBusinessPlan
     ? BUSINESS_METRIC_TO_SECTION
     : SELF_SERVE_METRIC_TO_SECTION;
 
-  const hasEuDeployments =
-    !isBusinessPlan && summary?.some((s) => s.region !== "aws-us-east-1");
-
   return (
-    <>
-      {hasEuDeployments && (
-        <Callout variant="instructions" className="flex items-start gap-2">
-          <InfoCircledIcon className="mt-0.5 size-4 shrink-0" />
-          <p>
+    <Sheet
+      className="animate-fadeInFromLoading overflow-hidden"
+      padding={false}
+    >
+      <div className="flex flex-col gap-1 overflow-x-clip">
+        <div
+          className={cn(
+            "grid items-center gap-2 rounded-t border-b px-4 py-2 text-sm text-content-secondary",
+            gridColumns,
+          )}
+        >
+          <div>Resource</div>
+          <div>
             {hasSubscription ? (
-              <>
-                <span className="font-semibold">
-                  EU region usage is billed on-demand.
-                </span>{" "}
-                Included plan limits only apply to US-hosted deployments. All
-                usage on EU deployments is charged at on-demand rates, plus a
-                30% regional surcharge.
-              </>
-            ) : (
-              <>
-                <span className="font-semibold">
-                  EU region usage has no included limits on paid plans.
-                </span>{" "}
-                If you upgrade, included plan limits will only apply to
-                US-hosted deployments. EU deployment usage will be billed
-                on-demand at plan rates, plus a 30% regional surcharge.
-              </>
-            )}
-          </p>
-        </Callout>
-      )}
-      <Sheet
-        className="animate-fadeInFromLoading overflow-hidden"
-        padding={false}
-      >
-        <div className="flex flex-col gap-1 overflow-x-clip">
-          <div
-            className={cn(
-              "grid items-center gap-2 rounded-t border-b px-4 py-2 text-sm text-content-secondary",
-              hasSubscription
-                ? "grid-cols-[4fr_3fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_auto]"
-                : "grid-cols-[5fr_4fr_auto]",
-            )}
-          >
-            <div>Resource</div>
-            <div>
-              {hasSubscription ? (
-                <div className="flex items-center gap-1">
-                  Included{" "}
-                  <Tooltip
-                    tip="The amount of usage used within the included limits of your plan."
-                    side="right"
-                    className="hidden sm:block"
-                  >
-                    <QuestionMarkCircledIcon />
-                  </Tooltip>
-                </div>
-              ) : (
-                "Usage"
-              )}
-            </div>
-            {hasSubscription && (
               <div className="flex items-center gap-1">
-                On-demand{" "}
+                Included{" "}
                 <Tooltip
-                  tip="Usage beyond your plan's included limits."
+                  tip="The amount of usage used within the included limits of your plan."
                   side="right"
                   className="hidden sm:block"
                 >
                   <QuestionMarkCircledIcon />
                 </Tooltip>
               </div>
+            ) : (
+              "Usage"
             )}
-            <span className="invisible flex items-center gap-1 text-xs">
-              <span className="hidden whitespace-nowrap sm:inline">
-                View breakdown by day
-              </span>
-              <ChevronRightIcon className="size-4" />
-            </span>
           </div>
-          {error ? (
-            <PlanSummaryError />
-          ) : !aggregated ? (
-            <PlanSummaryLoading />
-          ) : (
-            visibleSections.map((section, index) => {
-              const sectionId = sectionToRoute[section.metric];
-              const { section: _s, tab: _t, ...restQuery } = router.query;
-              const linkQuery = sectionId
-                ? { ...restQuery, section: sectionId }
-                : restQuery;
-              const linkHref = { pathname: router.pathname, query: linkQuery };
-
-              const metric = aggregated[section.metric] ?? 0;
-              const aiCostFailed =
-                section.metric === "aiGatewayCost" &&
-                aiGatewayCostError !== undefined;
-              const aiCostPending =
-                section.metric === "aiGatewayCost" &&
-                aiGatewayCost === undefined &&
-                !aiCostFailed;
-              if (section.metric === "aiGatewayCost" && !showAiGatewayUsage) {
-                return null;
-              }
-              const entitlement =
-                section.entitlement && entitlements
-                  ? ((entitlements as Record<string, unknown>)[
-                      section.entitlement
-                    ] as number | undefined)
-                  : undefined;
-
-              // For self-serve plans, only primary region (US) usage counts
-              // toward included limits, matching the V1 behavior.
-              const primaryRegionMetric = primaryRegionAggregated
-                ? (primaryRegionAggregated[section.metric] ?? 0)
-                : metric;
-              const includedAmount = section.allOnDemand
-                ? 0
-                : primaryRegionMetric !== undefined && entitlement !== undefined
-                  ? Math.min(primaryRegionMetric, entitlement)
-                  : undefined;
-              const onDemandAmount =
-                metric !== undefined && includedAmount !== undefined
-                  ? metric - includedAmount
-                  : undefined;
-
-              const displayedUsage =
-                hasSubscription &&
-                !section.noOnDemand &&
-                includedAmount !== undefined
-                  ? includedAmount
-                  : metric;
-
-              return (
-                <Button
-                  key={index}
-                  variant="unstyled"
-                  onClick={() => {
-                    void router.push(linkHref, undefined, { shallow: true });
-                  }}
-                  className={cn(
-                    "group grid min-h-10 items-center gap-2 rounded-sm px-4 py-2 text-left transition-colors hover:bg-background-primary focus-visible:bg-background-primary focus-visible:outline-2 focus-visible:outline-border-selected",
-                    hasSubscription
-                      ? "grid-cols-[4fr_3fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_auto]"
-                      : "grid-cols-[5fr_4fr_auto]",
-                  )}
+          {hasSubscription && (
+            <div className="flex items-center gap-1">
+              On-demand{" "}
+              <Tooltip
+                tip="Usage beyond your plan's included limits."
+                side="right"
+                className="hidden sm:block"
+              >
+                <QuestionMarkCircledIcon />
+              </Tooltip>
+            </div>
+          )}
+          {showSpend && (
+            <span className="flex items-center gap-1">
+              Spend
+              {pricing.status === "ready" && (
+                <Tooltip
+                  tip={`Spend is only available for time ranges starting after the previous change to prices (${formatDistanceToNowStrict(pricing.period.start, { addSuffix: true })}).`}
                 >
-                  <div className="flex items-center gap-2">
-                    {showEntitlements &&
-                      (entitlement !== undefined ? (
-                        <Tooltip
-                          side="bottom"
-                          tip={`Your team has used ${(100 * (displayedUsage / entitlement)).toFixed(2)}% of the included amount of ${section.title}.`}
-                          className="flex animate-fadeInFromLoading items-center"
-                        >
-                          <Donut current={displayedUsage} max={entitlement} />
-                        </Tooltip>
-                      ) : (
-                        // Keep sections without an included limit aligned with
-                        // the gauged ones.
-                        <div className="hidden size-6 sm:block" />
-                      ))}
-                    <SectionLabel detail={section.detail}>
-                      {section.title}
-                    </SectionLabel>
-                  </div>
+                  <QuestionMarkCircledIcon />
+                </Tooltip>
+              )}
+            </span>
+          )}
+          <span className="invisible flex items-center gap-1 text-xs">
+            <span className="hidden whitespace-nowrap sm:inline">
+              View breakdown by day
+            </span>
+            <ChevronRightIcon className="size-4" />
+          </span>
+        </div>
+        {error ? (
+          <PlanSummaryError />
+        ) : !aggregated ? (
+          <PlanSummaryLoading />
+        ) : (
+          visibleSections.map((section, index) => {
+            const sectionId = sectionToRoute[section.metric];
+            const { section: _s, tab: _t, ...restQuery } = router.query;
+            const linkQuery = sectionId
+              ? { ...restQuery, section: sectionId }
+              : restQuery;
+            const linkHref = { pathname: router.pathname, query: linkQuery };
+
+            const metric = aggregated[section.metric] ?? 0;
+            const aiCostFailed =
+              section.metric === "aiGatewayCost" &&
+              aiGatewayCostError !== undefined;
+            const aiCostPending =
+              section.metric === "aiGatewayCost" &&
+              aiGatewayCost === undefined &&
+              !aiCostFailed;
+            const entitlement =
+              section.entitlement && entitlements
+                ? entitlements[section.entitlement]
+                : undefined;
+
+            const includedAmount = section.allOnDemand
+              ? 0
+              : entitlement !== undefined
+                ? Math.min(metric, entitlement)
+                : undefined;
+            const onDemandAmount =
+              metric !== undefined && includedAmount !== undefined
+                ? metric - includedAmount
+                : undefined;
+
+            const displayedUsage =
+              hasSubscription &&
+              !section.noOnDemand &&
+              includedAmount !== undefined
+                ? includedAmount
+                : metric;
+
+            const spend =
+              showSpend && pricing.status === "ready" && spendApplicable
+                ? section.metric === "aiGatewayCost"
+                  ? aiCostFailed || aiGatewayCost === undefined
+                    ? undefined
+                    : { amount: aiGatewayCost, missingDimensions: [] }
+                  : getUsageSpend(summary, section.metric, pricing.period)
+                : undefined;
+
+            return (
+              <Button
+                key={index}
+                variant="unstyled"
+                onClick={() => {
+                  void router.push(linkHref, undefined, { shallow: true });
+                }}
+                className={cn(
+                  "group grid min-h-10 items-center gap-2 rounded-sm px-4 py-2 text-left transition-colors hover:bg-background-primary focus-visible:bg-background-primary focus-visible:outline-2 focus-visible:outline-border-selected",
+                  gridColumns,
+                )}
+              >
+                <div className="flex items-center gap-2">
+                  {showEntitlements &&
+                    (entitlement !== undefined ? (
+                      <Tooltip
+                        side="bottom"
+                        tip={`Your team has used ${(100 * (displayedUsage / entitlement)).toFixed(2)}% of the included amount of ${section.title}.`}
+                        className="flex animate-fadeInFromLoading items-center"
+                      >
+                        <Donut current={displayedUsage} max={entitlement} />
+                      </Tooltip>
+                    ) : (
+                      // Keep sections without an included limit aligned with
+                      // the gauged ones.
+                      <div className="hidden size-6 sm:block" />
+                    ))}
+                  <SectionLabel detail={section.detail}>
+                    {section.title}
+                  </SectionLabel>
+                </div>
+                <div className="animate-fadeInFromLoading">
+                  {hasSubscription && section.allOnDemand ? (
+                    <span className="text-content-secondary">–</span>
+                  ) : aiCostFailed ? (
+                    <span className="text-content-secondary">Unavailable</span>
+                  ) : aiCostPending ? (
+                    <Loading fullHeight={false} className="h-4 w-16" />
+                  ) : (
+                    <span>
+                      {section.format(displayedUsage)}
+                      {section.suffix &&
+                        (!showEntitlements ? ` ${section.suffix}` : "")}
+                    </span>
+                  )}
+                  {showEntitlements && entitlement !== undefined && (
+                    <span>
+                      {" "}
+                      / {section.format(entitlement)}
+                      {section.suffix ? ` ${section.suffix}` : ""}
+                    </span>
+                  )}
+                  {section.metric === "deploymentCount" &&
+                    isBusinessPlan &&
+                    pausedDeploymentCount !== undefined &&
+                    idleDeploymentCount !== undefined && (
+                      <span className="text-content-secondary">
+                        {" "}
+                        (
+                        {formatNumberCompact(
+                          Math.max(
+                            displayedUsage -
+                              pausedDeploymentCount -
+                              idleDeploymentCount,
+                            0,
+                          ),
+                        )}{" "}
+                        active · {formatNumberCompact(idleDeploymentCount)} idle
+                        · {formatNumberCompact(pausedDeploymentCount)} paused)
+                      </span>
+                    )}
+                </div>
+                {hasSubscription && (
                   <div className="animate-fadeInFromLoading">
-                    {hasSubscription && section.allOnDemand ? (
+                    {section.allOnDemand ? (
+                      aiCostFailed ? (
+                        <span className="text-content-secondary">
+                          Unavailable
+                        </span>
+                      ) : aiCostPending ? (
+                        <Loading fullHeight={false} className="h-4 w-16" />
+                      ) : (
+                        // The whole amount bills on demand, so it is not an
+                        // increment over an included amount.
+                        `${section.format(metric)}${section.suffix ? ` ${section.suffix}` : ""}`
+                      )
+                    ) : (
+                      !section.noOnDemand &&
+                      onDemandAmount !== undefined &&
+                      onDemandAmount > 0 &&
+                      `+${section.format(onDemandAmount)}${section.suffix ? ` ${section.suffix}` : ""}`
+                    )}
+                  </div>
+                )}
+                {showSpend && (
+                  <div className="animate-fadeInFromLoading tabular-nums">
+                    {!spendApplicable ||
+                    section.metric === "deploymentCount" ? (
                       <span className="text-content-secondary">–</span>
-                    ) : aiCostFailed ? (
+                    ) : pricing.status === "error" || aiCostFailed ? (
                       <span className="text-content-secondary">
                         Unavailable
                       </span>
-                    ) : aiCostPending ? (
+                    ) : pricing.status === "loading" || aiCostPending ? (
                       <Loading fullHeight={false} className="h-4 w-16" />
                     ) : (
-                      <span>
-                        {section.format(displayedUsage)}
-                        {section.suffix &&
-                          (!showEntitlements ? ` ${section.suffix}` : "")}
-                      </span>
+                      <SpendValue
+                        spend={spend}
+                        sectionTitle={section.title}
+                        showUnavailableWarning={
+                          pricing.status === "ready" &&
+                          section.metric !== "aiGatewayCost"
+                        }
+                      />
                     )}
-                    {showEntitlements && entitlement !== undefined && (
-                      <span>
-                        {" "}
-                        / {section.format(entitlement)}
-                        {section.suffix ? ` ${section.suffix}` : ""}
-                      </span>
-                    )}
-                    {section.metric === "deploymentCount" &&
-                      isBusinessPlan &&
-                      pausedDeploymentCount !== undefined &&
-                      idleDeploymentCount !== undefined && (
-                        <span className="text-content-secondary">
-                          {" "}
-                          (
-                          {formatNumberCompact(
-                            Math.max(
-                              displayedUsage -
-                                pausedDeploymentCount -
-                                idleDeploymentCount,
-                              0,
-                            ),
-                          )}{" "}
-                          active · {formatNumberCompact(idleDeploymentCount)}{" "}
-                          idle · {formatNumberCompact(pausedDeploymentCount)}{" "}
-                          paused)
-                        </span>
-                      )}
                   </div>
-                  {hasSubscription && (
-                    <div className="animate-fadeInFromLoading">
-                      {section.allOnDemand ? (
-                        aiCostFailed ? (
-                          <span className="text-content-secondary">
-                            Unavailable
-                          </span>
-                        ) : aiCostPending ? (
-                          <Loading fullHeight={false} className="h-4 w-16" />
-                        ) : (
-                          // The whole amount bills on demand, so it is not an
-                          // increment over an included amount.
-                          `${section.format(metric)}${section.suffix ? ` ${section.suffix}` : ""}`
-                        )
-                      ) : (
-                        !section.noOnDemand &&
-                        onDemandAmount !== undefined &&
-                        onDemandAmount > 0 &&
-                        `+${section.format(onDemandAmount)}${section.suffix ? ` ${section.suffix}` : ""}`
-                      )}
-                    </div>
-                  )}
-                  <span className="flex items-center gap-1 text-xs text-content-secondary">
-                    <span className="hidden whitespace-nowrap opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100 sm:inline">
-                      View breakdown by day
-                    </span>
-                    <ChevronRightIcon className="size-4" />
+                )}
+                <span className="flex items-center gap-1 text-xs text-content-secondary">
+                  <span className="hidden whitespace-nowrap opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100 sm:inline">
+                    View breakdown by day
                   </span>
-                </Button>
-              );
-            })
+                  <ChevronRightIcon className="size-4" />
+                </span>
+              </Button>
+            );
+          })
+        )}
+      </div>
+    </Sheet>
+  );
+}
+
+function SpendValue({
+  spend,
+  sectionTitle,
+  showUnavailableWarning,
+}: {
+  spend: UsageSpend | undefined;
+  sectionTitle: string;
+  showUnavailableWarning: boolean;
+}) {
+  return (
+    <span className="inline-flex items-center gap-1 whitespace-nowrap">
+      {spend === undefined || spend.missingDimensions.length > 0 ? (
+        <span className="text-content-secondary">–</span>
+      ) : (
+        formatSpend(spend.amount)
+      )}
+      {spend === undefined
+        ? showUnavailableWarning && <SpendWarning sectionTitle={sectionTitle} />
+        : spend.missingDimensions.length > 0 && (
+            <SpendWarning
+              sectionTitle={sectionTitle}
+              missingDimensions={spend.missingDimensions}
+            />
           )}
-        </div>
-      </Sheet>
-    </>
+    </span>
+  );
+}
+
+function SpendWarning({
+  sectionTitle,
+  missingDimensions,
+}: {
+  sectionTitle: string;
+  missingDimensions?: string[];
+}) {
+  return (
+    <Tooltip
+      aria-label={
+        missingDimensions
+          ? "Incomplete billing information"
+          : "Missing billing information"
+      }
+      className="inline-flex shrink-0 items-center text-content-warning"
+      tip={
+        missingDimensions ? (
+          <div className="space-y-2 p-1 text-left">
+            <p>
+              Spend unavailable: billing information is missing for some
+              metrics, deployment classes, or regions.
+            </p>
+            <div>
+              <p className="mb-1 font-semibold">Missing billing information</p>
+              <ul className="list-none space-y-1 text-content-secondary">
+                {missingDimensions.map((dimension) => (
+                  <li key={dimension}>{dimension}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        ) : (
+          <p className="p-1 text-left">
+            Spend unavailable: {sectionTitle} spend cannot be calculated from
+            the available billing information.
+          </p>
+        )
+      }
+    >
+      <ExclamationTriangleIcon className="size-4" />
+    </Tooltip>
   );
 }
 

@@ -104,6 +104,7 @@ use database::{
     IndexWorkerMetadataTable,
     NextPersistenceIndexIdTable,
     SchemaValidationProgressTable,
+    SchemaValidationTable,
     SchemasTable,
     TablesTable,
     Transaction,
@@ -118,7 +119,9 @@ use database::{
     NUM_RESERVED_LEGACY_TABLE_NUMBERS,
     SCHEMAS_STATE_INDEX,
     SCHEMAS_TABLE,
-    SCHEMA_VALIDATION_PROGRESS_BY_SCHEMA_ID,
+    SCHEMA_VALIDATIONS_BY_SCHEMA_ID_AND_TABLE_NAME,
+    SCHEMA_VALIDATIONS_TABLE,
+    SCHEMA_VALIDATION_PROGRESS_BY_VALIDATION_ID,
     SCHEMA_VALIDATION_PROGRESS_TABLE,
     TABLES_BY_NAME_INDEX,
 };
@@ -213,6 +216,11 @@ use crate::{
     exports::ExportsTable,
     external_packages::EXTERNAL_PACKAGES_TABLE,
     log_sinks::LOG_SINKS_TABLE,
+    s3_export_state::{
+        S3ExportStateTable,
+        S3_EXPORT_STATE_BY_CONFIG_ID,
+        S3_EXPORT_STATE_TABLE,
+    },
     scheduled_jobs::args::{
         ScheduledJobArgsTable,
         SCHEDULED_JOBS_ARGS_TABLE,
@@ -246,6 +254,7 @@ pub mod log_sinks;
 mod metrics;
 pub mod migrations;
 pub mod modules;
+pub mod s3_export_state;
 pub mod scheduled_jobs;
 pub mod session_requests;
 pub mod snapshot_imports;
@@ -294,9 +303,11 @@ enum DefaultTableNumber {
     UsageLimits = 40,
     DataSyncProgress = 41,
     NextPersistenceIndexId = 42,
+    SchemaValidations = 43,
+    S3ExportState = 44,
     // Keep this number and your user name up to date. The number makes it easy to know
     // what to use next. The username on the same line detects merge conflicts
-    // Next Number - 43 - tonyt
+    // Next Number - 45 - nipunn
 }
 
 impl From<DefaultTableNumber> for TableNumber {
@@ -327,6 +338,7 @@ impl From<DefaultTableNumber> for &'static dyn ErasedSystemTable {
             DefaultTableNumber::Schemas => &SchemasTable,
             DefaultTableNumber::CronJobLogs => &CronJobLogsTable,
             DefaultTableNumber::LogSinks => &LogSinksTable,
+            DefaultTableNumber::S3ExportState => &S3ExportStateTable,
             DefaultTableNumber::BackendState => &BackendStateTable,
             DefaultTableNumber::ExternalPackages => &ExternalPackagesTable,
             DefaultTableNumber::ScheduledJobs => &ScheduledJobsTable,
@@ -340,6 +352,7 @@ impl From<DefaultTableNumber> for &'static dyn ErasedSystemTable {
             DefaultTableNumber::CronNextRun => &CronNextRunTable,
             DefaultTableNumber::IndexBackfills => &IndexBackfillTable,
             DefaultTableNumber::SchemaValidationProgress => &SchemaValidationProgressTable,
+            DefaultTableNumber::SchemaValidations => &SchemaValidationTable,
             DefaultTableNumber::ScheduledJobArgs => &ScheduledJobArgsTable,
             DefaultTableNumber::AuditLogConfig => &AuditLogConfigTable,
             DefaultTableNumber::UsageLimits => &UsageLimitsTable,
@@ -447,7 +460,11 @@ pub async fn initialize_application_system_tables<RT: Runtime>(
         if component_id.is_root() {
             continue;
         }
-        for table in component_system_tables() {
+        for table in component_system_tables().into_iter().chain([
+            &SchemasTable as &dyn ErasedSystemTable,
+            &SchemaValidationProgressTable,
+            &SchemaValidationTable,
+        ]) {
             initialize_application_system_table(
                 &mut tx,
                 table,
@@ -589,6 +606,7 @@ pub fn app_system_tables() -> Vec<&'static dyn ErasedSystemTable> {
         &FunctionHandlesTable,
         &CanonicalUrlsTable,
         &LogSinksTable,
+        &S3ExportStateTable,
         &AuditLogConfigTable,
         &AwsLambdaVersionsTable,
         &BackendInfoTable,
@@ -600,8 +618,7 @@ pub fn app_system_tables() -> Vec<&'static dyn ErasedSystemTable> {
     system_tables
 }
 
-/// NOTE: Does not include _schemas or _schema_validation_progress because they
-/// are in bootstrapped system tables, but they are created for each component.
+/// Schema tables are bootstrapped separately for each component.
 pub fn component_system_tables() -> Vec<&'static dyn ErasedSystemTable> {
     vec![
         &FileStorageTable,
@@ -669,6 +686,7 @@ pub static FIRST_SEEN_TABLE: LazyLock<BTreeMap<TableName, DatabaseVersion>> = La
         BACKEND_INFO_TABLE.clone() => 44,
         EXPORTS_TABLE.clone() => 44,
         LOG_SINKS_TABLE.clone() => 68,
+        S3_EXPORT_STATE_TABLE.clone() => 134,
         TABLES_TABLE.clone() => 44,
         INDEX_TABLE.clone() => 44,
         SCHEMAS_TABLE.clone() => 50,
@@ -680,6 +698,7 @@ pub static FIRST_SEEN_TABLE: LazyLock<BTreeMap<TableName, DatabaseVersion>> = La
         CANONICAL_URLS_TABLE.clone() => 116,
         INDEX_BACKFILLS_TABLE.clone() => 120,
         SCHEMA_VALIDATION_PROGRESS_TABLE.clone() => 122,
+        SCHEMA_VALIDATIONS_TABLE.clone() => 131,
         SCHEDULED_JOBS_ARGS_TABLE.clone() => 123,
         AUDIT_LOG_CONFIG_TABLE.clone() => 124,
         USAGE_LIMITS_TABLE.clone() => 126,
@@ -709,9 +728,11 @@ pub static FIRST_SEEN_INDEX: LazyLock<BTreeMap<IndexName, DatabaseVersion>> = La
         BY_COMPONENT_PATH_INDEX.name() => 102,
         EXPORTS_BY_REQUESTOR.name() => 110,
         INDEX_BACKFILLS_BY_INDEX_ID.name() => 120,
-        SCHEMA_VALIDATION_PROGRESS_BY_SCHEMA_ID.name() => 122,
+        SCHEMA_VALIDATION_PROGRESS_BY_VALIDATION_ID.name() => 132,
+        SCHEMA_VALIDATIONS_BY_SCHEMA_ID_AND_TABLE_NAME.name() => 131,
         USAGE_LIMITS_INDEX_BY_SELECTOR.name() => 126,
         DATA_SYNC_PROGRESS_INDEX_BY_SYNC_ID.name() => 127,
+        S3_EXPORT_STATE_BY_CONFIG_ID.name() => 134,
         DATA_SYNC_PROGRESS_INDEX_BY_LAST_UPDATED.name() => 127,
         AUDIT_LOG_INDEX_BY_ACTION.name() => 128,
     }

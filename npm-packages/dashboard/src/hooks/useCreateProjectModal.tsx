@@ -12,6 +12,8 @@ import { useCurrentTeam } from "api/teams";
 import { useCreateProject } from "api/projects";
 import { cn } from "@ui/cn";
 import { usePostHog } from "hooks/usePostHog";
+import { ProjectTagsInput } from "components/projects/ProjectTagsInput";
+import { useLaunchDarkly } from "hooks/useLaunchDarkly";
 
 export const useCreateProjectModalRequest = createGlobalState<{
   team?: TeamResponse;
@@ -20,6 +22,7 @@ export const useCreateProjectModalRequest = createGlobalState<{
 export function CreateProjectModal() {
   const [request, setRequest] = useCreateProjectModalRequest();
   const currentTeam = useCurrentTeam();
+  const { tagEditUi } = useLaunchDarkly();
 
   if (!request) {
     return null;
@@ -41,6 +44,8 @@ export function CreateProjectModal() {
           <CreateProjectForm
             onClose={close}
             team={selectedTeam}
+            showLabel
+            showTags={tagEditUi}
             onSuccess={(project) => {
               const projectUrl = `/t/${selectedTeam.slug}/${project.slug}/development`;
               window.location.href = projectUrl;
@@ -66,11 +71,13 @@ export function CreateProjectForm({
   onClose,
   team,
   showLabel = false,
+  showTags = false,
   onSuccess,
 }: {
   onClose(): void;
   team: TeamResponse;
   showLabel?: boolean;
+  showTags?: boolean;
   onSuccess: (project: PlatformCreateProjectResponse) => void;
 }) {
   const createProject = useCreateProject(team.id);
@@ -78,11 +85,12 @@ export function CreateProjectForm({
   const formState = useFormik({
     initialValues: {
       projectName: "",
+      tags: [] as string[],
     },
     validateOnChange: false,
     validateOnBlur: true,
     validationSchema: CreateProjectSchema,
-    onSubmit: async (values: { projectName: string }) => {
+    onSubmit: async (values) => {
       const project = await createProject({
         ...values,
         deploymentType: null,
@@ -96,7 +104,7 @@ export function CreateProjectForm({
     <form
       onSubmit={formState.handleSubmit}
       aria-label="Create project"
-      className="flex gap-2"
+      className={showTags ? "flex flex-col gap-4" : "flex gap-2"}
     >
       <TextInput
         labelHidden={!showLabel}
@@ -115,9 +123,17 @@ export function CreateProjectForm({
         error={formState.touched ? formState.errors.projectName : undefined}
       />
 
+      {showTags && (
+        <ProjectTagsInput
+          tags={formState.values.tags}
+          onChange={(tags) => void formState.setFieldValue("tags", tags)}
+          description="Optionally, add tags to organize this project."
+        />
+      )}
+
       <Button
         disabled={!formState.dirty || !formState.isValid}
-        className={cn("h-fit", showLabel ? "mt-6" : "")}
+        className={cn("h-fit", showTags ? "self-end" : showLabel && "mt-6")}
         size="sm"
         type="submit"
         aria-label="submit"

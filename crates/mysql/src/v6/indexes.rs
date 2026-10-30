@@ -1,466 +1,638 @@
-//! V6 index-table definitions.
+//! `Scanning` writes record deletion timestamps in `indexes_backfill_deletes`.
+//! After backfill insertion finishes, reconciliation removes `indexes_latest`
+//! rows whose timestamps precede their keys' latest deletion timestamps.
+//!
+//! `Scanning` writes, backfill chunks, and reconciliation pages acquire
+//! `indexes_latest` record locks in primary-key order. `Scanning` tombstones
+//! participate in the sorted upsert so inserts and deletions follow the same
+//! lock order.
 
 use std::{
-    fmt::Write,
-    iter,
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     ops::Bound,
 };
 
-use anyhow::Context as _;
+use anyhow::Context;
 use common::{
-    index::{
-        SplitKey,
-        MAX_INDEX_KEY_PREFIX_LEN,
+    cover,
+    knobs::INDEX_RETENTION_DELETE_CHUNK,
+    persistence::{
+        ConflictStrategy,
+        DocumentLogEntry,
+        IndexBackfillEntry,
+        PersistenceIndexEntry,
     },
-    interval::{
-        End,
-        Interval,
-        StartIncluded,
-    },
-    query::Order,
-    sha256::Sha256,
+    runtime::Runtime,
     types::{
+        IndexId,
+        IndexRef,
+        IndexWriteMode,
         PersistenceIndexId,
         Timestamp,
     },
     value::InternalDocumentId,
 };
-use itertools::Itertools;
+use fastrace::prelude::*;
 use mysql_async::Value;
 
-use super::DeploymentId;
+use super::{
+    sql::{
+        self,
+        sort_by_latest_primary_key,
+        BackfillDelete,
+        BackfillMarker,
+        IndexKey,
+        IndexRow,
+        LogBucket,
+        LogRow,
+        RowUpdate,
+        SqlKey,
+    },
+    PersistenceDeploymentId,
+};
+use crate::{
+    chunks::{
+        fill_chunks,
+        ApproxSize,
+    },
+    connection::{
+        MySqlConnection,
+        MySqlTransaction,
+    },
+    metrics,
+};
 
-pub(crate) const LATEST_TABLE: &str = "indexes_latest";
-pub(crate) const LOG_BUCKET_SIZE_NANOS: i64 = 10 * 60 * 1_000_000_000;
-pub(crate) const LIST_LOG_TABLES: &str = r#"
-SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES
-WHERE TABLE_SCHEMA = ? AND TABLE_NAME LIKE 'indexes\_log\_%'
-"#;
-
-/// The hash component used to disambiguate V6 key prefixes.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct KeySuffixHash(Vec<u8>);
-
-impl KeySuffixHash {
-    /// An empty suffix has no hash bytes so it is stored as `X''`.
-    pub(crate) fn from_suffix(suffix: Option<&[u8]>) -> Self {
-        match suffix {
-            None | Some([]) => Self(Vec::new()),
-            Some(suffix) => Self(Sha256::hash(suffix).as_ref()[..16].to_vec()),
-        }
-    }
-
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
+/// Typed diagnostics contain only internal identifiers, timestamps, and fixed
+/// invariant descriptions, allowing callers to report failures without SQL
+/// data.
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+pub(crate) enum IndexWriteError {
+    #[error(
+        "MySQL V6 index write replaces an entry of document {document_id} at {ts} without that \
+         document revision"
+    )]
+    MissingDocumentRevision {
+        document_id: InternalDocumentId,
+        ts: Timestamp,
+    },
+    #[error(
+        "MySQL V6 index writes with `Overwrite` are unimplemented: index backfill uses \
+         `write_index_backfill`"
+    )]
+    UnsupportedOverwrite,
+    #[error(
+        "MySQL V6 live index write at {ts} supersedes a revision at {prev_ts}, which is not \
+         earlier"
+    )]
+    InvalidPredecessor { ts: Timestamp, prev_ts: Timestamp },
+    #[error("MySQL V6 tombstone for an index key with no previous entry")]
+    MissingPredecessor,
+    #[error("MySQL V6 index write replaces an entry that is not there")]
+    MissingReplacedRow,
+    #[error("MySQL V6 tombstone's own row is not there")]
+    MissingTombstoneRow,
+    #[error("MySQL V6 tombstone for an index key whose previous entry is not there")]
+    MissingDeletedRow,
+    #[error("MySQL V6 index write into log bucket {0}")]
+    LogBucket(i64),
+    #[error("MySQL V6 requires a persistence index ID to write index {0}")]
+    MissingPersistenceIndexId(IndexId),
 }
 
-/// A V6 index key split into a prefix, optional suffix, and suffix hash.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct IndexKey {
-    pub(crate) key_prefix: Vec<u8>,
-    pub(crate) key_suffix: Option<Vec<u8>>,
-    pub(crate) key_suffix_hash: KeySuffixHash,
+#[derive(Default)]
+pub(crate) struct IndexWriteBatch {
+    log_rows: BTreeMap<LogBucket, Vec<LogRow>>,
+    scan_complete_inserts: Vec<IndexRow>,
+    scan_complete_updates: Vec<RowUpdate>,
+    scan_complete_deletes: Vec<IndexRow>,
+    scanning_ops: Vec<ScanningOp>,
 }
 
-impl IndexKey {
-    pub(crate) fn from_key(key: Vec<u8>) -> Self {
-        let SplitKey { prefix, suffix } = SplitKey::new(key);
-        let key_suffix_hash = KeySuffixHash::from_suffix(suffix.as_deref());
-        Self {
-            key_prefix: prefix,
-            key_suffix: suffix,
-            key_suffix_hash,
-        }
-    }
+enum ScanningOp {
+    Live(IndexRow),
+    Tombstone(IndexRow),
 }
 
-/// A ten-minute successor-timestamp bucket used in a V6 log table name.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct LogBucket(i64);
-
-impl LogBucket {
-    pub(crate) fn from_successor_ts(successor_ts: Timestamp) -> Self {
-        Self(i64::from(successor_ts).div_euclid(LOG_BUCKET_SIZE_NANOS))
-    }
-
-    pub(crate) const fn value(self) -> i64 {
-        self.0
-    }
-
-    pub(crate) fn table_name(self) -> String {
-        format!("indexes_log_{}", self.0)
-    }
-
-    pub(crate) fn from_table_name(table_name: &str) -> anyhow::Result<Self> {
-        let bucket = table_name
-            .strip_prefix("indexes_log_")
-            .with_context(|| format!("not a V6 index log table: {table_name}"))?
-            .parse()
-            .with_context(|| format!("V6 index log table has no bucket: {table_name}"))?;
-        Ok(Self(bucket))
-    }
-
-    /// The bucket `buckets` positions after this one. Fallible so that an
-    /// absurd lookahead surfaces as an error rather than a wrapped bucket that
-    /// names a table on the wrong side of the timeline.
-    pub(crate) fn offset(self, buckets: i64) -> anyhow::Result<Self> {
-        let bucket = self
-            .0
-            .checked_add(buckets)
-            .with_context(|| format!("log bucket {} + {buckets} overflows", self.0))?;
-        Ok(Self(bucket))
-    }
-
-    /// The lowest `successor_ts` this bucket holds.
-    pub(crate) fn start_ts(self) -> anyhow::Result<Timestamp> {
-        let nanos = self
-            .0
-            .checked_mul(LOG_BUCKET_SIZE_NANOS)
-            .with_context(|| format!("log bucket {} overflows a timestamp", self.0))?;
-        Timestamp::try_from(nanos)
-    }
-
-    /// One past the highest `successor_ts` this bucket holds, so a snapshot
-    /// read at or after it never needs the bucket.
-    pub(crate) fn end_ts(self) -> anyhow::Result<Timestamp> {
-        self.offset(1)?.start_ts()
-    }
+pub(crate) enum BackfillOp {
+    Live(IndexRow),
+    Tombstone(BackfillMarker),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct IndexRow {
-    pub(crate) deployment_id: DeploymentId,
-    pub(crate) index_id: PersistenceIndexId,
-    pub(crate) key: IndexKey,
-    pub(crate) ts: Timestamp,
-    pub(crate) document_id: InternalDocumentId,
-}
-
-impl IndexRow {
-    /// Parameters for one row of either index table, in column order.
-    /// `successor_ts` is present exactly for log rows, where the column sits
-    /// between `ts` and `table_id`.
-    fn params_with_successor(&self, successor_ts: Option<Timestamp>) -> Vec<Value> {
-        let mut params = vec![
-            self.deployment_id.into(),
-            self.index_id.value().into(),
-            Value::Bytes(self.key.key_prefix.clone()),
-            self.key.key_suffix.clone().into(),
-            self.key.key_suffix_hash.as_bytes().into(),
-            Value::Int(i64::from(self.ts)),
-        ];
-        params.extend(successor_ts.map(|ts| Value::Int(i64::from(ts))));
-        params.extend([
-            Value::Bytes(self.document_id.table().0.into()),
-            Value::Bytes(self.document_id.internal_id().into()),
-        ]);
-        params
-    }
-
-    /// An `IndexRow` is always a live revision, so `deleted` binds false. It is
-    /// bound rather than left to the column default so that a live write
-    /// landing on a tombstone clears it; see `upsert_latest_chunk`.
-    pub(crate) fn params(&self) -> Vec<Value> {
-        let mut params = self.params_with_successor(None);
-        params.push(false.into());
-        params
-    }
-
-    pub(crate) fn delete_params(&self) -> Vec<Value> {
-        vec![
-            self.deployment_id.into(),
-            self.index_id.value().into(),
-            Value::Bytes(self.key.key_prefix.clone()),
-            self.key.key_suffix_hash.as_bytes().into(),
-            self.key.key_suffix.clone().into(),
-            Value::Int(i64::from(self.ts)),
-        ]
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LogRow {
-    pub(crate) row: IndexRow,
-    pub(crate) successor_ts: Timestamp,
-}
-
-impl LogRow {
-    pub(crate) fn params(&self) -> Vec<Value> {
-        self.row.params_with_successor(Some(self.successor_ts))
-    }
-
-    pub(crate) fn bucket(&self) -> LogBucket {
-        LogBucket::from_successor_ts(self.successor_ts)
-    }
-}
-
-/// The key fields used to seek the V6 index primary keys.
-#[derive(Clone)]
-pub(crate) struct SqlKey {
-    pub(crate) prefix: Vec<u8>,
-    pub(crate) suffix_hash: Vec<u8>,
-}
-
-impl SqlKey {
-    fn min_with_same_prefix(key: Vec<u8>) -> Self {
-        let SplitKey { prefix, .. } = SplitKey::new(key);
-        Self {
-            prefix,
-            suffix_hash: vec![],
-        }
-    }
-
-    fn max_with_same_prefix(key: Vec<u8>) -> Self {
-        let SplitKey { prefix, .. } = SplitKey::new(key);
-        Self {
-            prefix,
-            suffix_hash: vec![u8::MAX; 16],
-        }
-    }
-}
-
-/// Converts an index interval into bounds on the V6 primary key. A long-key
-/// prefix can include additional keys, which the caller filters after reading.
-pub(crate) fn to_sql_bounds(interval: Interval) -> (Bound<SqlKey>, Bound<SqlKey>) {
-    let lower = match interval.start {
-        StartIncluded(key) => Bound::Included(SqlKey::min_with_same_prefix(key.into())),
-    };
-    let upper = match interval.end {
-        End::Excluded(key) if key.len() < MAX_INDEX_KEY_PREFIX_LEN => {
-            Bound::Excluded(SqlKey::min_with_same_prefix(key.into()))
-        },
-        End::Excluded(key) => Bound::Included(SqlKey::max_with_same_prefix(key.into())),
-        End::Unbounded => Bound::Unbounded,
-    };
-    (lower, upper)
-}
-
-/// Which end of a scanned range a bound closes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BoundSide {
-    Lower,
-    Upper,
-}
-
-impl BoundSide {
-    /// Admits keys strictly past the bound.
-    const fn exclusive(self) -> &'static str {
+impl BackfillOp {
+    fn latest_primary_key(&self) -> (PersistenceIndexId, &[u8], &[u8]) {
         match self {
-            Self::Lower => ">",
-            Self::Upper => "<",
+            Self::Live(row) => row.latest_primary_key(),
+            Self::Tombstone(marker) => marker.latest_primary_key(),
         }
     }
 
-    /// Also admits keys equal to the bound.
-    const fn inclusive(self) -> &'static str {
+    fn is_tombstone(&self) -> bool {
+        matches!(self, Self::Tombstone(_))
+    }
+
+    fn ts(&self) -> Timestamp {
         match self {
-            Self::Lower => ">=",
-            Self::Upper => "<=",
+            Self::Live(row) => row.ts,
+            Self::Tombstone(marker) => marker.ts,
         }
     }
 }
 
-fn append_bound_clause(
-    clause: &mut String,
-    params: &mut Vec<Value>,
-    bound: &Bound<SqlKey>,
-    side: BoundSide,
-) {
-    let prefix_comparator = side.exclusive();
-    // Only an inclusive bound admits rows whose suffix hash equals the bound's.
-    let (key, hash_comparator) = match bound {
-        Bound::Unbounded => return,
-        Bound::Included(key) => (key, side.inclusive()),
-        Bound::Excluded(key) => (key, prefix_comparator),
-    };
-    write!(
-        clause,
-        " AND (key_prefix {prefix_comparator} ? OR (key_prefix = ? AND key_suffix_hash \
-         {hash_comparator} ?))"
-    )
-    .expect("writing to a String cannot fail");
-    params.extend([
-        Value::Bytes(key.prefix.clone()),
-        Value::Bytes(key.prefix.clone()),
-        Value::Bytes(key.suffix_hash.clone()),
-    ]);
-}
-
-fn index_query_params(
-    deployment_id: DeploymentId,
-    index_id: PersistenceIndexId,
-    read_timestamp: Timestamp,
-    bounds: &[Value],
-    successor_filter: bool,
-) -> Vec<Value> {
-    let mut params = vec![
-        deployment_id.into(),
-        index_id.value().into(),
-        Value::Int(i64::from(read_timestamp)),
-    ];
-    params.extend(bounds.iter().cloned());
-    if successor_filter {
-        params.push(Value::Int(i64::from(read_timestamp)));
+impl ApproxSize for BackfillOp {
+    fn approx_size(&self) -> usize {
+        match self {
+            Self::Live(row) => row.approx_size(),
+            Self::Tombstone(marker) => marker.approx_size(),
+        }
     }
-    params
 }
 
-/// Resolves each index row to its document revision.
-const DOCUMENT_JOIN: &str = r#"LEFT JOIN @db_name.documents D FORCE INDEX FOR JOIN (PRIMARY)
-ON D.deployment_id = U.deployment_id
-    AND D.ts = U.ts
-    AND D.table_id = U.table_id
-    AND D.id = U.document_id"#;
-
-/// Unions one arm per snapshot source: `indexes_latest` plus each log bucket.
-/// `arm` renders an arm from its table expression and the predicate that arm
-/// needs beyond the shared key bounds -- hiding tombstones for the latest
-/// table, restricting to revisions still live at the snapshot for a log bucket.
-/// `arm_params` supplies that arm's parameters, taking whether the successor
-/// predicate is present.
-fn union_arms(
-    log_buckets: &[LogBucket],
-    mut arm: impl FnMut(&str, &str) -> String,
-    mut arm_params: impl FnMut(bool) -> Vec<Value>,
-) -> (String, Vec<Value>) {
-    let mut arms = vec![arm(
-        &format!("{LATEST_TABLE} FORCE INDEX (PRIMARY)"),
-        "AND deleted = false",
-    )];
-    let mut params = arm_params(false);
-    for bucket in log_buckets {
-        arms.push(arm(&bucket.table_name(), "AND successor_ts > ?"));
-        params.extend(arm_params(true));
+impl ScanningOp {
+    fn row(&self) -> &IndexRow {
+        match self {
+            Self::Live(row) | Self::Tombstone(row) => row,
+        }
     }
-    (arms.join("\nUNION ALL\n"), params)
+
+    fn tombstone(&self) -> Option<&IndexRow> {
+        match self {
+            Self::Tombstone(row) => Some(row),
+            Self::Live(_) => None,
+        }
+    }
 }
 
-/// Builds the V6 range query over `indexes_latest` and the supplied log
-/// buckets. The union is duplicate-free because each key has one revision
-/// visible at a snapshot across the latest and log tables.
-///
-/// Rows come back ordered by `key_suffix_hash`, which for keys past the prefix
-/// limit is not the order of the keys themselves. Pagination is consistent --
-/// the cursor is a `(prefix, suffix_hash)` pair in that same order -- but a
-/// caller that needs key order has to buffer each equal-prefix run and sort it
-/// by the reconstructed key, which is what the V6 index scan does.
-pub(crate) fn index_query(
-    deployment_id: DeploymentId,
-    index_id: PersistenceIndexId,
-    read_timestamp: Timestamp,
-    lower: Bound<SqlKey>,
-    upper: Bound<SqlKey>,
-    order: Order,
-    batch_size: usize,
-    log_buckets: &[LogBucket],
-) -> (String, Vec<Value>) {
-    let order = match order {
-        Order::Asc => "ASC",
-        Order::Desc => "DESC",
-    };
-    let mut where_clause = "deployment_id = ? AND index_id = ? AND ts <= ?".to_owned();
-    let mut bounds = vec![];
-    append_bound_clause(&mut where_clause, &mut bounds, &lower, BoundSide::Lower);
-    append_bound_clause(&mut where_clause, &mut bounds, &upper, BoundSide::Upper);
+impl IndexWriteBatch {
+    pub(crate) fn validate_documents(&self, documents: &[DocumentLogEntry]) -> anyhow::Result<()> {
+        // The scan's history check finds displaced revisions through the
+        // commits that made them, so every replaced entry needs the document
+        // revision that replaced it. Only a backfill writes entries alone.
+        let revisions: BTreeSet<_> = documents
+            .iter()
+            .map(|update| (update.ts, update.id))
+            .collect();
+        for (ts, document_id) in self.replacement_commits() {
+            anyhow::ensure!(
+                revisions.contains(&(ts, document_id)),
+                IndexWriteError::MissingDocumentRevision { document_id, ts }
+            );
+        }
+        Ok(())
+    }
 
-    let (arms, params) = union_arms(
-        log_buckets,
-        |table, successor_filter| {
-            format!(
-                r#"(SELECT deployment_id, index_id, key_prefix, key_suffix_hash, key_suffix, ts, table_id, document_id
-FROM @db_name.{table}
-WHERE {where_clause} {successor_filter}
-ORDER BY index_id {order}, key_prefix {order}, key_suffix_hash {order}
-LIMIT {batch_size})"#
-            )
-        },
-        |successor_filter| {
-            index_query_params(
-                deployment_id,
+    /// The commits that moved entries into the log, each as the document
+    /// revision it wrote.
+    pub(crate) fn replacement_commits(
+        &self,
+    ) -> impl Iterator<Item = (Timestamp, InternalDocumentId)> + '_ {
+        self.log_rows
+            .values()
+            .flatten()
+            .map(|row| (row.successor_ts, row.row.document_id))
+    }
+}
+
+pub(crate) struct IndexEngine {
+    deployment_id: PersistenceDeploymentId,
+}
+
+impl IndexEngine {
+    pub(crate) fn new(deployment_id: PersistenceDeploymentId) -> Self {
+        Self { deployment_id }
+    }
+
+    /// `ScanComplete` entries must name their persisted predecessor.
+    /// `Scanning` entries supply history through `prev` while backfill is
+    /// still inserting predecessors.
+    pub(crate) fn plan_index_writes(
+        &self,
+        index_updates: &[PersistenceIndexEntry],
+        conflict_strategy: ConflictStrategy,
+    ) -> anyhow::Result<IndexWriteBatch> {
+        anyhow::ensure!(
+            conflict_strategy == ConflictStrategy::Error || index_updates.is_empty(),
+            IndexWriteError::UnsupportedOverwrite
+        );
+        let mut batch = IndexWriteBatch::default();
+        for update in index_updates {
+            let index_id = persistence_index_id(update.index)?;
+            let key = IndexKey::from_key(update.key.to_vec());
+            let row = |ts, document_id| IndexRow {
+                deployment_id: self.deployment_id,
                 index_id,
-                read_timestamp,
-                &bounds,
-                successor_filter,
+                key: key.clone(),
+                ts,
+                document_id,
+            };
+            if let Some(prev) = update.prev {
+                anyhow::ensure!(
+                    prev.ts < update.ts,
+                    IndexWriteError::InvalidPredecessor {
+                        ts: update.ts,
+                        prev_ts: prev.ts
+                    }
+                );
+                batch
+                    .log_rows
+                    .entry(LogBucket::from_successor_ts(update.ts))
+                    .or_default()
+                    .push(LogRow {
+                        row: row(prev.ts, prev.document_id),
+                        successor_ts: update.ts,
+                    });
+            }
+            match (update.value, update.prev, update.mode) {
+                (Some(document_id), None, IndexWriteMode::ScanComplete) => {
+                    cover!(super::coverage::PLAN_SCAN_COMPLETE_INSERT);
+                    batch
+                        .scan_complete_inserts
+                        .push(row(update.ts, document_id));
+                },
+                (Some(document_id), Some(prev), IndexWriteMode::ScanComplete) => {
+                    cover!(super::coverage::PLAN_SCAN_COMPLETE_UPDATE);
+                    // Same key, so this advances one row in place rather than
+                    // removing and reinserting it.
+                    batch.scan_complete_updates.push(RowUpdate {
+                        row: row(update.ts, document_id),
+                        prev,
+                    });
+                },
+                (None, Some(prev), IndexWriteMode::ScanComplete) => {
+                    cover!(super::coverage::PLAN_SCAN_COMPLETE_DELETE);
+                    batch
+                        .scan_complete_deletes
+                        .push(row(prev.ts, prev.document_id));
+                },
+                (Some(document_id), _, IndexWriteMode::Scanning) => {
+                    cover!(super::coverage::PLAN_SCANNING_LIVE);
+                    batch
+                        .scanning_ops
+                        .push(ScanningOp::Live(row(update.ts, document_id)));
+                },
+                (None, Some(prev), IndexWriteMode::Scanning) => {
+                    cover!(super::coverage::PLAN_SCANNING_TOMBSTONE);
+                    batch
+                        .scanning_ops
+                        .push(ScanningOp::Tombstone(row(update.ts, prev.document_id)));
+                },
+                (None, None, _) => {
+                    anyhow::bail!(IndexWriteError::MissingPredecessor)
+                },
+            }
+        }
+        sort_by_latest_primary_key(&mut batch.scan_complete_inserts, |row| row);
+        sort_by_latest_primary_key(&mut batch.scan_complete_updates, |u| &u.row);
+        sort_by_latest_primary_key(&mut batch.scan_complete_deletes, |row| row);
+        // Stable sorting preserves the last operation for each key.
+        sort_by_latest_primary_key(&mut batch.scanning_ops, ScanningOp::row);
+        Ok(batch)
+    }
+
+    pub(crate) fn plan_backfill_rows(
+        &self,
+        entries: &[IndexBackfillEntry],
+    ) -> anyhow::Result<Vec<BackfillOp>> {
+        let mut rows = entries
+            .iter()
+            .map(|entry| {
+                let index_id = persistence_index_id(entry.index)?;
+                let key = IndexKey::from_key(entry.key.to_vec());
+                Ok(if let Some(document_id) = entry.value {
+                    cover!(super::coverage::BACKFILL_LIVE);
+                    BackfillOp::Live(IndexRow {
+                        deployment_id: self.deployment_id,
+                        index_id,
+                        key,
+                        ts: entry.ts,
+                        document_id,
+                    })
+                } else {
+                    cover!(super::coverage::BACKFILL_MARKER);
+                    BackfillOp::Tombstone(BackfillMarker {
+                        deployment_id: self.deployment_id,
+                        index_id,
+                        key,
+                        ts: entry.ts,
+                    })
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        rows.sort_by(|a, b| {
+            a.latest_primary_key()
+                .cmp(&b.latest_primary_key())
+                .then_with(|| b.is_tombstone().cmp(&a.is_tombstone()))
+                .then_with(|| b.ts().cmp(&a.ts()))
+        });
+        let planned = rows.len();
+        rows.dedup_by(|a, b| {
+            a.latest_primary_key() == b.latest_primary_key() && a.is_tombstone() == b.is_tombstone()
+        });
+        if rows.len() < planned {
+            cover!(super::coverage::BACKFILL_DEDUP);
+        }
+        Ok(rows)
+    }
+
+    pub(crate) async fn write_backfill_chunk(
+        &self,
+        tx: &mut MySqlTransaction<'_>,
+        rows: &[BackfillOp],
+        cluster_name: &str,
+    ) -> anyhow::Result<()> {
+        let markers: Vec<_> = rows
+            .iter()
+            .filter_map(|op| match op {
+                BackfillOp::Tombstone(row) => Some(row),
+                BackfillOp::Live(_) => None,
+            })
+            .collect();
+        for chunk in fill_chunks(&markers) {
+            let timer = metrics::insert_index_chunk_timer(cluster_name);
+            async {
+                tx.query_drop(
+                    &sql::insert_backfill_marker_chunk(chunk.len()),
+                    chunk.iter().flat_map(|marker| marker.params()).collect(),
+                )
+                .await
+            }
+            .in_span(chunk_span("backfill_marker_chunk_write", chunk))
+            .await?;
+            timer.finish();
+        }
+        let live: Vec<_> = rows
+            .iter()
+            .filter_map(|op| match op {
+                BackfillOp::Live(row) => Some(row.clone()),
+                BackfillOp::Tombstone(_) => None,
+            })
+            .collect();
+        if live.is_empty() {
+            return Ok(());
+        }
+        self.write_latest_chunk(
+            tx,
+            &live,
+            sql::insert_backfill_latest_chunk,
+            "backfill_chunk_write",
+            cluster_name,
+        )
+        .await
+    }
+
+    pub(crate) async fn write_index_batch(
+        &self,
+        tx: &mut MySqlTransaction<'_>,
+        batch: &IndexWriteBatch,
+        cluster_name: &str,
+    ) -> anyhow::Result<()> {
+        self.update_exact(tx, &batch.scan_complete_updates, cluster_name)
+            .await?;
+        let markers: Vec<&IndexRow> = batch
+            .scanning_ops
+            .iter()
+            .filter_map(ScanningOp::tombstone)
+            .collect();
+        for chunk in fill_chunks(&markers) {
+            let timer = metrics::insert_index_chunk_timer(cluster_name);
+            async {
+                tx.query_drop(
+                    &sql::insert_backfill_marker_chunk(chunk.len()),
+                    chunk
+                        .iter()
+                        .flat_map(|row| row.backfill_marker_params())
+                        .collect(),
+                )
+                .await
+            }
+            .in_span(chunk_span("marker_chunk_write", chunk))
+            .await?;
+            timer.finish();
+        }
+        // Upserting tombstones before deleting them makes every `Scanning`
+        // operation acquire its record lock in primary-key order.
+        let scanning: Vec<IndexRow> = batch
+            .scanning_ops
+            .iter()
+            .map(|op| op.row().clone())
+            .collect();
+        for chunk in fill_chunks(&scanning) {
+            self.write_latest_chunk(
+                tx,
+                chunk,
+                sql::upsert_latest_chunk,
+                "upsert_chunk_write",
+                cluster_name,
             )
-        },
-    );
-    (
-        format!(
-            r#"
-SELECT U.index_id, U.key_prefix, U.key_suffix_hash, U.key_suffix, U.ts, U.table_id, U.document_id, D.json_value, D.prev_ts
-FROM (
-{arms}
-) U
-{DOCUMENT_JOIN}
-ORDER BY U.key_prefix {order}, U.key_suffix_hash {order}
-LIMIT {batch_size}
-"#
-        ),
-        params,
-    )
+            .await?;
+        }
+        let tombstones: Vec<IndexRow> = batch
+            .scanning_ops
+            .chunk_by(|a, b| a.row().latest_primary_key() == b.row().latest_primary_key())
+            .filter_map(|key_ops| key_ops.last()?.tombstone())
+            .cloned()
+            .collect();
+        self.delete_exact(
+            tx,
+            &tombstones,
+            IndexWriteError::MissingTombstoneRow,
+            "tombstone_chunk_write",
+            cluster_name,
+        )
+        .await?;
+        for (bucket, rows) in &batch.log_rows {
+            for chunk in fill_chunks(rows) {
+                let timer = metrics::insert_index_chunk_timer(cluster_name);
+                async {
+                    tx.query_drop(
+                        &sql::insert_log_chunk(*bucket, chunk.len()),
+                        chunk.iter().flat_map(LogRow::params).collect(),
+                    )
+                    .await
+                    .context(IndexWriteError::LogBucket(bucket.value()))
+                }
+                .in_span(chunk_span("log_chunk_write", chunk))
+                .await?;
+                timer.finish();
+            }
+        }
+        for chunk in fill_chunks(&batch.scan_complete_inserts) {
+            self.write_latest_chunk(
+                tx,
+                chunk,
+                sql::insert_latest_chunk,
+                "insert_chunk_write",
+                cluster_name,
+            )
+            .await?;
+        }
+        self.delete_exact(
+            tx,
+            &batch.scan_complete_deletes,
+            IndexWriteError::MissingDeletedRow,
+            "delete_chunk_write",
+            cluster_name,
+        )
+        .await
+    }
+
+    pub(crate) async fn read_backfill_markers_page<RT: Runtime>(
+        &self,
+        connection: &mut MySqlConnection<'_, RT>,
+        index: PersistenceIndexId,
+        after: Bound<SqlKey>,
+    ) -> anyhow::Result<Vec<BackfillDelete>> {
+        let (query, params) = sql::backfill_markers_page(
+            self.deployment_id,
+            index,
+            after,
+            *INDEX_RETENTION_DELETE_CHUNK,
+        );
+        let deployment_id = self.deployment_id;
+        connection
+            .query_collect(&query, params, *INDEX_RETENTION_DELETE_CHUNK, move |row| {
+                BackfillDelete::from_row(deployment_id, index, &row)
+            })
+            .await
+    }
+
+    pub(crate) async fn delete_stale(
+        &self,
+        tx: &mut MySqlTransaction<'_>,
+        deletes: &[BackfillDelete],
+        cluster_name: &str,
+    ) -> anyhow::Result<()> {
+        for chunk in fill_chunks(deletes) {
+            let timer = metrics::insert_index_chunk_timer(cluster_name);
+            let deleted = async {
+                tx.query_iter(
+                    &sql::delete_stale_chunk(chunk.len()),
+                    chunk.iter().flat_map(BackfillDelete::params).collect(),
+                )
+                .await
+            }
+            .in_span(chunk_span("reconcile_chunk_write", chunk))
+            .await?;
+            if deleted > 0 {
+                cover!(super::coverage::RECONCILE_DELETED_STALE);
+            }
+            timer.finish();
+        }
+        Ok(())
+    }
+
+    async fn write_latest_chunk(
+        &self,
+        tx: &mut MySqlTransaction<'_>,
+        rows: &[IndexRow],
+        chunk_sql: fn(usize) -> String,
+        span_kind: &str,
+        cluster_name: &str,
+    ) -> anyhow::Result<()> {
+        let timer = metrics::insert_index_chunk_timer(cluster_name);
+        async {
+            tx.query_drop(
+                &chunk_sql(rows.len()),
+                rows.iter().flat_map(IndexRow::params).collect(),
+            )
+            .await
+        }
+        .in_span(chunk_span(span_kind, rows))
+        .await?;
+        timer.finish();
+        Ok(())
+    }
+
+    /// Advances each live entry to its next revision, refusing the batch if any
+    /// row's stored predecessor is not the one named.
+    async fn update_exact(
+        &self,
+        tx: &mut MySqlTransaction<'_>,
+        rows: &[RowUpdate],
+        cluster_name: &str,
+    ) -> anyhow::Result<()> {
+        for chunk in fill_chunks(rows) {
+            let timer = metrics::insert_index_chunk_timer(cluster_name);
+            let mut params: Vec<Value> = chunk.iter().flat_map(RowUpdate::params).collect();
+            params.push(self.deployment_id.into());
+            let affected = async {
+                tx.query_iter(&sql::update_latest_chunk(chunk.len()), params)
+                    .await
+            }
+            .in_span(chunk_span("update_chunk_write", chunk))
+            .await?;
+            anyhow::ensure!(
+                affected == chunk.len() as u64,
+                IndexWriteError::MissingReplacedRow
+            );
+            timer.finish();
+        }
+        Ok(())
+    }
+
+    async fn delete_exact(
+        &self,
+        tx: &mut MySqlTransaction<'_>,
+        rows: &[IndexRow],
+        missing: IndexWriteError,
+        span_kind: &str,
+        cluster_name: &str,
+    ) -> anyhow::Result<()> {
+        for chunk in fill_chunks(rows) {
+            let timer = metrics::insert_index_chunk_timer(cluster_name);
+            let affected = async {
+                tx.query_iter(
+                    &sql::delete_latest_chunk(chunk.len()),
+                    chunk.iter().flat_map(IndexRow::delete_params).collect(),
+                )
+                .await
+            }
+            .in_span(chunk_span(span_kind, chunk))
+            .await?;
+            anyhow::ensure!(affected == chunk.len() as u64, missing);
+            timer.finish();
+        }
+        Ok(())
+    }
 }
 
-/// `deleted` trails the columns the log tables share, which have no such
-/// column. Updating it alongside the rest is what lets a newer live revision
-/// take over a key that is currently a tombstone.
-pub(crate) fn upsert_latest_chunk(chunk_size: usize) -> String {
-    let values = iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?)", chunk_size).join(", ");
-    format!(
-        r#"INSERT INTO @db_name.indexes_latest
-    (deployment_id, index_id, key_prefix, key_suffix, key_suffix_hash, ts, table_id, document_id, deleted)
-    VALUES {values}
-    ON DUPLICATE KEY UPDATE
-    key_suffix = IF(VALUES(ts) > ts, VALUES(key_suffix), key_suffix),
-    table_id = IF(VALUES(ts) > ts, VALUES(table_id), table_id),
-    document_id = IF(VALUES(ts) > ts, VALUES(document_id), document_id),
-    deleted = IF(VALUES(ts) > ts, VALUES(deleted), deleted),
-    ts = IF(VALUES(ts) > ts, VALUES(ts), ts)"#
-    )
+fn persistence_index_id(index: IndexRef) -> anyhow::Result<PersistenceIndexId> {
+    index
+        .persistence_index_id()
+        .context(IndexWriteError::MissingPersistenceIndexId(index.id()))
 }
 
-pub(crate) fn insert_log_chunk(bucket: LogBucket, chunk_size: usize) -> String {
-    let values = iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?)", chunk_size).join(", ");
-    format!(
-        r#"INSERT INTO @db_name.{}
-    (deployment_id, index_id, key_prefix, key_suffix, key_suffix_hash, ts, successor_ts, table_id, document_id)
-    VALUES {values}
-    ON DUPLICATE KEY UPDATE successor_ts = VALUES(successor_ts)"#,
-        bucket.table_name()
-    )
+fn chunk_span(kind: &str, rows: &[impl ApproxSize]) -> Span {
+    Span::enter_with_local_parent(format!("write_index_batch::{kind}")).with_properties(|| {
+        [
+            ("chunk_length", rows.len().to_string()),
+            (
+                "chunk_bytes",
+                rows.iter()
+                    .map(ApproxSize::approx_size)
+                    .sum::<usize>()
+                    .to_string(),
+            ),
+        ]
+    })
 }
 
-pub(crate) fn delete_latest_chunk(chunk_size: usize) -> String {
-    let predicates = iter::repeat_n(
-        "(deployment_id = ? AND index_id = ? AND key_prefix = ? AND key_suffix_hash = ? AND \
-         key_suffix <=> ? AND ts <= ?)",
-        chunk_size,
-    )
-    .join(" OR ");
-    format!("DELETE FROM @db_name.indexes_latest WHERE {predicates}")
-}
-
-pub(crate) fn drop_log_ddl(bucket: LogBucket) -> String {
-    format!("DROP TABLE IF EXISTS @db_name.{}", bucket.table_name())
-}
-
-pub(crate) fn log_ddl(bucket: LogBucket) -> String {
-    format!(
-        r#"
-CREATE TABLE IF NOT EXISTS @db_name.{} (
-    deployment_id INT UNSIGNED NOT NULL,
-    index_id INT UNSIGNED NOT NULL,
-    key_prefix VARBINARY(2500) NOT NULL,
-    key_suffix LONGBLOB NULL,
-    key_suffix_hash VARBINARY(16) NOT NULL,
-    ts BIGINT NOT NULL,
-    successor_ts BIGINT NOT NULL,
-    table_id BINARY(16) NULL,
-    document_id BINARY(16) NULL,
-    PRIMARY KEY (deployment_id, index_id, key_prefix, key_suffix_hash, ts),
-    INDEX indexes_log_by_successor_ts (deployment_id, index_id, successor_ts)
-) ROW_FORMAT=DYNAMIC PARTITION BY KEY(index_id) PARTITIONS 16;
-"#,
-        bucket.table_name()
-    )
+pub(crate) async fn list_log_buckets<RT: Runtime>(
+    connection: &mut MySqlConnection<'_, RT>,
+    db_name: &str,
+) -> anyhow::Result<BTreeSet<LogBucket>> {
+    let buckets = connection
+        .query_collect(
+            sql::LIST_LOG_TABLES,
+            vec![Value::Bytes(db_name.as_bytes().to_vec())],
+            16,
+            |row| {
+                let table_name: String = row.get_opt(0).context("row[0]")??;
+                LogBucket::from_table_name(&table_name)
+            },
+        )
+        .await?;
+    Ok(buckets.into_iter().collect())
 }

@@ -1,5 +1,4 @@
 import { BusinessPlanSummary } from "components/billing/PlanSummary";
-import { useLaunchDarkly } from "hooks/useLaunchDarkly";
 import { Sheet } from "@ui/Sheet";
 import { Spinner } from "@ui/Spinner";
 import { Button } from "@ui/Button";
@@ -13,7 +12,8 @@ import { useTeamEntitlements } from "api/teams";
 import { NoPermissionMessage } from "elements/NoPermissionMessage";
 import { TEAM_RESOURCE } from "lib/permissions";
 import { useProjectById, useProjectBySlug } from "api/projects";
-import { useTeamOrbSubscription } from "api/billing";
+import { useTeamOrbSubscription, useTeamPrices } from "api/billing";
+import { getUsagePricing } from "./lib/usagePrices";
 import groupBy from "lodash/groupBy";
 import sumBy from "lodash/sumBy";
 import { Period } from "elements/UsagePeriodSelector";
@@ -208,6 +208,8 @@ function TeamUsageContents({ team }: { team: TeamResponse }) {
       : null;
 
   const { subscription } = useTeamOrbSubscription(team?.id);
+  const prices = useTeamPrices(team.id);
+  const pricing = getUsagePricing(prices, shownBillingPeriod);
 
   const isBusinessPlanType = subscription?.plan.planType === "CONVEX_BUSINESS";
 
@@ -238,8 +240,6 @@ function TeamUsageContents({ team }: { team: TeamResponse }) {
     projectId,
     componentPrefix,
   );
-
-  const { showAiGatewayUsage } = useLaunchDarkly();
 
   const entitlements = useTeamEntitlements(team?.id);
 
@@ -324,8 +324,11 @@ function TeamUsageContents({ team }: { team: TeamResponse }) {
                 <BusinessPlanSummary
                   summary={summary}
                   error={summaryError}
+                  pricing={pricing}
+                  spendApplicable={
+                    !query.projectSlug && projectId === null && !componentPrefix
+                  }
                   aiGatewayCost={aiGatewayCost}
-                  showAiGatewayUsage={showAiGatewayUsage}
                   aiGatewayCostError={aiGatewayCostError}
                   isBusinessPlan={isBusinessPlanType}
                   entitlements={entitlements}
@@ -454,7 +457,7 @@ function TeamUsageContents({ team }: { team: TeamResponse }) {
                   />
                 )}
 
-                {section === "aiGatewayCost" && showAiGatewayUsage && (
+                {section === "aiGatewayCost" && (
                   <AiGatewayCostUsage
                     team={team}
                     dateRange={dateRange}

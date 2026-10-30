@@ -1,6 +1,9 @@
-use std::collections::{
-    BTreeMap,
-    BTreeSet,
+use std::{
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    net::Ipv4Addr,
 };
 
 use anyhow::Context;
@@ -27,9 +30,17 @@ use common::{
         LogEventFormatVersion,
         LogTopic,
     },
+    types::streaming_export::selection::{
+        ColumnSelection,
+        ComponentSelection,
+        InclusionDefault,
+        Selection,
+        TableSelection,
+    },
 };
 use errors::ErrorMetadata;
 use http::StatusCode;
+use keybroker::Identity;
 use model::log_sinks::types::{
     axiom::{
         AxiomAttribute,
@@ -42,6 +53,11 @@ use model::log_sinks::types::{
     },
     posthog_error_tracking::PostHogErrorTrackingConfig,
     posthog_logs::PostHogLogsConfig,
+    s3_export::{
+        S3ExportConfig,
+        S3ExportCredentials,
+        SyncPeriod,
+    },
     sentry::{
         ExceptionFormatVersion,
         SentryConfig,
@@ -193,6 +209,35 @@ impl From<LogStreamType> for SinkType {
     }
 }
 
+/// Analytics export destinations are gated on the streaming export entitlement;
+/// every other sink type streams logs and is gated on log streaming.
+async fn ensure_integration_allowed(
+    application: &Application<ProdRuntime>,
+    identity: &Identity,
+    sink_type: &SinkType,
+) -> anyhow::Result<()> {
+    match sink_type {
+        SinkType::S3Export => {
+            application
+                .ensure_streaming_export_enabled(identity.clone())
+                .await
+        },
+        SinkType::Local
+        | SinkType::Datadog
+        | SinkType::DatadogV2
+        | SinkType::Webhook
+        | SinkType::Axiom
+        | SinkType::AxiomV2
+        | SinkType::Sentry
+        | SinkType::PostHogLogs
+        | SinkType::PostHogErrorTracking => {
+            application
+                .ensure_log_streaming_allowed(identity.clone())
+                .await
+        },
+    }
+}
+
 /// Delete log stream
 ///
 /// Delete the deployment's log stream with the given id.
@@ -218,9 +263,8 @@ pub async fn delete_log_stream(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     identity.require_operation(keybroker::DeploymentOp::WriteIntegrations)?;
-    st.application
-        .ensure_log_streaming_allowed(identity.clone())
-        .await?;
+    let sink = st.application.must_get_log_sink_by_id(&id).await?;
+    ensure_integration_allowed(&st.application, &identity, &sink.config.sink_type()).await?;
 
     st.application
         .remove_log_sink_by_id(identity, request_metadata, id)
@@ -401,6 +445,182 @@ impl TryFrom<CreatePostHogErrorTrackingLogStreamArgs> for PostHogErrorTrackingCo
     }
 }
 
+/// Reserved by AWS for bucket names.
+const S3_RESERVED_BUCKET_PREFIXES: [&str; 2] = ["xn--", "sthree-"];
+const S3_RESERVED_BUCKET_SUFFIXES: [&str; 2] = ["-s3alias", "--ol-s3"];
+
+// Changing field filters would require re-exporting documents that the cursor
+// has already passed. Table selection changes are handled by the iterator.
+fn validate_s3_selection(selection: &Selection) -> anyhow::Result<()> {
+    let filters_fields = selection
+        .components
+        .values()
+        .any(|component| match component {
+            ComponentSelection::Included { tables, .. } => tables.values().any(|table| {
+                matches!(table, TableSelection::Included { columns, other_columns }
+                if *other_columns == InclusionDefault::Excluded
+                    || columns.values().any(|c| *c == ColumnSelection::Excluded))
+            }),
+            ComponentSelection::Excluded(_) => false,
+        });
+    anyhow::ensure!(
+        !filters_fields,
+        ErrorMetadata::bad_request(
+            "FieldFiltersUnsupported",
+            "S3 exports can't filter fields within a table yet. Select whole tables instead.",
+        )
+    );
+    Ok(())
+}
+
+// Resuming a cursor in a different destination would skip all previously
+// exported pages. `/` and `None` address the same S3 directory, so an update
+// that only respells the prefix keeps the stored one.
+fn ensure_same_s3_destination(
+    existing: &S3ExportConfig,
+    updated: S3ExportConfig,
+) -> anyhow::Result<S3ExportConfig> {
+    let trimmed = |prefix: &Option<String>| {
+        prefix
+            .as_deref()
+            .unwrap_or_default()
+            .trim_matches('/')
+            .to_owned()
+    };
+    let updated = if trimmed(&existing.prefix) == trimmed(&updated.prefix) {
+        S3ExportConfig {
+            prefix: existing.prefix.clone(),
+            ..updated
+        }
+    } else {
+        updated
+    };
+    anyhow::ensure!(
+        !existing.requires_resync(&updated),
+        ErrorMetadata::bad_request(
+            "S3ExportDestinationChanged",
+            "An S3 export's bucket, region, prefix, and credential type can't change. Delete the \
+             export and create a new one instead.",
+        )
+    );
+    Ok(updated)
+}
+
+// The prefix lands in IAM policy resource ARNs, where `*` and `?` are wildcards
+// and `$` starts a policy variable.
+fn validate_s3_prefix(prefix: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !prefix.contains(['*', '?', '$']),
+        ErrorMetadata::bad_request(
+            "InvalidS3Prefix",
+            "Prefixes may not contain `*`, `?` or `$`",
+        )
+    );
+    Ok(())
+}
+
+fn validate_s3_region(region: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (1..=63).contains(&region.len()),
+        ErrorMetadata::bad_request("InvalidS3Region", "Region must be between 1 and 63 bytes")
+    );
+    Ok(())
+}
+
+fn validate_s3_bucket(bucket: &str) -> anyhow::Result<()> {
+    // https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html
+    let is_lower_alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let valid = (3..=63).contains(&bucket.len())
+        && bucket
+            .chars()
+            .all(|c| is_lower_alnum(c) || c == '-' || c == '.')
+        && bucket.starts_with(is_lower_alnum)
+        && bucket.ends_with(is_lower_alnum)
+        && !bucket.contains("..")
+        && bucket.parse::<Ipv4Addr>().is_err()
+        && !S3_RESERVED_BUCKET_PREFIXES
+            .iter()
+            .any(|prefix| bucket.starts_with(prefix))
+        && !S3_RESERVED_BUCKET_SUFFIXES
+            .iter()
+            .any(|suffix| bucket.ends_with(suffix));
+    if !valid {
+        anyhow::bail!(ErrorMetadata::bad_request(
+            "InvalidS3Bucket",
+            format!("`{bucket}` is not a valid S3 bucket name"),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateS3ExportLogStreamArgs {
+    /// Name of the S3 bucket to mirror into.
+    bucket: String,
+    /// AWS region the bucket lives in, e.g. `us-east-1`.
+    region: String,
+    /// Key prefix within the bucket. Omit to write at the bucket root.
+    #[serde(default)]
+    prefix: Option<String>,
+    /// Access key of an IAM user that can write to the bucket. Send both key
+    /// fields, or `roleArn` instead.
+    // TODO(ENG-11116): drop the access key fields once existing exports have
+    // moved to roles, so an export authenticates with a role only.
+    #[serde(default)]
+    access_key_id: Option<String>,
+    #[serde(default)]
+    secret_access_key: Option<String>,
+    /// ARN of a role in the bucket's account that Convex assumes to write.
+    /// Send an empty string to create the export first: the response carries
+    /// the `roleExternalId` the role's trust policy needs, and the export waits
+    /// until an update supplies the ARN.
+    #[serde(default)]
+    role_arn: Option<String>,
+    /// The components and tables to export. Defaults to everything. Each table
+    /// exports whole documents, so filtering fields within a table is rejected.
+    #[serde(default)]
+    selection: Option<Selection>,
+    /// How often the mirror is refreshed.
+    period: SyncPeriod,
+}
+
+impl TryFrom<CreateS3ExportLogStreamArgs> for S3ExportConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(value: CreateS3ExportLogStreamArgs) -> Result<Self, Self::Error> {
+        validate_s3_bucket(&value.bucket)?;
+        validate_s3_region(&value.region)?;
+        validate_s3_prefix(value.prefix.as_deref().unwrap_or_default())?;
+        let selection = value.selection.unwrap_or_default();
+        validate_s3_selection(&selection)?;
+        let credentials = match (value.access_key_id, value.secret_access_key, value.role_arn) {
+            (Some(access_key_id), Some(secret_access_key), None) => {
+                S3ExportCredentials::AccessKey {
+                    access_key_id: access_key_id.into(),
+                    secret_access_key: secret_access_key.into(),
+                }
+            },
+            (None, None, Some(role_arn)) => S3ExportCredentials::Role {
+                role_arn,
+                external_id: S3ExportCredentials::new_external_id(),
+            },
+            _ => anyhow::bail!(ErrorMetadata::bad_request(
+                "S3ExportCredentialsRequired",
+                "Send `accessKeyId` with `secretAccessKey`, or `roleArn` on its own.",
+            )),
+        };
+        Ok(Self {
+            bucket: value.bucket,
+            region: value.region,
+            prefix: value.prefix,
+            credentials,
+            selection,
+            period: value.period,
+        })
+    }
+}
+
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", tag = "logStreamType")]
 pub enum CreateLogStreamArgs {
@@ -416,6 +636,22 @@ pub enum CreateLogStreamArgs {
     PostHogLogs(CreatePostHogLogsLogStreamArgs),
     #[schema(title = "PostHogErrorTracking")]
     PostHogErrorTracking(CreatePostHogErrorTrackingLogStreamArgs),
+    #[schema(title = "S3Export")]
+    S3Export(CreateS3ExportLogStreamArgs),
+}
+
+impl CreateLogStreamArgs {
+    fn sink_type(&self) -> SinkType {
+        match self {
+            Self::Datadog(_) => SinkType::Datadog,
+            Self::Webhook(_) => SinkType::Webhook,
+            Self::Axiom(_) => SinkType::Axiom,
+            Self::Sentry(_) => SinkType::Sentry,
+            Self::PostHogLogs(_) => SinkType::PostHogLogs,
+            Self::PostHogErrorTracking(_) => SinkType::PostHogErrorTracking,
+            Self::S3Export(_) => SinkType::S3Export,
+        }
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -441,6 +677,15 @@ pub enum CreateLogStreamResponse {
     PostHogLogs { id: String },
     #[schema(title = "PostHogErrorTracking")]
     PostHogErrorTracking { id: String },
+    #[schema(title = "S3Export")]
+    #[serde(rename_all = "camelCase")]
+    S3Export {
+        id: String,
+        /// Set for role exports. The role's trust policy must require it as
+        /// `sts:ExternalId`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        role_external_id: Option<String>,
+    },
 }
 
 async fn ensure_log_sink_does_not_exist(
@@ -480,9 +725,10 @@ pub async fn create_log_stream(
     Json(args): Json<CreateLogStreamArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     identity.require_operation(keybroker::DeploymentOp::WriteIntegrations)?;
-    st.application
-        .ensure_log_streaming_allowed(identity.clone())
-        .await?;
+    if matches!(&args, CreateLogStreamArgs::S3Export(_)) {
+        identity.require_operation(keybroker::DeploymentOp::ViewData)?;
+    }
+    ensure_integration_allowed(&st.application, &identity, &args.sink_type()).await?;
 
     match args {
         CreateLogStreamArgs::Datadog(datadog_sink_post_args) => {
@@ -610,6 +856,27 @@ pub async fn create_log_stream(
                 id: id.to_string(),
             }))
         },
+        CreateLogStreamArgs::S3Export(args) => {
+            ensure_log_sink_does_not_exist(&st.application, &SinkType::S3Export).await?;
+
+            let config: S3ExportConfig = args.try_into()?;
+            let role_external_id = match &config.credentials {
+                S3ExportCredentials::Role { external_id, .. } => Some(external_id.clone()),
+                S3ExportCredentials::AccessKey { .. } => None,
+            };
+            let id = st
+                .application
+                .add_log_sink(
+                    identity.clone(),
+                    request_metadata.clone(),
+                    SinkConfig::S3Export(config),
+                )
+                .await?;
+            Ok(Json(CreateLogStreamResponse::S3Export {
+                id: id.to_string(),
+                role_external_id,
+            }))
+        },
     }
 }
 
@@ -700,6 +967,8 @@ enum LogStreamConfig {
     PostHogLogs(PostHogLogsLogStreamConfig),
     #[schema(title = "PostHogErrorTracking")]
     PostHogErrorTracking(PostHogErrorTrackingLogStreamConfig),
+    #[schema(title = "S3Export")]
+    S3Export(S3ExportLogStreamConfig),
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -803,6 +1072,37 @@ pub struct PostHogErrorTrackingLogStreamConfig {
     pub host: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+#[schema(title = "S3ExportConfig")]
+pub struct S3ExportLogStreamConfig {
+    pub id: String,
+    /// Status of the integration
+    pub status: LogStreamStatus,
+    /// Name of the S3 bucket being mirrored into.
+    pub bucket: String,
+    /// AWS region the bucket lives in.
+    pub region: String,
+    /// Key prefix within the bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// AWS access key ID used to write to the bucket. The matching secret
+    /// access key is write-only and is never returned. Absent for role exports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    /// ARN of the role Convex assumes to write. Empty until the admin pastes
+    /// it. Absent for access-key exports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role_arn: Option<String>,
+    /// Value the role's trust policy must require as `sts:ExternalId`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role_external_id: Option<String>,
+    /// The components and tables being exported.
+    pub selection: Selection,
+    /// How often the mirror is refreshed.
+    pub period: SyncPeriod,
+}
+
 fn log_sink_to_log_stream_config(sink: LogSinkWithId) -> Option<LogStreamConfig> {
     let status: LogStreamStatus =
         Into::<model::log_sinks::types::SerializedSinkState>::into(sink.status).into();
@@ -854,6 +1154,29 @@ fn log_sink_to_log_stream_config(sink: LogSinkWithId) -> Option<LogStreamConfig>
                 host: config.host,
             },
         )),
+        SinkConfig::S3Export(config) => {
+            let (access_key_id, role_arn, role_external_id) = match config.credentials {
+                S3ExportCredentials::AccessKey { access_key_id, .. } => {
+                    (Some(access_key_id.into_value()), None, None)
+                },
+                S3ExportCredentials::Role {
+                    role_arn,
+                    external_id,
+                } => (None, Some(role_arn), Some(external_id)),
+            };
+            Some(LogStreamConfig::S3Export(S3ExportLogStreamConfig {
+                id: sink.id.to_string(),
+                status,
+                bucket: config.bucket,
+                region: config.region,
+                prefix: config.prefix,
+                access_key_id,
+                role_arn,
+                role_external_id,
+                selection: config.selection,
+                period: config.period,
+            }))
+        },
         _ => None,
     }
 }
@@ -1031,6 +1354,26 @@ pub struct UpdatePostHogErrorTrackingSinkArgs {
     host: Option<Option<String>>,
 }
 
+/// Destination and AWS access key ID are fixed at creation.
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateS3ExportSinkArgs {
+    /// A new secret for the export's access key ID. Access-key exports only.
+    #[serde(default)]
+    secret_access_key: Option<String>,
+    /// The role ARN from the customer's stack. Role exports only; sets or
+    /// replaces the ARN, within the same AWS account.
+    #[serde(default)]
+    role_arn: Option<String>,
+    /// The components and tables to export. Each table exports whole
+    /// documents, so filtering fields within a table is rejected.
+    #[serde(default)]
+    selection: Option<Selection>,
+    /// How often the mirror is refreshed.
+    #[serde(default)]
+    period: Option<SyncPeriod>,
+}
+
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", tag = "logStreamType")]
 pub enum UpdateLogStreamArgs {
@@ -1046,6 +1389,8 @@ pub enum UpdateLogStreamArgs {
     PostHogLogs(UpdatePostHogLogsSinkArgs),
     #[schema(title = "PostHogErrorTracking")]
     PostHogErrorTracking(UpdatePostHogErrorTrackingSinkArgs),
+    #[schema(title = "S3Export")]
+    S3Export(UpdateS3ExportSinkArgs),
 }
 
 /// Update log stream
@@ -1075,14 +1420,15 @@ pub async fn update_log_stream(
     Json(args): Json<UpdateLogStreamArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     identity.require_operation(keybroker::DeploymentOp::WriteIntegrations)?;
-    st.application
-        .ensure_log_streaming_allowed(identity.clone())
-        .await?;
 
     let LogSinkWithId {
         config: sink_config,
         ..
     } = st.application.must_get_log_sink_by_id(&id).await?;
+    if matches!(&sink_config, SinkConfig::S3Export(_)) {
+        identity.require_operation(keybroker::DeploymentOp::ViewData)?;
+    }
+    ensure_integration_allowed(&st.application, &identity, &sink_config.sink_type()).await?;
 
     match sink_config {
         SinkConfig::Datadog(existing_config) => {
@@ -1314,6 +1660,71 @@ pub async fn update_log_stream(
                     SinkConfig::PostHogErrorTracking(config),
                 )
                 .await?;
+        },
+        SinkConfig::S3Export(existing_config) => {
+            let UpdateLogStreamArgs::S3Export(update_args) = args else {
+                return Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+                    "LogStreamTypeMismatch",
+                    "Cannot update an S3 export integration with arguments for a different \
+                     integration type",
+                ))
+                .into());
+            };
+
+            if let Some(selection) = &update_args.selection {
+                validate_s3_selection(selection)?;
+            }
+            let credentials = match (
+                existing_config.credentials.clone(),
+                update_args.secret_access_key,
+                update_args.role_arn,
+            ) {
+                (credentials, None, None) => credentials,
+                (S3ExportCredentials::AccessKey { access_key_id, .. }, Some(secret), None) => {
+                    S3ExportCredentials::AccessKey {
+                        access_key_id,
+                        secret_access_key: secret.into(),
+                    }
+                },
+                (S3ExportCredentials::Role { external_id, .. }, None, Some(role_arn)) => {
+                    S3ExportCredentials::Role {
+                        role_arn,
+                        external_id,
+                    }
+                },
+                _ => {
+                    return Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+                        "S3ExportCredentialTypeMismatch",
+                        "Send `secretAccessKey` for an access-key export or `roleArn` for a role \
+                         export, not the other.",
+                    ))
+                    .into());
+                },
+            };
+            let config = S3ExportConfig {
+                credentials,
+                selection: update_args
+                    .selection
+                    .unwrap_or(existing_config.selection.clone()),
+                period: update_args.period.unwrap_or(existing_config.period),
+                ..existing_config.clone()
+            };
+            let config = ensure_same_s3_destination(&existing_config, config)?;
+            // The S3 export worker, not the log manager, sets this status: a
+            // failure stays Failed until a page lands. New credentials start
+            // over at Pending; other edits keep the status, so a tables-only
+            // edit cannot hide a failure.
+            let credentials_changed = config.credentials != existing_config.credentials;
+            st.application
+                .patch_log_sink_config_and_status(
+                    identity.clone(),
+                    request_metadata.clone(),
+                    &id,
+                    SinkConfig::S3Export(config),
+                    credentials_changed,
+                )
+                .await?;
+            return Ok(StatusCode::OK);
         },
         _ => {
             return Err(anyhow::anyhow!(ErrorMetadata::bad_request(

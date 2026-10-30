@@ -1,3 +1,5 @@
+import { syncSelection, syncPeriod } from "./tableDefs/streamingExport";
+export { syncSelection } from "./tableDefs/streamingExport";
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 import deploymentAuditLogTable, {
@@ -196,6 +198,7 @@ export const logTopic = v.union(
   v.literal("current_storage_usage"),
   v.literal("concurrency_stats"),
   v.literal("storage_api_bandwidth"),
+  v.literal("ai_gateway_usage"),
   v.literal("log_stream_egress"),
   v.literal("custom_audit"),
 );
@@ -265,6 +268,36 @@ export const postHogErrorTrackingConfig = v.object({
   host: v.optional(v.string()),
 });
 
+const s3ExportProgress = v.union(
+  v.object({
+    type: v.literal("snapshotting"),
+    numTablesSynced: v.int64(),
+    totalTables: v.int64(),
+    currentComponent: v.string(),
+    currentTable: v.string(),
+    numDocumentsInCurrentTable: v.int64(),
+    totalDocumentsInCurrentTable: v.union(v.int64(), v.null()),
+    numDocumentsSynced: v.int64(),
+    totalDocuments: v.union(v.int64(), v.null()),
+  }),
+  v.object({ type: v.literal("stale"), ts: v.int64() }),
+  v.object({ type: v.literal("upToDate"), ts: v.int64() }),
+);
+
+export const s3ExportConfig = v.object({
+  type: v.literal("s3Export"),
+  bucket: v.string(),
+  region: v.string(),
+  prefix: v.optional(v.string()),
+  accessKeyId: v.optional(v.string()),
+  secretAccessKey: v.optional(v.string()),
+  // Empty until the admin pastes the ARN from their CloudFormation stack.
+  roleArn: v.optional(v.string()),
+  roleExternalId: v.optional(v.string()),
+  selection: syncSelection,
+  period: syncPeriod,
+});
+
 export const sinkConfig = v.union(
   datadogConfig,
   webhookConfig,
@@ -272,6 +305,7 @@ export const sinkConfig = v.union(
   sentryConfig,
   postHogLogsConfig,
   postHogErrorTrackingConfig,
+  s3ExportConfig,
 );
 
 const logSinksTable = defineTable({
@@ -495,12 +529,28 @@ export default defineSchema({
   }).index("by_name_and_ts", ["name", "ts"]),
   _udf_config: defineTable({ serverVersion: v.string() }),
   _schemas: defineTable(schemaMetadata).index("by_state", ["state"]),
-  _schema_validation_progress: defineTable({
+  _schema_validations: defineTable({
     schemaId: v.id("_schemas"),
+    tableName: v.string(),
+    validatorHash: v.optional(v.string()),
+    state: v.union(
+      v.object({ state: v.literal("pending") }),
+      v.object({ state: v.literal("valid") }),
+      v.object({ state: v.literal("failed"), error: v.string() }),
+    ),
+  }).index("by_schema_id_and_table_name", ["schemaId", "tableName"]),
+  _schema_validation_progress: defineTable({
+    validationId: v.id("_schema_validations"),
     numDocsValidated: v.int64(),
     totalDocs: v.union(v.int64(), v.null()),
-  }).index("by_schema_id", ["schemaId"]),
+  }).index("by_validation_id", ["validationId"]),
   _log_sinks: logSinksTable,
+  _s3_export_state: defineTable({
+    configId: v.id("_log_sinks"),
+    checkpoint: v.object({
+      progress: s3ExportProgress,
+    }),
+  }).index("by_config_id", ["configId"]),
   _backend_state: backendStateTable,
   _snapshot_imports: snapshotImportsTable,
   _aws_lambda_versions: awsLambdaVersionsTable,

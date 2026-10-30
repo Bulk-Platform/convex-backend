@@ -28,6 +28,7 @@ use reqwest::{
     Proxy,
     Url,
 };
+use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::select;
 
 use crate::http::{
@@ -52,13 +53,22 @@ pub struct FetchAborted;
 pub struct ProxiedFetchClient {
     http_client:
         LazyLock<reqwest::Client, Box<dyn FnOnce() -> reqwest::Client + Send + Sync + 'static>>,
+    uses_proxy: bool,
 }
 
-// Share the underlying TlsConnector between ProxiedFetchClients
-static TLS_CONNECTOR: LazyLock<native_tls::TlsConnector> = LazyLock::new(|| {
-    let mut tls = native_tls::TlsConnector::builder();
-    tls.request_alpns(&["h2", "http/1.1"]);
-    tls.build().expect("failed to build TLS connector")
+// Share the underlying rustls::ClientConfig between ProxiedFetchClients
+static TLS_CONNECTOR: LazyLock<rustls::ClientConfig> = LazyLock::new(|| {
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("invalid default protocol versions?")
+    .with_platform_verifier()
+    .expect("Failed to create rustls_platform_verifier")
+    .with_no_client_auth();
+    // reqwest prefers HTTP2 by default, preserve that
+    config.alpn_protocols = vec!["h2".into(), "http/1.1".into()];
+    config
 });
 
 /// Creates a reqwest client configured with an optional proxy.
@@ -102,6 +112,7 @@ impl ProxiedFetchClient {
         redirect_policy: reqwest::redirect::Policy,
     ) -> Self {
         Self {
+            uses_proxy: proxy_url.is_some(),
             http_client: LazyLock::new(Box::new(move || {
                 build_proxied_reqwest_client(proxy_url, client_id, redirect_policy)
             })),
@@ -120,19 +131,32 @@ impl FetchClient for ProxiedFetchClient {
         // by `streaming_body`) reports `is_end_stream() == false`, so hyper omits
         // END_STREAM from the HTTP/2 HEADERS frame and closes the stream with a
         // trailing empty DATA frame -- which strict servers reject for a body-less
-        // GET (https://github.com/get-convex/convex-backend/issues/497). Omitting
+        // GET (https://github.com/convex/convex-backend/issues/497). Omitting
         // the body uses `Body::empty()` (`is_end_stream() == true`), so hyper sets
         // END_STREAM on HEADERS and sends no DATA frame.
         if let Some(body) = request.body {
             request_builder = request_builder.body(streaming_body(body, request_size.clone()));
         }
         for (name, value) in &request.headers {
+            // `Proxy-Authorization` is hop-by-hop and comes from the client's proxy
+            // configuration.
+            if name == http::header::PROXY_AUTHORIZATION {
+                continue;
+            }
             request_builder = request_builder.header(name.as_str(), value.as_bytes());
         }
         let raw_request = request_builder.build()?;
         let raw_response = select! {
             response = self.http_client.execute(raw_request) => {
-                response?
+                // Through our egress proxy, the chain below reqwest's message
+                // names the proxy ("tunnel error"), so keep only that message.
+                response.map_err(|e| {
+                    if self.uses_proxy {
+                        anyhow::anyhow!("{e}")
+                    } else {
+                        e.into()
+                    }
+                })?
             },
             _ = &mut request.signal => {
                 anyhow::bail!(FetchAborted);
@@ -167,7 +191,7 @@ impl FetchClient for ProxiedFetchClient {
 /// full-duplex body whose first chunk is only produced after the response
 /// headers arrive, so we must not poll it before the request is sent.
 fn streaming_body(
-    body: Pin<Box<dyn Stream<Item = anyhow::Result<Bytes>> + Sync + Send>>,
+    body: Pin<Box<dyn Stream<Item = anyhow::Result<Bytes>> + Send>>,
     request_size: Arc<AtomicU64>,
 ) -> Body {
     Body::wrap_stream(body.inspect(move |b| {

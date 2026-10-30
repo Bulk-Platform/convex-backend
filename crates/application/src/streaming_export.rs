@@ -14,7 +14,6 @@ use database::{
     streaming_export_selection::StreamingExportSelection,
     DocumentDeltas,
     SnapshotPage,
-    StreamingExportFilter,
 };
 use errors::ErrorMetadata;
 use keybroker::Identity;
@@ -62,10 +61,7 @@ impl<RT: Runtime> Application<RT> {
             .document_deltas(
                 identity,
                 Some(cursor),
-                StreamingExportFilter {
-                    selection,
-                    ..Default::default()
-                },
+                selection,
                 *DOCUMENT_DELTAS_LIMIT,
                 *DOCUMENT_DELTAS_LIMIT,
             )
@@ -85,10 +81,7 @@ impl<RT: Runtime> Application<RT> {
             &self.database.latest_database_snapshot()?,
             identity.clone(),
             cursor,
-            StreamingExportFilter {
-                selection,
-                ..Default::default()
-            },
+            selection,
             sync_client,
         )
         .await?;
@@ -111,16 +104,13 @@ impl<RT: Runtime> Application<RT> {
             &self.database.latest_database_snapshot()?,
             identity,
             cursor,
-            StreamingExportFilter {
-                selection,
-                ..Default::default()
-            },
+            selection,
             sync_client,
         )
         .await
     }
 
-    /// One page of the progress rows of active data syncs — those that
+    /// One page of the progress documents of active data syncs — those that
     /// fetched a page within the active window — most recently updated first.
     /// The returned cursor, if any, fetches the next page.
     pub async fn active_data_syncs(
@@ -154,8 +144,8 @@ impl<RT: Runtime> Application<RT> {
         Ok((syncs, next_cursor))
     }
 
-    /// The progress row of a single active data sync — one that fetched a page
-    /// within the active window — or `None` if no such sync exists.
+    /// The progress document of a single active data sync — one that fetched a
+    /// page within the active window — or `None` if no such sync exists.
     pub async fn active_data_sync(
         &self,
         identity: Identity,
@@ -168,14 +158,16 @@ impl<RT: Runtime> Application<RT> {
             .await
     }
 
-    /// Upsert this sync's `_data_sync_progress` row from the page's outcome.
+    /// Upsert this sync's `_data_sync_progress` document from the page's
+    /// outcome.
     ///
-    /// If the sync has no row yet, this page records its creation: the insert
-    /// and its audit log entry are committed together and any failure fails
-    /// the page, so a client can never advance past a creation that wasn't
-    /// audit logged. Once the row exists, refreshes are best-effort: a
-    /// failure (e.g. an OCC with a concurrent page of the same sync, or table
-    /// summaries still bootstrapping) is reported without failing the page.
+    /// If the sync has no document yet, this page records its creation: the
+    /// insert and its audit log entry are committed together and any
+    /// failure fails the page, so a client can never advance past a
+    /// creation that wasn't audit logged. Once the document exists,
+    /// refreshes are best-effort: a failure (e.g. an OCC with a concurrent
+    /// page of the same sync, or table summaries still bootstrapping) is
+    /// reported without failing the page.
     async fn record_data_sync_progress(
         &self,
         result: &SyncResult,
@@ -277,10 +269,7 @@ impl<RT: Runtime> Application<RT> {
                 identity,
                 snapshot,
                 cursor,
-                StreamingExportFilter {
-                    selection,
-                    ..Default::default()
-                },
+                selection,
                 *SNAPSHOT_LIST_LIMIT,
                 *SNAPSHOT_LIST_LIMIT,
             )

@@ -16,7 +16,7 @@ mod stream;
 mod structured_clone;
 mod subtle_crypto;
 mod text;
-mod time;
+pub mod time;
 mod validate_args;
 mod validate_returns;
 
@@ -58,6 +58,8 @@ use value::{
     NamespacedTableMapping,
 };
 
+pub(crate) use self::errors::uncatchable_developer_error;
+pub use self::stream::BodyReceiver;
 use self::{
     console::{
         op_console_message,
@@ -412,6 +414,8 @@ op_table! {
         "console/timeStart" => op_console_time_start,
         "console/timeLog" => op_console_time_log,
         "console/timeEnd" => op_console_time_end,
+        // The wasm runtime answers this one from `WasmSyscallHost`, which is
+        // where its module source maps live.
         "error/stack" => op_error_stack,
         "url/getUrlInfo" => op_url_get_url_info,
         "url/getUrlSearchParamPairs" => op_url_get_url_search_param_pairs,

@@ -223,6 +223,8 @@ const deploymentInfo: Omit<DeploymentInfo, "deploymentUrl" | "adminKey"> = {
     slug: "team",
   }),
   useTeamMembers: () => [],
+  useCurrentMemberName: () => undefined,
+  useMemberPreference: () => ({ value: false, set: async () => {} }),
   useTeamEntitlements: () => ({
     auditLogRetentionDays: -1,
     logStreamingEnabled: true,
@@ -326,7 +328,11 @@ const deploymentInfo: Omit<DeploymentInfo, "deploymentUrl" | "adminKey"> = {
   deploymentsURI: "",
   isSelfHosted: true,
   workosIntegrationEnabled: false,
+  healthDeployProgressEnabled: false,
+  s3ExportIntegrationEnabled: false,
   connectionStateCheckIntervalMs: 2500,
+  showFivetranSyncProgress: false,
+  componentSwitcherTreeEnabled: false,
 };
 
 function DeploymentInfoProvider({

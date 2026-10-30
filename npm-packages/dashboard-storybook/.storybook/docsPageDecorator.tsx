@@ -15,6 +15,7 @@ import {
 import {
   useProjectBySlug,
   useCurrentProject,
+  useCurrentProjectWithStatus,
   usePaginatedProjects,
   useProjectById,
 } from "../../dashboard/src/api/projects";
@@ -48,7 +49,6 @@ import {
   useDeploymentByName,
   useDeploymentRegions,
 } from "../../dashboard/src/api/deployments";
-import { deploymentAuth } from "../../dashboard/src/lib/deploymentAuth";
 import { useTeamUsageState } from "../../dashboard/src/api/usage";
 import { useReferralState } from "../../dashboard/src/api/referrals";
 import { usePostHog } from "../../dashboard/src/hooks/usePostHog";
@@ -180,6 +180,9 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
     createTime: Date.now(),
     prodDeploymentName: "musical-otter-456",
     devDeploymentName: "happy-capybara-123",
+    prodDeploymentReference: "production",
+    devDeploymentReference: "dev/nicolas",
+    tags: [],
   } as NonNullable<ReturnType<typeof useProjectBySlug>>;
   const shouldMockCurrentProject = title.startsWith("docs/pages/project/");
   const shouldMockCurrentDeployment = title.startsWith(
@@ -190,6 +193,7 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
       docsPage?: {
         deploymentType?: "dev" | "prod";
         launchDarkly?: Partial<ReturnType<typeof useLaunchDarkly>>;
+        entitlements?: Partial<ReturnType<typeof useTeamEntitlements>>;
       };
     }
   )?.docsPage;
@@ -268,7 +272,10 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
     isLoading: false,
   });
   mocked(useProfile).mockReturnValue(mockProfile);
-  mocked(useTeamEntitlements).mockReturnValue(mockTeamEntitlements);
+  mocked(useTeamEntitlements).mockReturnValue({
+    ...mockTeamEntitlements,
+    ...docsPageParams?.entitlements,
+  });
   mocked(useProjectBySlug).mockReturnValue(
     shouldMockCurrentProject ? mockProject : undefined,
   );
@@ -277,6 +284,10 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
       ? (mockProject as ReturnType<typeof useCurrentProject>)
       : undefined,
   );
+  mocked(useCurrentProjectWithStatus).mockReturnValue({
+    project: shouldMockCurrentProject ? mockProject : undefined,
+    isLoading: false,
+  });
   mocked(useProjectById).mockImplementation(() => ({
     project: mockProject,
     isLoading: false,
@@ -361,13 +372,6 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
   mocked(useCurrentDeployment).mockReturnValue(
     shouldMockCurrentDeployment ? activeDeployment : undefined,
   );
-  mocked(deploymentAuth).mockImplementation(async (deploymentName) => {
-    return {
-      ok: true,
-      deploymentUrl: `https://${deploymentName}.convex.cloud`,
-      adminKey: "STORYBOOK-FAKE-KEY",
-    };
-  });
   mocked(useDeploymentByName).mockReturnValue(undefined);
   mocked(useDeploymentRegions).mockReturnValue({
     regions: [
@@ -556,8 +560,8 @@ function DocsShell({
 }
 
 // DeploymentInfoProvider renders children without the context on the first
-// render (before the async deploymentAuth resolves). Guard against calling
-// DeploymentDashboardLayout until the context is available.
+// render, before it has resolved the deployment's URL and admin key. Guard
+// against calling DeploymentDashboardLayout until the context is available.
 function DeploymentLayoutWhenReady({
   children,
 }: React.PropsWithChildren<object>) {

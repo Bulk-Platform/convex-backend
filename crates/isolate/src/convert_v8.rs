@@ -16,6 +16,7 @@ use serde::{
     Serialize,
 };
 use strum::IntoStaticStr;
+use value::heap_size::HeapSize;
 
 use crate::strings;
 
@@ -100,6 +101,15 @@ pub enum JsException {
     TypeError(TypeError),
 }
 
+impl HeapSize for JsException {
+    fn heap_size(&self) -> usize {
+        match self {
+            Self::DOMException(DOMException { message, name: _ }) => message.heap_size(),
+            Self::TypeError(TypeError { message }) => message.heap_size(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DOMException {
     pub message: Cow<'static, str>,
@@ -173,6 +183,18 @@ impl From<DOMException> for anyhow::Error {
 impl From<TypeError> for anyhow::Error {
     fn from(e: TypeError) -> Self {
         anyhow::Error::new(JsException::TypeError(e))
+    }
+}
+
+impl From<webcrypto::DOMExceptionName> for DOMExceptionName {
+    fn from(name: webcrypto::DOMExceptionName) -> Self {
+        match name {
+            webcrypto::DOMExceptionName::NotSupportedError => DOMExceptionName::NotSupportedError,
+            webcrypto::DOMExceptionName::SyntaxError => DOMExceptionName::SyntaxError,
+            webcrypto::DOMExceptionName::InvalidAccessError => DOMExceptionName::InvalidAccessError,
+            webcrypto::DOMExceptionName::DataError => DOMExceptionName::DataError,
+            webcrypto::DOMExceptionName::OperationError => DOMExceptionName::OperationError,
+        }
     }
 }
 

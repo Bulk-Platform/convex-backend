@@ -517,6 +517,23 @@ export async function selectRegionOrUseDefault(
   return selectedRegionName;
 }
 
+// Mirrors the order of `REGION_PRESENTATION` in
+// `npm-packages/dashboard/src/lib/regions.ts`, so both region pickers list
+// regions in the same order.
+const REGION_ORDER: string[] = [
+  "aws-us-east-1",
+  "aws-eu-west-1",
+  "aws-ca-central-1",
+  "aws-ap-southeast-2",
+];
+
+// Regions missing from `REGION_ORDER` (e.g. newly launched ones) go last, in
+// server order, since `Array.prototype.sort` is stable.
+function regionSortIndex(regionName: string): number {
+  const index = REGION_ORDER.indexOf(regionName);
+  return index === -1 ? REGION_ORDER.length : index;
+}
+
 export async function selectRegion(
   ctx: Context,
   teamId: number,
@@ -538,12 +555,7 @@ export async function selectRegion(
       name: item.displayName,
       value: item.name,
     }))
-    .sort((a, b) => {
-      // Show US region first if it exists
-      if (a.value === "aws-us-east-1") return -1;
-      if (b.value === "aws-us-east-1") return 1;
-      return 0;
-    });
+    .sort((a, b) => regionSortIndex(a.value) - regionSortIndex(b.value));
   return await promptOptions(ctx, {
     message: `Where should this ${deploymentType} deployment run?`,
     suffix: `\n${chalkStderr.gray(
@@ -559,16 +571,18 @@ export async function hasProject(
   projectSlug: string,
 ) {
   try {
-    const projects: Project[] = (
-      await typedBigBrainClient(ctx).GET("/teams/{team_slug}/projects", {
+    await typedPlatformClient(ctx, { throw: true }).GET(
+      "/teams/{team_id_or_slug}/projects/{project_slug}",
+      {
         params: {
           path: {
-            team_slug: teamSlug,
+            team_id_or_slug: teamSlug,
+            project_slug: projectSlug,
           },
         },
-      })
-    ).data!;
-    return !!projects.find((project) => project.slug === projectSlug);
+      },
+    );
+    return true;
   } catch {
     return false;
   }
@@ -581,19 +595,27 @@ export async function hasProjects(ctx: Context) {
 export async function validateOrSelectProject(
   ctx: Context,
   projectSlug: string | undefined,
-  teamSlug: string,
+  teamId: number,
   singleProjectPrompt: string,
   multiProjectPrompt: string,
 ): Promise<string | null> {
-  const projects: Project[] = (
-    await typedBigBrainClient(ctx).GET("/teams/{team_slug}/projects", {
-      params: {
-        path: {
-          team_slug: teamSlug,
+  const projects: Project[] = [];
+  const client = typedPlatformClient(ctx);
+  let cursor: string | undefined;
+  do {
+    const { items, pagination } = (
+      await client.GET("/teams/{team_id}/projects", {
+        params: {
+          path: { team_id: teamId },
+          query: cursor === undefined ? {} : { cursor },
         },
-      },
-    })
-  ).data!;
+      })
+    ).data!;
+    projects.push(...items);
+    cursor = pagination.hasMore
+      ? (pagination.nextCursor ?? undefined)
+      : undefined;
+  } while (cursor !== undefined);
   if (projects.length === 0) {
     return await ctx.crash({
       exitCode: 1,
@@ -972,40 +994,49 @@ export function waitUntilCalled(): [Promise<unknown>, () => void] {
   return [waitPromise, () => onCalled(null)];
 }
 
-const BYTE_UNITS: [number, string][] = [
-  [1 << 30, "GiB"],
-  [1_000_000_000, "GB"],
-  [1 << 20, "MiB"],
-  [1_000_000, "MB"],
-  [1 << 10, "KiB"],
-  [1_000, "KB"],
-];
+const BYTE_UNITS = ["bytes", "KiB", "MiB", "GiB", "TiB", "PiB"];
 
 /**
- * Format a byte count into a human-friendly string.
- *
- * Picks the unit (binary or decimal) that divides most cleanly.
- * Shows one decimal place only when it divides exactly (e.g. "4.1 MiB").
- * Falls back to raw bytes when no unit divides cleanly.
+ * Format a byte count into a human-friendly string, rounded to one decimal
+ * place (dropped when it would be ".0"), e.g. "4.1 MiB" or "128 MiB".
  */
 export function formatSize(n: number): string {
-  if (n === 0) {
-    return "0 bytes";
+  let value = n;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < BYTE_UNITS.length - 1) {
+    value /= 1024;
+    unitIndex++;
   }
-  for (const [unitSize, unitName] of BYTE_UNITS) {
-    if (n < unitSize) {
-      continue;
-    }
-    if (n % unitSize === 0) {
-      return `${n / unitSize} ${unitName}`;
-    }
-    if ((n * 10) % unitSize === 0) {
-      const whole = Math.floor(n / unitSize);
-      const frac = Math.floor((n * 10) / unitSize) % 10;
-      return `${whole}.${frac} ${unitName}`;
-    }
+  // Rounding to one decimal place can itself reach the next unit's
+  // boundary (e.g. 1023.999 KiB -> "1024.0 KiB" instead of "1.0 MiB").
+  const roundedValue = Number(value.toFixed(1));
+  if (roundedValue >= 1024 && unitIndex < BYTE_UNITS.length - 1) {
+    value /= 1024;
+    unitIndex++;
   }
-  return `${n} bytes`;
+  const formatted = value.toFixed(1).replace(/\.0$/, "");
+  return `${formatted} ${BYTE_UNITS[unitIndex]}`;
+}
+
+/**
+ * Read an integer override from the environment, falling back to
+ * `defaultValue` when the variable is unset. The whole value must be a
+ * base-10 integer: `parseInt` would read a typo like `100_000` or `100k` as
+ * 100 and silently move the threshold, so anything else is rejected with a
+ * warning instead.
+ */
+export function integerFromEnv(envVar: string, defaultValue: number): number {
+  const envValue = process.env[envVar];
+  if (envValue === undefined) {
+    return defaultValue;
+  }
+  if (!/^[+-]?\d+$/.test(envValue.trim())) {
+    logWarning(
+      `Ignoring ${envVar}=${JSON.stringify(envValue)}: expected an integer, using ${defaultValue}`,
+    );
+    return defaultValue;
+  }
+  return Number(envValue);
 }
 
 export function formatDuration(ms: number): string {
@@ -1195,12 +1226,12 @@ export function spawnAsync(
 
 const IDEMPOTENT_METHODS = ["GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE"];
 
-function retryDelay(
+// immediate, 1s delay, 2s delay, 4s delay, etc.
+export function retryDelay(
   attempt: number,
   _error: Error | null,
   _response: Response | null,
 ): number {
-  // immediate, 1s delay, 2s delay, 4s delay, etc.
   const delay = attempt === 0 ? 1 : 2 ** (attempt - 1) * 1000;
   const randomSum = delay * 0.2 * Math.random();
   return delay + randomSum;
@@ -1209,8 +1240,13 @@ function retryDelay(
 function deploymentFetchRetryOn(
   onError?: (err: any, attempt: number) => void,
   method?: string,
+  maxRetries: number = MAX_RETRIES,
+  shouldRetryOverride?: (
+    error: Error | null,
+    response: Response | null,
+  ) => boolean,
 ) {
-  const shouldRetry = function (
+  const defaultShouldRetry = function (
     _attempt: number,
     error: Error | null,
     response: Response | null,
@@ -1266,6 +1302,21 @@ function deploymentFetchRetryOn(
     return { kind: "stop" };
   };
 
+  const shouldRetry = shouldRetryOverride
+    ? function (
+        _attempt: number,
+        error: Error | null,
+        response: Response | null,
+      ): { kind: "retry"; error: any } | { kind: "stop" } {
+        return shouldRetryOverride(error, response)
+          ? {
+              kind: "retry",
+              error:
+                error ?? `Received response with status ${response?.status}`,
+            }
+          : { kind: "stop" };
+      }
+    : defaultShouldRetry;
   return function (
     attempt: number,
     error: Error | null,
@@ -1275,7 +1326,7 @@ function deploymentFetchRetryOn(
     if (result.kind === "retry") {
       onError?.(result.error, attempt);
     }
-    if (attempt >= MAX_RETRIES) {
+    if (attempt >= maxRetries) {
       // Stop retrying if we've exhausted all retries, but do this after we've
       // called `onError` so that the caller can still log the error.
       return false;
@@ -1334,15 +1385,30 @@ export function deploymentFetch(
     deploymentUrl: string;
     adminKey: string;
     onError?: (err: any) => void;
+    // Defaults to MAX_RETRIES. Lower this for best-effort requests (e.g.
+    // advisory checks) where a slow retry loop against an unsupported or
+    // unhealthy endpoint shouldn't hold up the surrounding command.
+    maxRetries?: number | undefined;
+    // Replaces the default retry policy (which is tuned for pushes: network
+    // errors, 404s on fresh deployments, retries of idempotent methods).
+    // Return true to retry the request. Backoff and retry logging are
+    // shared either way.
+    shouldRetry?: (error: Error | null, response: Response | null) => boolean;
   },
 ): typeof fetch {
-  const { deploymentUrl, adminKey, onError } = options;
+  const {
+    deploymentUrl,
+    adminKey,
+    onError,
+    maxRetries = MAX_RETRIES,
+    shouldRetry,
+  } = options;
   const onErrorWithAttempt = (err: any, attempt: number) => {
     onError?.(err);
     if (attempt >= RETRY_LOG_THRESHOLD) {
       logMessage(
         chalkStderr.gray(
-          `Retrying request (attempt ${attempt}/${MAX_RETRIES})...`,
+          `Retrying request (attempt ${attempt}/${maxRetries})...`,
         ),
       );
     }
@@ -1367,7 +1433,12 @@ export function deploymentFetch(
     }
     const func = throwingFetch(url, {
       retryDelay,
-      retryOn: deploymentFetchRetryOn(onErrorWithAttempt, options?.method),
+      retryOn: deploymentFetchRetryOn(
+        onErrorWithAttempt,
+        options?.method,
+        maxRetries,
+        shouldRetry,
+      ),
       ...options,
       headers,
     });

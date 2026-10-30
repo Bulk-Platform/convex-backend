@@ -45,6 +45,7 @@ use common::{
     types::{
         IndexId,
         IndexName,
+        IndexRef,
         RepeatableTimestamp,
         TabletIndexName,
         Timestamp,
@@ -62,7 +63,6 @@ use itertools::Itertools;
 use value::{
     DeveloperDocumentId,
     TableMapping,
-    TableName,
     TabletId,
 };
 
@@ -208,12 +208,13 @@ fn log_index_page_mismatch(
 impl IndexReader for IndexCacheReader {
     async fn index_page(
         &self,
-        index_id: IndexId,
+        index: IndexRef,
         tablet_id: TabletId,
         interval: &Interval,
         order: Order,
         max_results: usize,
     ) -> anyhow::Result<IndexPage> {
+        let index_id = index.id();
         let interval = Arc::new(interval.clone());
         let maybe_page = self.handle.get(
             index_id,
@@ -228,7 +229,7 @@ impl IndexReader for IndexCacheReader {
             if verify_cache_results {
                 let index_page = self
                     .reader
-                    .index_page(index_id, tablet_id, &interval, order, max_results)
+                    .index_page(index, tablet_id, &interval, order, max_results)
                     .await?;
                 if index_page != cached_page {
                     let index_name = self
@@ -259,7 +260,7 @@ impl IndexReader for IndexCacheReader {
         } else {
             let index_page = self
                 .reader
-                .index_page(index_id, tablet_id, &interval, order, max_results)
+                .index_page(index, tablet_id, &interval, order, max_results)
                 .await?;
             self.handle.populate(
                 index_id,
@@ -306,7 +307,7 @@ enum RangeFetchResult {
     /// Some documents may still have been served from the
     /// `DatabaseIndexSnapshotCache`.
     NonCached {
-        index_id: IndexId,
+        index: IndexRef,
         cache_results: Vec<DatabaseIndexSnapshotCacheResult>,
     },
 }
@@ -387,7 +388,7 @@ impl DatabaseIndexSnapshot {
         if let Some(range) = self
             .in_memory_indexes
             .range(
-                index.id(),
+                IndexRef::try_from(&index)?,
                 &range_request.interval,
                 range_request.order,
                 *range_request.index_name.table(),
@@ -395,12 +396,6 @@ impl DatabaseIndexSnapshot {
             )
             .await?
         {
-            Self::log_start_range_fetch(
-                range_request.printable_index_name.table(),
-                1,
-                0,
-                range_request.max_size,
-            );
             return Ok(RangeFetchResult::MemoryCached {
                 documents: range,
                 next_cursor: CursorPosition::End,
@@ -411,54 +406,10 @@ impl DatabaseIndexSnapshot {
         let cache_results =
             self.cache
                 .get(index.id(), &range_request.interval, range_request.order);
-        let cache_miss_count = cache_results
-            .iter()
-            .filter(|r| matches!(r, DatabaseIndexSnapshotCacheResult::CacheMiss(_)))
-            .count();
-        Self::log_start_range_fetch(
-            range_request.printable_index_name.table(),
-            cache_results.len() - cache_miss_count,
-            cache_miss_count,
-            range_request.max_size,
-        );
         Ok(RangeFetchResult::NonCached {
-            index_id: index.id(),
+            index: IndexRef::try_from(&index)?,
             cache_results,
         })
-    }
-
-    fn log_start_range_fetch(
-        _table_name: &TableName,
-        _num_cached_ranges: usize,
-        _num_cache_misses: usize,
-        _prefetch_size: usize,
-    ) {
-        // TODO: This event is reporting to Honeycomb too often
-        // Event::add_to_local_parent("start_range_fetch", || {
-        //     let table_name = if table_name.is_system() {
-        //         table_name.to_string()
-        //     } else {
-        //         format!("user_table")
-        //     };
-        //     let cached_ranges = num_cached_ranges.to_string();
-        //     let cache_misses = num_cache_misses.to_string();
-        //     let prefetch_size = prefetch_size.to_string();
-        //     [
-        //         (Cow::Borrowed("query.table"), Cow::Owned(table_name)),
-        //         (
-        //             Cow::Borrowed("query.cached_ranges"),
-        //             Cow::Owned(cached_ranges),
-        //         ),
-        //         (
-        //             Cow::Borrowed("query.cache_miss_ranges"),
-        //             Cow::Owned(cache_misses),
-        //         ),
-        //         (
-        //             Cow::Borrowed("query.prefetch_size"),
-        //             Cow::Owned(prefetch_size),
-        //         ),
-        //     ]
-        // });
     }
 
     /// Query the given indexes at the snapshot.
@@ -535,7 +486,7 @@ impl DatabaseIndexSnapshot {
                 None,
             )),
             RangeFetchResult::NonCached {
-                index_id,
+                index,
                 cache_results,
             } => {
                 let any_misses = cache_results
@@ -543,7 +494,7 @@ impl DatabaseIndexSnapshot {
                     .any(|result| matches!(result, DatabaseIndexSnapshotCacheResult::CacheMiss(_)));
                 let fut = Self::fetch_cache_misses(
                     self.reader.clone(),
-                    index_id,
+                    index,
                     range_request.clone(),
                     cache_results,
                 );
@@ -563,7 +514,7 @@ impl DatabaseIndexSnapshot {
                     .split(cursor.clone(), range_request.order);
                 Ok((
                     (fetch_result_vec, cursor),
-                    Some((index_id, cache_miss_results, interval_read)),
+                    Some((index.id(), cache_miss_results, interval_read)),
                 ))
             },
         }
@@ -611,7 +562,7 @@ impl DatabaseIndexSnapshot {
 
     async fn fetch_cache_misses(
         reader: Arc<dyn IndexReader>,
-        index_id: IndexId,
+        index: IndexRef,
         range_request: RangeRequest,
         cache_results: Vec<DatabaseIndexSnapshotCacheResult>,
     ) -> anyhow::Result<(
@@ -640,7 +591,7 @@ impl DatabaseIndexSnapshot {
                     // Query persistence.
                     let index_page = reader
                         .index_page(
-                            index_id,
+                            index,
                             *range_request.index_name.table(),
                             &interval,
                             range_request.order,

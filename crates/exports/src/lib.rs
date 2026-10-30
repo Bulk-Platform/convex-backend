@@ -24,7 +24,7 @@ use common::{
     persistence::LatestDocument,
     runtime::Runtime,
     types::{
-        IndexId,
+        IndexRef,
         ObjectKey,
         TableName,
     },
@@ -103,7 +103,9 @@ pub fn ensure_file_storage_export_size(size: u64) -> anyhow::Result<()> {
         ErrorMetadata::bad_request(
             FILE_STORAGE_EXPORT_TOO_LARGE_SHORT_MSG,
             format!(
-                "File storage is too large to include in an export ({} > maximum size {}).",
+                "File storage is too large to include in this backup ({} > maximum size {}). You \
+                 can still create a tables-only backup. Restoring it replaces table data while \
+                 leaving the target deployment's current file storage unchanged.",
                 size.format_size(BINARY),
                 MAX_FILE_STORAGE_EXPORT_SIZE_BYTES.format_size(BINARY),
             ),
@@ -272,7 +274,7 @@ pub async fn write_table<'a, 'b: 'a, F, Fut, RT: Runtime>(
     component_path: &ComponentPath,
     tablet_id: &TabletId,
     table_name: TableName,
-    by_id: &IndexId,
+    by_id: &IndexRef,
     usage: &FunctionUsageTracker,
     update_progress: &F,
     table_total_docs: u64,
@@ -331,7 +333,7 @@ async fn construct_zip_snapshot<F, Fut, RT: Runtime>(
     tables: BTreeMap<TabletId, (TableNamespace, TableNumber, TableName, TableCount)>,
     mut table_iterator: MultiTableIterator<RT>,
     component_ids_to_paths: BTreeMap<ComponentId, ComponentPath>,
-    by_id_indexes: BTreeMap<TabletId, IndexId>,
+    by_id_indexes: BTreeMap<TabletId, IndexRef>,
     system_tables: BTreeMap<(TableNamespace, TableName), TabletId>,
     storage_table_counts: BTreeMap<TableNamespace, u64>,
     include_storage: bool,

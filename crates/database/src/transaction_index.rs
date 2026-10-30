@@ -58,11 +58,10 @@ use indexing::{
     },
 };
 use search::{
-    query::RevisionWithKeys,
-    CandidateRevision,
     QueryResults,
     Searcher,
     TextIndexManager,
+    TextSearchResults,
 };
 use storage::Storage;
 use tokio::task;
@@ -240,10 +239,14 @@ impl TransactionIndex {
             let result = try_anyhow!({
                 let (snapshot_result_vec, cursor) = snapshot_result?;
                 let mut snapshot_it = snapshot_result_vec.into_iter();
+                // Pending writes past `cursor` belong to later pages.
+                let (snapshot_interval, _) = range_request
+                    .interval
+                    .split(cursor.clone(), range_request.order);
                 let pending_it = self.pending_iter_for_interval(
                     &range_request.index_name,
                     &range_request.printable_index_name,
-                    &range_request.interval,
+                    &snapshot_interval,
                 )?;
                 let mut pending_it = range_request.order.apply(pending_it);
 
@@ -340,7 +343,7 @@ impl TransactionIndex {
         query: &InternalSearch,
         index_name: TabletIndexName,
         version: SearchVersion,
-    ) -> anyhow::Result<Vec<(CandidateRevision, IndexKeyBytes)>> {
+    ) -> anyhow::Result<TextSearchResults> {
         // We do not allow modifying the index registry and performing a text search
         // in the same transaction. We could implement this by sending the index
         // updates in the search request, but there is no need to bother since we
@@ -374,7 +377,10 @@ impl TransactionIndex {
         // Record the query results in the read set.
         reads.record_search(index_name.clone(), results.reads);
 
-        Ok(results.revisions_with_keys)
+        Ok(TextSearchResults {
+            revisions_with_keys: results.revisions_with_keys,
+            filtered_bytes_searched: results.filtered_bytes_searched,
+        })
     }
 
     /// Fetch a batch of index ranges. This method does not update the read set,
@@ -502,13 +508,17 @@ impl TransactionIndex {
 
     // TODO: Add precise error types to facilitate detecting which indexing errors
     // are the developer's fault or not.
+    /// `old_document` comes with the write timestamp of its revision.
     pub fn begin_update(
         &mut self,
-        old_document: Option<ResolvedDocument>,
+        old_document: Option<(ResolvedDocument, WriteTimestamp)>,
         new_document: Option<ResolvedDocument>,
     ) -> anyhow::Result<Update<'_>> {
         let mut registry = self.index_registry.clone();
-        registry.update(old_document.as_ref(), new_document.as_ref())?;
+        registry.update(
+            old_document.as_ref().map(|(document, _)| document),
+            new_document.as_ref(),
+        )?;
 
         Ok(Update {
             index: self,
@@ -520,9 +530,13 @@ impl TransactionIndex {
 
     fn finish_update(
         &mut self,
-        old_document: Option<ResolvedDocument>,
+        old_document: Option<(ResolvedDocument, WriteTimestamp)>,
         new_document: Option<ResolvedDocument>,
     ) -> Vec<DatabaseIndexUpdate> {
+        let (old_document, old_ts) = match old_document {
+            Some((document, ts)) => (Some(document), Some(ts)),
+            None => (None, None),
+        };
         // Update the index registry first.
         let index_registry_updated = self
             .index_registry
@@ -532,7 +546,7 @@ impl TransactionIndex {
         // Then compute the index updates.
         let updates = self
             .index_registry
-            .index_updates(old_document.as_ref(), new_document.as_ref());
+            .index_updates(old_document.as_ref().zip(old_ts), new_document.as_ref());
 
         // Add the index updates to self.database_index_updates.
         for update in &updates {
@@ -551,7 +565,7 @@ impl TransactionIndex {
                 },
             };
             self.database_index_updates
-                .entry(update.index_id)
+                .entry(update.index.id())
                 .or_insert_with(TransactionIndexMap::new)
                 .insert(update.key.to_bytes(), new_value);
         }
@@ -705,7 +719,7 @@ impl TransactionIndexMap {
 pub struct Update<'a> {
     index: &'a mut TransactionIndex,
 
-    deletion: Option<ResolvedDocument>,
+    deletion: Option<(ResolvedDocument, WriteTimestamp)>,
     insertion: Option<ResolvedDocument>,
     registry: IndexRegistry,
 }
@@ -737,7 +751,7 @@ pub trait TransactionTextSnapshot: Send + Sync + 'static {
         // should be rare.
         // As a potential future optimization, we could try to make the caller much
         // more coupled with the search algorithm and require it to send bm25 statistics
-        // diff, top fuzzy search suggestions and other search specific properties derived
+        // diff, shortlisted query terms and other search specific properties derived
         // from the writes. Alternatively, we could only do subset of that and relax the
         // determinism requirement since we don't really need to have deterministic between
         // search calls in mutations and search calls in queries, and if anyone relies on
@@ -807,7 +821,7 @@ impl TextIndexManagerSnapshot {
         printable_index_name: &IndexName,
         query: pb::searchlight::TextQuery,
         pending_updates: &Vec<DocumentUpdate>,
-    ) -> anyhow::Result<RevisionWithKeys> {
+    ) -> anyhow::Result<TextSearchResults> {
         let text_indexes_snapshot =
             runtime::block_in_place(|| self.snapshot_with_updates(pending_updates))?;
         text_indexes_snapshot

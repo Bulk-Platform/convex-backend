@@ -12,6 +12,7 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::Context;
 use async_trait::async_trait;
 use enum_iterator::Sequence;
 use futures::{
@@ -43,7 +44,11 @@ use crate::{
         DatabaseIndexValue,
         GenericIndexName,
         IndexId,
+        IndexRef,
+        IndexWriteMode,
+        PersistenceIndexId,
         PersistenceVersion,
+        PrevIndexEntry,
         RepeatableReason,
         RepeatableTimestamp,
         Timestamp,
@@ -75,17 +80,25 @@ impl DocumentLogEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PersistenceIndexEntry {
+    /// Whether index backfill may still be inserting entries for existing
+    /// documents.
+    pub mode: IndexWriteMode,
     pub ts: Timestamp,
-    pub index_id: IndexId,
+    pub index: IndexRef,
     pub key: IndexKeyBytes,
     pub value: Option<InternalDocumentId>,
+    /// `Some` when the key had an entry before this one: always for a
+    /// tombstone, and for a live entry whose key the document's previous
+    /// revision also produced.
+    pub prev: Option<PrevIndexEntry>,
 }
 
 impl PersistenceIndexEntry {
     pub fn from_index_update(ts: Timestamp, update: &DatabaseIndexUpdate) -> Self {
         Self {
             ts,
-            index_id: update.index_id,
+            index: update.index,
+            mode: update.mode,
             key: update.key.to_bytes(),
             value: match update.value {
                 DatabaseIndexValue::Deleted => None,
@@ -93,15 +106,73 @@ impl PersistenceIndexEntry {
                     Some(InternalDocumentId::new(id.tablet_id, id.internal_id()))
                 },
             },
+            prev: update.prev,
         }
     }
 
+    /// The bytes the entry adds, as the write throughput limiter and the write
+    /// log account for them. The superseded entry is the persistence layer's
+    /// bookkeeping, not data the commit adds, so it is not counted.
     pub fn size(&self) -> u64 {
-        let mut size = self.ts.size() + self.index_id.size() + self.key.0.len();
+        let mut size = self.ts.size() + self.index.id().size() + self.key.0.len();
         if let Some(value) = self.value {
             size += value.size();
         }
         size as u64
+    }
+}
+
+/// An index entry written while building or replaying an index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexBackfillEntry {
+    pub mode: IndexWriteMode,
+    pub ts: Timestamp,
+    pub index: IndexRef,
+    pub key: IndexKeyBytes,
+    pub value: Option<InternalDocumentId>,
+}
+
+impl TryFrom<PersistenceIndexEntry> for IndexBackfillEntry {
+    type Error = anyhow::Error;
+
+    fn try_from(entry: PersistenceIndexEntry) -> anyhow::Result<Self> {
+        let value = entry.value.context("index backfill wrote a tombstone")?;
+        anyhow::ensure!(
+            entry.prev.is_none(),
+            "index backfill wrote an entry superseding another"
+        );
+        Ok(Self {
+            mode: entry.mode,
+            ts: entry.ts,
+            index: entry.index,
+            key: entry.key,
+            value: Some(value),
+        })
+    }
+}
+
+impl IndexBackfillEntry {
+    pub fn from_replay(entry: &PersistenceIndexEntry) -> Self {
+        Self {
+            mode: entry.mode,
+            ts: entry.ts,
+            index: entry.index,
+            key: entry.key.clone(),
+            value: entry.value,
+        }
+    }
+}
+
+impl From<&IndexBackfillEntry> for PersistenceIndexEntry {
+    fn from(entry: &IndexBackfillEntry) -> Self {
+        Self {
+            mode: entry.mode,
+            ts: entry.ts,
+            index: entry.index,
+            key: entry.key.clone(),
+            value: entry.value,
+            prev: None,
+        }
     }
 }
 
@@ -247,6 +318,11 @@ pub struct IndexRetentionProgress {
     /// Index rows the persistence reported removing. A layout that reclaims
     /// whole storage units rather than rows removes none and reports zero.
     pub deleted_rows: usize,
+    /// Distinct indexes for which the pass re-derived expired entries -- a
+    /// measure of how spread the retention work was across the index
+    /// population, as opposed to concentrated in a few. A layout that
+    /// reclaims whole storage units rather than rows reports zero.
+    pub unique_indexes: usize,
 }
 
 #[async_trait]
@@ -263,6 +339,43 @@ pub trait Persistence: Sync + Send + 'static {
         indexes: &'a [PersistenceIndexEntry],
         conflict_strategy: ConflictStrategy,
     ) -> anyhow::Result<()>;
+
+    /// Durably invalidates shadow state before administrative writes that may
+    /// bypass normal document/index write pairing, such as restores and
+    /// migration copies.
+    async fn invalidate_shadow(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Persists entries read from an index backfill snapshot at their document
+    /// timestamps. Replaying a chunk must be idempotent.
+    async fn write_index_backfill(&self, entries: &[IndexBackfillEntry]) -> anyhow::Result<()> {
+        let entries: Vec<_> = entries.iter().map(PersistenceIndexEntry::from).collect();
+        self.write(&[], &entries, ConflictStrategy::Overwrite).await
+    }
+
+    /// Reconciles backfill entries with live writes. The caller runs this
+    /// after the last backfill chunk is durable and before writes switch to
+    /// [`IndexWriteMode::ScanComplete`]. Implementations must be idempotent.
+    async fn reconcile_index_backfill(&self, _index: PersistenceIndexId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// The indexes for which this persistence records keys that live writes
+    /// deleted. Empty for a layout that keeps no delete markers.
+    async fn index_backfill_marker_indexes(&self) -> anyhow::Result<Vec<PersistenceIndexId>> {
+        Ok(Vec::new())
+    }
+
+    /// Returns the number of deletion markers removed. Each call deletes a
+    /// bounded chunk; the caller must ensure no new markers can be written
+    /// for the index.
+    async fn delete_index_backfill_markers_chunk(
+        &self,
+        _index: PersistenceIndexId,
+    ) -> anyhow::Result<u64> {
+        Ok(0)
+    }
 
     /// Writes global key-value data for the whole persistence.
     /// This is expected to be small data that does not make sense in a
@@ -528,7 +641,7 @@ pub trait PersistenceReader: Send + Sync + 'static {
     /// fully consumed regardless of the estimate.
     fn index_scan(
         &self,
-        index_id: IndexId,
+        index: IndexRef,
         tablet_id: TabletId,
         read_timestamp: Timestamp,
         range: &Interval,
@@ -545,14 +658,14 @@ pub trait PersistenceReader: Send + Sync + 'static {
     /// Performs a single point get using an index.
     async fn index_get(
         &self,
-        index_id: IndexId,
+        index: IndexRef,
         tablet_id: TabletId,
         read_timestamp: Timestamp,
         key: IndexKey,
         retention_validator: Arc<dyn RetentionValidator>,
     ) -> anyhow::Result<Option<LatestDocument>> {
         let mut stream = self.index_scan(
-            index_id,
+            index,
             tablet_id,
             read_timestamp,
             &Interval::prefix(key.to_bytes().into()),
@@ -601,6 +714,13 @@ pub trait PersistenceReader: Send + Sync + 'static {
     }
 
     fn version(&self) -> PersistenceVersion;
+
+    /// Whether the database must run the index retention worker. Backends with
+    /// independent index history maintenance return `false`, and their index
+    /// retention persistence globals are not maintained.
+    fn needs_index_retention_deletes(&self) -> bool {
+        true
+    }
 
     async fn table_size_stats(&self) -> anyhow::Result<Vec<PersistenceTableSize>> {
         Ok(vec![])
@@ -775,14 +895,14 @@ impl PersistenceSnapshot {
     /// Same as [`Persistence::index_scan`] but with fixed timestamp.
     pub fn index_scan(
         &self,
-        index_id: IndexId,
+        index: IndexRef,
         tablet_id: TabletId,
         interval: &Interval,
         order: Order,
         size_hint: usize,
     ) -> IndexStream<'_> {
         self.reader.index_scan(
-            index_id,
+            index,
             tablet_id,
             *self.at,
             interval,
@@ -795,14 +915,14 @@ impl PersistenceSnapshot {
     /// Same as [`Persistence::index_get`] but with fixed timestamp.
     pub async fn index_get(
         &self,
-        index_id: IndexId,
+        index: IndexRef,
         tablet_id: TabletId,
         key: IndexKey,
     ) -> anyhow::Result<Option<LatestDocument>> {
         let result = self
             .reader
             .index_get(
-                index_id,
+                index,
                 tablet_id,
                 *self.at,
                 key,
@@ -818,6 +938,10 @@ impl PersistenceSnapshot {
 
     pub fn persistence(&self) -> &dyn PersistenceReader {
         self.reader.as_ref()
+    }
+
+    pub fn retention_validator(&self) -> Arc<dyn RetentionValidator> {
+        self.retention_validator.clone()
     }
 }
 

@@ -832,7 +832,7 @@
           "pro"
         ],
         "summary": "Data sync",
-        "description": "Paginated streamable export of some or all of a deployment's data.\n\nCall this endpoint repeatedly, passing the opaque `pagination.nextCursor`\nfrom each response back in the next request as `cursor`. Omit `cursor` on\nthe first call.\n\nTo do a one time data sync, keep fetching pages until reaching an `upToDate`\npage. For a continuous streaming export, continue fetching pages\nperiodically. It's recommended to sleep between `upToDate` pages to reduce\noverhead.\n\nThe caller must have the `deployment:data:view` permission.",
+        "description": "Paginated streamable export of some or all of a deployment's data.\n\nCall this endpoint repeatedly, passing the opaque `pagination.nextCursor`\nfrom each response back in the next request as `cursor`. Omit `cursor` on\nthe first call.\n\nApply each page's `truncates` before its `values`, and persist these changes\natomically with `pagination.nextCursor`. Retrying the same input cursor may\nreturn a different page, so non-atomic updates can lead to data\ninconsistency.\n\nTo do a one time data sync, keep fetching pages until reaching an `upToDate`\npage. For a continuous streaming export, continue fetching pages\nperiodically. It's recommended to sleep between `upToDate` pages to reduce\noverhead.\n\nThe caller must have the `deployment:data:view` permission.",
         "operationId": "data_sync",
         "requestBody": {
           "content": {
@@ -1091,7 +1091,7 @@
       },
       "ActiveDataSyncStale": {
         "type": "object",
-        "description": "The sync reached a consistent snapshot at `syncedTs`, but newer data is\nalready available; it is streaming later changes (CDC).",
+        "description": "The sync reached a consistent snapshot at `syncedTs`, but its timestamp is\nstale; it is streaming later changes (CDC). Newer data may be available.",
         "required": [
           "type",
           "totalTables",
@@ -1595,6 +1595,28 @@
               }
             ],
             "title": "PostHogErrorTracking"
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CreateS3ExportLogStreamArgs"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "logStreamType"
+                ],
+                "properties": {
+                  "logStreamType": {
+                    "type": "string",
+                    "enum": [
+                      "s3Export"
+                    ]
+                  }
+                }
+              }
+            ],
+            "title": "S3Export"
           }
         ]
       },
@@ -1716,6 +1738,32 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "title": "S3Export",
+            "required": [
+              "id",
+              "logStreamType"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "roleExternalId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Set for role exports. The role's trust policy must require it as\n`sts:ExternalId`."
+              },
+              "logStreamType": {
+                "type": "string",
+                "enum": [
+                  "s3Export"
+                ]
+              }
+            }
           }
         ]
       },
@@ -1771,6 +1819,66 @@
               "$ref": "#/components/schemas/LogTopic"
             },
             "description": "The topics this log stream is subscribed to. Omit to\nsubscribe to all topics, including ones added in the future."
+          }
+        }
+      },
+      "CreateS3ExportLogStreamArgs": {
+        "type": "object",
+        "required": [
+          "bucket",
+          "region",
+          "period"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "description": "Name of the S3 bucket to mirror into."
+          },
+          "region": {
+            "type": "string",
+            "description": "AWS region the bucket lives in, e.g. `us-east-1`."
+          },
+          "prefix": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Key prefix within the bucket. Omit to write at the bucket root."
+          },
+          "accessKeyId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Access key of an IAM user that can write to the bucket. Send both key\nfields, or `roleArn` instead."
+          },
+          "secretAccessKey": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "roleArn": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ARN of a role in the bucket's account that Convex assumes to write.\nSend an empty string to create the export first: the response carries\nthe `roleExternalId` the role's trust policy needs, and the export waits\nuntil an update supplies the ARN."
+          },
+          "selection": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Selection",
+                "description": "The components and tables to export. Defaults to everything. Each table\nexports whole documents, so filtering fields within a table is rejected."
+              }
+            ]
+          },
+          "period": {
+            "$ref": "#/components/schemas/SyncPeriod",
+            "description": "How often the mirror is refreshed."
           }
         }
       },
@@ -2148,6 +2256,7 @@
               "cancel_all_scheduled_functions",
               "cancel_scheduled_function",
               "request_export",
+              "download_export",
               "cancel_export",
               "set_export_expiration",
               "create_integration",
@@ -2522,6 +2631,28 @@
               }
             ],
             "title": "PostHogErrorTracking"
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/S3ExportLogStreamConfig"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "logStreamType"
+                ],
+                "properties": {
+                  "logStreamType": {
+                    "type": "string",
+                    "enum": [
+                      "s3Export"
+                    ]
+                  }
+                }
+              }
+            ],
+            "title": "S3Export"
           }
         ]
       },
@@ -2617,6 +2748,7 @@
           "current_storage_usage",
           "concurrency_stats",
           "storage_api_bandwidth",
+          "ai_gateway_usage",
           "log_stream_egress",
           "custom_audit"
         ]
@@ -2633,7 +2765,8 @@
           "calls",
           "GB",
           "Query-GB",
-          "GB-hours"
+          "GB-hours",
+          "dollars"
         ]
       },
       "MetricUsageResponse": {
@@ -2770,6 +2903,71 @@
           }
         ]
       },
+      "S3ExportLogStreamConfig": {
+        "type": "object",
+        "title": "S3ExportConfig",
+        "required": [
+          "id",
+          "status",
+          "bucket",
+          "region",
+          "selection",
+          "period"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/LogStreamStatus",
+            "description": "Status of the integration"
+          },
+          "bucket": {
+            "type": "string",
+            "description": "Name of the S3 bucket being mirrored into."
+          },
+          "region": {
+            "type": "string",
+            "description": "AWS region the bucket lives in."
+          },
+          "prefix": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Key prefix within the bucket."
+          },
+          "accessKeyId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "AWS access key ID used to write to the bucket. The matching secret\naccess key is write-only and is never returned. Absent for role exports."
+          },
+          "roleArn": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ARN of the role Convex assumes to write. Empty until the admin pastes\nit. Absent for access-key exports."
+          },
+          "roleExternalId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Value the role's trust policy must require as `sts:ExternalId`."
+          },
+          "selection": {
+            "$ref": "#/components/schemas/Selection",
+            "description": "The components and tables being exported."
+          },
+          "period": {
+            "$ref": "#/components/schemas/SyncPeriod",
+            "description": "How often the mirror is refreshed."
+          }
+        }
+      },
       "SeedStatusResponse": {
         "type": "string",
         "description": "Progress of the historical-usage backfill. Only `complete` guarantees the\nreported usage reflects the full window. While the status is `pending` or\n`partial`, history from before this deployment was loaded may not be\nhydrated yet and the numbers can understate actual usage, so retry later for\nan accurate total. `failed` means the backfill couldn't hydrate any history.",
@@ -2842,6 +3040,15 @@
       "SyncId": {
         "type": "string",
         "description": "Unique id of a data sync, assigned by `/api/v1/data/sync` on the sync's\nfirst page and stable across its lifetime."
+      },
+      "SyncPeriod": {
+        "type": "string",
+        "description": "How often the mirror is refreshed from the deployment.",
+        "enum": [
+          "continuous",
+          "hourly",
+          "daily"
+        ]
       },
       "TableSelection": {
         "oneOf": [
@@ -3157,6 +3364,28 @@
               }
             ],
             "title": "PostHogErrorTracking"
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/UpdateS3ExportSinkArgs"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "logStreamType"
+                ],
+                "properties": {
+                  "logStreamType": {
+                    "type": "string",
+                    "enum": [
+                      "s3Export"
+                    ]
+                  }
+                }
+              }
+            ],
+            "title": "S3Export"
           }
         ]
       },
@@ -3214,6 +3443,49 @@
             "description": "The topics this log stream is subscribed to. Omit to keep the current\nsubscription, or pass `null` to subscribe to all topics (including ones\nadded in the future)."
           }
         }
+      },
+      "UpdateS3ExportSinkArgs": {
+        "type": "object",
+        "description": "Destination and AWS access key ID are fixed at creation.",
+        "properties": {
+          "secretAccessKey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A new secret for the export's access key ID. Access-key exports only."
+          },
+          "roleArn": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The role ARN from the customer's stack. Role exports only; sets or\nreplaces the ARN, within the same AWS account."
+          },
+          "selection": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Selection",
+                "description": "The components and tables to export. Each table exports whole\ndocuments, so filtering fields within a table is rejected."
+              }
+            ]
+          },
+          "period": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SyncPeriod",
+                "description": "How often the mirror is refreshed."
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
       },
       "UpdateSentrySinkArgs": {
         "type": "object",
@@ -3345,7 +3617,8 @@
           "queryMutationComputeGbHours",
           "actionComputeConvexGbHours",
           "actionComputeNodeJsGbHours",
-          "actionComputeCpuGbHours"
+          "actionComputeCpuGbHours",
+          "aiGatewayCostDollars"
         ]
       },
       "UsageLimitResponse": {

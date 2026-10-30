@@ -409,6 +409,9 @@ export interface components {
             createTime: number;
             prodDeploymentName?: string | null;
             devDeploymentName?: string | null;
+            prodDeploymentReference?: string | null;
+            devDeploymentReference?: string | null;
+            tags?: string[] | null;
         };
         /** @description Summary of a project WorkOS environment for list responses - slimmer than
          *     full environment details, uses workos_ prefix for consistency with
@@ -461,7 +464,7 @@ export interface components {
         };
         ReferralCode: string;
         /** @enum {string} */
-        RegionName: "aws-us-east-1" | "aws-eu-west-1";
+        RegionName: "aws-us-east-1" | "aws-eu-west-1" | "aws-ca-central-1" | "aws-ap-southeast-2";
         /** Format: int64 */
         TeamId: number;
         TeamName: string;

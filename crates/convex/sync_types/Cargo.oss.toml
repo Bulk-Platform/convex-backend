@@ -7,7 +7,7 @@ edition = "2021"
 rust-version = "1.85"
 resolver = "2"
 license = "Apache-2.0"
-repository = "https://github.com/get-convex/convex-rs"
+repository = "https://github.com/convex/convex-rs"
 homepage = "https://www.convex.dev/"
 
 [features]
@@ -25,6 +25,7 @@ rand = { version = "0.9" }
 serde = { features = [ "derive" ], version = "1" }
 serde_json = { features = [ "float_roundtrip", "preserve_order", "raw_value" ], version = "1" }
 strum = { version = "0.28", features = [ "derive" ] }
+thiserror = { version = "2" }
 uuid = { features = [ "serde", "v4" ], version = "1.6" }
 
 [dev-dependencies]
@@ -35,6 +36,7 @@ proptest-derive = { version = "0.5.0" }
 [lints.rust]
 unused_extern_crates = "warn"
 unused_features = "allow"
+unexpected_cfgs = { level = "warn", check-cfg = [ "cfg(rust_analyzer)" ] }
 
 [lints.clippy]
 await_holding_lock = "warn"

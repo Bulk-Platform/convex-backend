@@ -22,7 +22,11 @@ use common::{
         JsError,
     },
     execution_context::ExecutionContext,
-    knobs::NODE_ANALYZE_MAX_RETRIES,
+    knobs::{
+        GET_SERVICE_TOKEN_GUARANTEED_LIFETIME,
+        MAX_LOG_LINES_NODE_ACTIONS,
+        NODE_ANALYZE_MAX_RETRIES,
+    },
     log_lines::{
         run_function_and_collect_log_lines,
         LogLine,
@@ -606,6 +610,9 @@ impl TryFrom<ExecutorRequest> for JsonValue {
                     "sourcePackage": JsonValue::from(r.source_package),
                     "backendAddress": backend_address,
                     "timeoutSecs": timeout.as_secs_f64(),
+                    "maxLogLines": *MAX_LOG_LINES_NODE_ACTIONS,
+                    "serviceTokenGuaranteedLifetimeSecs":
+                        GET_SERVICE_TOKEN_GUARANTEED_LIFETIME.as_secs_f64(),
                     "backendCallbackToken": r.callback_token,
                     "authHeader": r.auth_header,
                     "userIdentity": r.user_identity.map(JsonValue::try_from).transpose()?,
