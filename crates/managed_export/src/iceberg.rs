@@ -41,6 +41,10 @@ use iceberg::{
     Catalog,
 };
 use parquet_iceberg::file::properties::WriterProperties;
+use value::{
+    export::ValueFormat,
+    ConvexObject,
+};
 
 #[path = "iceberg_writer.rs"]
 mod writer;
@@ -50,13 +54,13 @@ pub use writer::{
     SourceTable,
 };
 
-/// One document revision in a table's change log. A `None` payload records a
+/// One document revision in a table's change log. A `None` document records a
 /// deletion.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Change {
     pub id: String,
     pub ts: u64,
-    pub payload: Option<String>,
+    pub document: Option<ConvexObject>,
 }
 
 /// Every revision is a row; readers take the latest `ts` per `_id` and skip
@@ -84,6 +88,17 @@ pub(crate) async fn append(
     snapshot_properties: &HashMap<String, String>,
 ) -> Result<(Table, u64)> {
     let schema = table.metadata().current_schema().clone();
+    let payloads = changes
+        .iter()
+        .map(|c| {
+            c.document
+                .clone()
+                .map(|document| {
+                    serde_json::to_string(&document.export(ValueFormat::ConvexEncodedJSON))
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let batch = RecordBatch::try_new(
         Arc::new(schema_to_arrow_schema(&schema)?),
         vec![
@@ -95,10 +110,10 @@ pub(crate) async fn append(
                     .collect::<Result<Vec<_>, _>>()?,
             )),
             Arc::new(BooleanArray::from_iter(
-                changes.iter().map(|c| Some(c.payload.is_none())),
+                changes.iter().map(|c| Some(c.document.is_none())),
             )),
             Arc::new(StringArray::from_iter(
-                changes.iter().map(|c| c.payload.as_deref()),
+                payloads.iter().map(Option::as_deref),
             )),
         ],
     )?;
