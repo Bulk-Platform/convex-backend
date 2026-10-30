@@ -16,12 +16,22 @@ env:
 
 jobs:
   build:
-    name: Build and publish amd64 backend
+    name: Build and publish ${{ matrix.arch }} backend
     if:
       github.ref_type == 'branch' && (startsWith(github.ref_name,
       'codex/upgrade-convex-') || github.ref_name ==
       github.event.repository.default_branch)
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          # Native arm64 so local development on Apple Silicon can run the
+          # same image as production without emulation.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
 
     steps:
@@ -55,14 +65,15 @@ jobs:
         with:
           context: .
           file: self-hosted/docker-build/Dockerfile.backend
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.arch }}
           push: true
-          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha,scope=bulk-convex-backend-amd64
-          cache-to: type=gha,mode=max,scope=bulk-convex-backend-amd64
+          cache-from: type=gha,scope=bulk-convex-backend-${{ matrix.arch }}
+          cache-to:
+            type=gha,mode=max,scope=bulk-convex-backend-${{ matrix.arch }}
           provenance: false
           build-args: |
             VERGEN_GIT_SHA=${{ github.sha }}
@@ -79,12 +90,82 @@ jobs:
           docker run --rm --entrypoint node "$image" -e \
             "const assert = require('node:assert/strict'); const crypto = require('node:crypto'); assert.equal(crypto.createHash('sha256').update('bulk-node-runtime').digest('hex').length, 64); assert.equal(typeof fetch, 'function'); console.log(JSON.stringify(process.versions))"
 
+      - name: Record platform digest
+        run: |
+          mkdir -p digests
+          echo "${{ steps.build.outputs.digest }}" > "digests/${{ matrix.arch }}"
+
+      - name: Upload platform digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+  manifest:
+    name: Publish multi-arch backend
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Download platform digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch index
+        id: index
+        run: |
+          amd64="$(cat digests/amd64)"
+          arm64="$(cat digests/arm64)"
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${{ github.sha }}" \
+            "${IMAGE_NAME}@${amd64}" "${IMAGE_NAME}@${arm64}"
+          digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:${{ github.sha }}" \
+            --format '{{json .Manifest}}' | jq -r .digest)"
+          test -n "$digest"
+          platforms="$(docker buildx imagetools inspect "${IMAGE_NAME}@${digest}" \
+            --format '{{json .Manifest}}' | jq -r '[.manifests[].platform | .os + "/" + .architecture] | sort | join(",")')"
+          test "$platforms" = "linux/amd64,linux/arm64"
+          {
+            echo "digest=$digest"
+            echo "amd64=$amd64"
+            echo "arm64=$arm64"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test multi-arch reference
+        run: |
+          image="${IMAGE_NAME}@${{ steps.index.outputs.digest }}"
+          docker pull "$image"
+          docker run --rm --entrypoint /convex/convex-local-backend "$image" --help
+
       - name: Publish immutable image reference
         run: |
           {
             echo "### Bulk Convex backend"
             echo "Source: ${{ github.ref_name }} at ${{ github.sha }}"
+            echo ""
+            echo "Multi-arch (pin this one):"
             echo '```text'
-            echo "${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
+            echo "${IMAGE_NAME}@${{ steps.index.outputs.digest }}"
+            echo '```'
+            echo "Platform images:"
+            echo '```text'
+            echo "linux/amd64 ${IMAGE_NAME}@${{ steps.index.outputs.amd64 }}"
+            echo "linux/arm64 ${IMAGE_NAME}@${{ steps.index.outputs.arm64 }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

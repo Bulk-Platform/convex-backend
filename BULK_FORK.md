@@ -137,9 +137,12 @@ gh run list \
   --limit 1
 ```
 
-The workflow builds Linux AMD64, pushes
-`ghcr.io/bulk-platform/convex-backend:<commit-sha>`, smoke-tests the published
-binary, and prints the immutable `image@sha256:...` reference in its summary.
+The workflow builds Linux AMD64 and ARM64 natively on GitHub-hosted runners,
+smoke-tests each published platform image, then pushes a multi-arch index as
+`ghcr.io/bulk-platform/convex-backend:<commit-sha>` and prints its immutable
+`image@sha256:...` reference in the summary. Pin that multi-arch digest
+everywhere: production hosts resolve the AMD64 image and local development on
+Apple Silicon resolves the ARM64 image from the same reference.
 
 Do not deploy the commit tag or `latest`. Copy the immutable digest into a
 separate `bulk-infra` pull request and follow `runbooks/convex-runtime-fork.md`
