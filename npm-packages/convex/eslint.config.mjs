@@ -65,7 +65,7 @@ export default [
       sourceType: "module",
 
       parserOptions: {
-        project: ["./tsconfig.json"],
+        project: ["./tsconfig.json", "./bulk-tests/tsconfig.json"],
         tsconfigRootDir: __dirname,
       },
     },
