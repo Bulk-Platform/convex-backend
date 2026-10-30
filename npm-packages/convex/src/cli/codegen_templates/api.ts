@@ -1,4 +1,5 @@
 import { header } from "./common.js";
+import { segmentedApiDeclarations } from "./segmented_api.js";
 
 export function importPath(modulePath: string) {
   // Replace backslashes with forward slashes.
@@ -80,39 +81,23 @@ export function apiCodegen(
   opts?: { useTypeScript?: boolean },
 ) {
   const useTypeScript = opts?.useTypeScript ?? false;
-
-  if (!useTypeScript) {
-    // Generate separate .js and .d.ts files
-    const apiDTS = `${header("Generated `api` utility.")}
-  import type { ApiFromModules, FilterApi, FunctionReference } from "convex/server";
-  ${modulePaths
+  const imports = modulePaths
     .map(
       (modulePath) =>
         `import type * as ${moduleIdentifier(modulePath)} from "../${importPath(
           modulePath,
         )}.js";`,
     )
-    .join("\n")}
+    .join("\n");
 
-  /**
-   * A utility for referencing Convex functions in your app's API.
-   *
-   * Usage:
-   * \`\`\`js
-   * const myFunctionReference = api.myModule.myFunction;
-   * \`\`\`
-   */
-  declare const fullApi: ApiFromModules<{
-    ${modulePaths
-      .map(
-        (modulePath) =>
-          `"${importPath(modulePath)}": typeof ${moduleIdentifier(modulePath)},`,
-      )
-      .join("\n")}
-  }>;
-  export declare const api: FilterApi<typeof fullApi, FunctionReference<any, "public">>;
-  export declare const internal: FilterApi<typeof fullApi, FunctionReference<any, "internal">>;
-  `;
+  if (!useTypeScript) {
+    // Generate separate .js and .d.ts files
+    const apiDTS = `${header("Generated `api` utility.")}
+import type { ApiFromModules, FilterApi, FunctionReference } from "convex/server";
+${imports}
+
+${segmentedApiDeclarations(modulePaths, { useTypeScript: false })}
+`;
 
     const apiJS = `${header("Generated `api` utility.")}
   import { anyApi } from "convex/server";
@@ -137,43 +122,9 @@ export function apiCodegen(
     const apiTS = `${header("Generated `api` utility.")}
 import type { ApiFromModules, FilterApi, FunctionReference } from "convex/server";
 import { anyApi } from "convex/server";
-${modulePaths
-  .map(
-    (modulePath) =>
-      `import type * as ${moduleIdentifier(modulePath)} from "../${importPath(
-        modulePath,
-      )}.js";`,
-  )
-  .join("\n")}
+${imports}
 
-const fullApi: ApiFromModules<{
-  ${modulePaths
-    .map(
-      (modulePath) =>
-        `"${importPath(modulePath)}": typeof ${moduleIdentifier(modulePath)},`,
-    )
-    .join("\n")}
-}> = anyApi as any;
-
-/**
- * A utility for referencing Convex functions in your app's public API.
- *
- * Usage:
- * \`\`\`js
- * const myFunctionReference = api.myModule.myFunction;
- * \`\`\`
- */
-export const api: FilterApi<typeof fullApi, FunctionReference<any, "public">> = anyApi as any;
-
-/**
- * A utility for referencing Convex functions in your app's internal API.
- *
- * Usage:
- * \`\`\`js
- * const myFunctionReference = internal.myModule.myFunction;
- * \`\`\`
- */
-export const internal: FilterApi<typeof fullApi, FunctionReference<any, "internal">> = anyApi as any;
+${segmentedApiDeclarations(modulePaths, { useTypeScript: true })}
 `;
     return {
       TS: apiTS,
