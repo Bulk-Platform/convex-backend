@@ -20,6 +20,8 @@ import {
   useMyCustomRoles,
 } from "api/roles";
 import { useCurrentTeam } from "api/teams";
+import { useProfile } from "api/profile";
+import { defaultDevDeploymentReference } from "lib/deploymentReference";
 import { projectResource } from "lib/permissions";
 import { permissionDeniedTip } from "elements/permissionDeniedTip";
 import { HighlightMatch } from "elements/HighlightMatch";
@@ -51,6 +53,8 @@ export function ProjectCard({
     devDeploymentReference,
     isLoading: isLoadingDeployments,
   } = useDeploymentUris(id, slug);
+
+  const profile = useProfile();
 
   const hasAdminPermissions = useHasProjectAdminPermissions(project.id);
 
@@ -127,26 +131,27 @@ export function ProjectCard({
     </div>
   );
 
-  const deployments = isLoadingDeployments ? (
-    <Loading className="h-6 w-56 rounded-md" fullHeight={false} />
-  ) : isCustomRoleMember ? (
-    <DeploymentPill
-      href={deploymentsListHref}
-      label="Deployments"
-      icon={<LayersIcon />}
-    />
-  ) : (
-    <DeploymentLinks
-      isProdDefault={isProdDefault}
-      devHref={devHref}
-      prodHref={prodHref}
-      prodDeploymentName={prodDeploymentName}
-      devDeploymentName={devDeploymentName}
-      prodDeploymentReference={prodDeploymentReference}
-      devDeploymentReference={devDeploymentReference}
-      alignWidths={listItem}
-    />
-  );
+  const deployments =
+    isLoadingDeployments || profile === undefined ? (
+      <Loading className="h-6 w-56 rounded-md" fullHeight={false} />
+    ) : isCustomRoleMember ? (
+      <DeploymentPill
+        href={deploymentsListHref}
+        label="Deployments"
+        icon={<LayersIcon />}
+      />
+    ) : (
+      <DeploymentLinks
+        isProdDefault={isProdDefault}
+        devHref={devHref}
+        prodHref={prodHref}
+        prodDeploymentName={prodDeploymentName}
+        devDeploymentName={devDeploymentName}
+        prodDeploymentReference={prodDeploymentReference}
+        devDeploymentReference={devDeploymentReference}
+        defaultDevReference={defaultDevDeploymentReference(profile)}
+      />
+    );
 
   const created = (
     <div className="relative z-10 min-w-0">
@@ -227,7 +232,8 @@ export function ProjectCard({
 // where a click lands; hovering a specific pill outlines only that pill.
 //
 // Pills are labeled with the deployment's reference. Local dev deployments have
-// none and read as "local"; any other deployment without one reads as its type.
+// none and read as "local"; any other deployment without one reads as the
+// reference it would be created with.
 function DeploymentLinks({
   devHref,
   prodHref,
@@ -236,7 +242,7 @@ function DeploymentLinks({
   devDeploymentName,
   prodDeploymentReference,
   devDeploymentReference,
-  alignWidths,
+  defaultDevReference,
 }: {
   isProdDefault: boolean;
   devHref: string;
@@ -245,15 +251,13 @@ function DeploymentLinks({
   devDeploymentName: string | null;
   prodDeploymentReference: string | null;
   devDeploymentReference: string | null;
-  // Pads each pill to a fixed minimum so the pills line up across list rows,
-  // whether or not the deployment exists yet.
-  alignWidths?: boolean;
+  defaultDevReference: string;
 }) {
   return (
     <div className="flex min-w-0 gap-1.5">
       <DeploymentPill
         href={prodHref}
-        label={prodDeploymentReference ?? "Production"}
+        label={prodDeploymentReference ?? "production"}
         isDefault={isProdDefault}
         exists={prodDeploymentName !== null}
         icon={
@@ -262,7 +266,6 @@ function DeploymentLinks({
             className="text-purple-500 dark:text-purple-200"
           />
         }
-        className={alignWidths ? "min-w-25" : undefined}
         tip={
           prodDeploymentName === null
             ? "Add a new production deployment"
@@ -273,7 +276,9 @@ function DeploymentLinks({
         href={devHref}
         label={
           devDeploymentReference ??
-          (devDeploymentName?.startsWith("local-") ? "local" : "Development")
+          (devDeploymentName?.startsWith("local-")
+            ? "local"
+            : defaultDevReference)
         }
         isDefault={!isProdDefault}
         exists={devDeploymentName !== null}
@@ -283,7 +288,6 @@ function DeploymentLinks({
             className="text-green-700 dark:text-green-500"
           />
         }
-        className={alignWidths ? "min-w-28" : undefined}
         tip={
           devDeploymentName === null
             ? "Add a new personal dev deployment"
@@ -300,7 +304,6 @@ function DeploymentPill({
   icon,
   isDefault = false,
   exists = true,
-  className,
   tip,
 }: {
   href: string;
@@ -309,7 +312,6 @@ function DeploymentPill({
   icon: ReactNode;
   isDefault?: boolean;
   exists?: boolean;
-  className?: string;
   tip?: ReactNode;
 }) {
   const link = (
@@ -321,7 +323,6 @@ function DeploymentPill({
         !exists && "border-dashed text-content-secondary",
         isDefault &&
           "group-hover:border-border-selected group-has-[[data-deployment-pill]:hover]:border-border-transparent hover:border-border-selected!",
-        className,
       )}
     >
       <span
@@ -330,7 +331,9 @@ function DeploymentPill({
       >
         {exists ? icon : <PlusIcon />}
       </span>
-      <span className="truncate">{label}</span>
+      {/* Labels are mostly lowercase references, and Inter's x-height sits
+          below the line box's center, so nudge them up to center on the icon. */}
+      <span className="translate-y-[-0.5px] truncate">{label}</span>
     </Link>
   );
 

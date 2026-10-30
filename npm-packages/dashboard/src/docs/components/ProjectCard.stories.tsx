@@ -4,6 +4,7 @@ import { ProjectResponse } from "@convex-dev/platform/managementApi";
 import { ProjectCard } from "components/projects/ProjectCard";
 import { useProjectById } from "api/projects";
 import { useCurrentTeam } from "api/teams";
+import { useProfile } from "api/profile";
 import { useHasProjectAdminPermissions } from "api/roles";
 import { mocked, userEvent, within } from "storybook/test";
 import { cn } from "@ui/cn";
@@ -45,6 +46,11 @@ const meta = {
       error: undefined,
     });
     mocked(useHasProjectAdminPermissions).mockReturnValue(true);
+    mocked(useProfile).mockReturnValue({
+      id: 1,
+      name: "Jane Doe",
+      email: "jane@acme.dev",
+    });
   },
   render: (args) => (
     <div className="w-full max-w-sm">
