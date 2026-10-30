@@ -5,15 +5,18 @@
 
 import { ScaleModule } from "./scale_fixture.js";
 
-const PRELUDE = `import { api, internal } from "./_generated/api";
-import type { FunctionArgs, FunctionReference, FunctionReturnType } from "convex/server";
-
-type Expect<T extends true> = T;
+/** Exact-type assertions for probe files: `Expect<Equal<A, B>>` and friends. */
+export const TYPE_ASSERTIONS = `type Expect<T extends true> = T;
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
 type IsAny<T> = 0 extends 1 & T ? true : false;
 type IsNever<T> = [T] extends [never] ? true : false;
 type Concrete<T> = IsAny<T> extends true ? false : IsNever<T> extends true ? false : true;
-type Get<I extends number> = FunctionReference<"query", "public", { id: string; limit?: number | undefined }, { module: I; id: string }>;
+`;
+
+const PRELUDE = `import { api, internal } from "./_generated/api";
+import type { FunctionArgs, FunctionReference, FunctionReturnType } from "convex/server";
+
+${TYPE_ASSERTIONS}type Get<I extends number> = FunctionReference<"query", "public", { id: string; limit?: number | undefined }, { module: I; id: string }>;
 type Set = FunctionReference<"mutation", "public", { id: string; value: "a" | "b" }, boolean>;
 type Sweep<I extends number> = FunctionReference<"query", "internal", { before: number }, { swept: I }>;
 `;

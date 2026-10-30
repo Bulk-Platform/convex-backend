@@ -6,6 +6,10 @@ import fs from "fs";
 import path from "path";
 import ts from "typescript";
 import { fileURLToPath } from "url";
+import {
+  importPath,
+  moduleIdentifier,
+} from "../src/cli/codegen_templates/api.js";
 
 export const packageRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -84,19 +88,31 @@ export const helper = (s: string) => s.trim();
 `;
 }
 
-const strip = (p: string) => p.replace(/\.ts$/, "");
-const ident = (p: string) => strip(p).replace(/[/.-]/g, "_");
+/** An `api.d.ts` with upstream's imports for `modulePaths` around `declarations`. */
+export function apiDts(modulePaths: string[], declarations: string) {
+  const imports = modulePaths.map(
+    (p) =>
+      `import type * as ${moduleIdentifier(p)} from "../${importPath(p)}.js";`,
+  );
+  return `import type { ApiFromModules, FilterApi, FunctionReference } from "convex/server";
+${imports.join("\n")}
+${declarations}
+`;
+}
 
 /** Upstream `convex@1.46.0`'s api.d.ts: one `ApiFromModules` over every module. */
 export function monolithicApiDts(modulePaths: string[]) {
-  return `import type { ApiFromModules, FilterApi, FunctionReference } from "convex/server";
-${modulePaths.map((p) => `import type * as ${ident(p)} from "../${strip(p)}.js";`).join("\n")}
-declare const fullApi: ApiFromModules<{
-${modulePaths.map((p) => `  "${strip(p)}": typeof ${ident(p)},`).join("\n")}
+  const entries = modulePaths.map(
+    (p) => `  "${importPath(p)}": typeof ${moduleIdentifier(p)},`,
+  );
+  return apiDts(
+    modulePaths,
+    `declare const fullApi: ApiFromModules<{
+${entries.join("\n")}
 }>;
 export declare const api: FilterApi<typeof fullApi, FunctionReference<any, "public">>;
-export declare const internal: FilterApi<typeof fullApi, FunctionReference<any, "internal">>;
-`;
+export declare const internal: FilterApi<typeof fullApi, FunctionReference<any, "internal">>;`,
+  );
 }
 
 /** Module sources keyed by their path under `convex/`. */

@@ -29,6 +29,7 @@ import {
 } from "./scale_fixture.js";
 import {
   NEGATIVE_CASES,
+  TYPE_ASSERTIONS,
   negativeCaseLines,
   negativeProbes,
   positiveProbes,
@@ -165,8 +166,7 @@ test(
     const topLevel = [...new Set(paths.map((p) => p.split(/[/.]/)[0]))];
     const probe = `import type * as mono from "./_generated/api_mono";
 import { api, internal } from "./_generated/api";
-type Expect<T extends true> = T;
-type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
+${TYPE_ASSERTIONS}
 export type ApiKeys = Expect<Equal<keyof typeof mono.api | "ops", keyof typeof api>>;
 export type InternalKeys = Expect<Equal<keyof typeof mono.internal, keyof typeof internal>>;
 export type Ops = Expect<Equal<(typeof api)["ops"], {}>>;

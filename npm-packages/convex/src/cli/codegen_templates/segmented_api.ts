@@ -13,80 +13,63 @@ import { apiComment } from "./common.js";
 /** Folders with more modules than this are split again by their subfolders. */
 export const MAX_MODULES_PER_API_CHUNK = 400;
 
+// The backend only accepts `[A-Za-z0-9_.]` in module path components
+// (`sync_types/src/path.rs`), so names with a `$` never collide with a module.
+const SEGMENT_TYPE = "ApiSegment$";
+const CHUNK_PREFIX = "fullApi$";
+
+type Visibility = "public" | "internal";
+type Chunk = { name: string; prefix: string[]; modulePaths: string[] };
 type ApiNode =
-  | { type: "chunk"; prefix: string[]; modulePaths: string[] }
-  | {
-      type: "branch";
-      self: ApiNode | null;
-      children: Map<string, ApiNode>;
-    };
+  | { type: "chunk"; chunk: Chunk }
+  // A folder over the chunk limit: its own module (`foo.ts` for `foo/`), if
+  // any, and its subfolders and modules.
+  | { type: "folder"; self: Chunk | null; children: ApiChildren };
+type ApiChildren = Map<string, ApiNode>;
 
 export function segmentedApiDeclarations(
   modulePaths: string[],
   opts: { useTypeScript: boolean; maxModulesPerChunk?: number | undefined },
 ): string {
   const maxModules = opts.maxModulesPerChunk ?? MAX_MODULES_PER_API_CHUNK;
-  const taken = new Set(modulePaths.map(moduleIdentifier));
-  const uniqueName = (base: string) => {
-    let name = base;
-    while (taken.has(name)) {
-      name = `_${name}`;
-    }
-    taken.add(name);
-    return name;
+  const chunks: Chunk[] = [];
+  const addChunk = (prefix: string[], paths: string[]): Chunk => {
+    const chunk = {
+      name: `${CHUNK_PREFIX}${chunks.length}`,
+      prefix,
+      modulePaths: paths,
+    };
+    chunks.push(chunk);
+    return chunk;
   };
-  const segmentType = uniqueName("ApiSegment");
-  const chunkPrefix = uniqueName("fullApi$");
-
-  const chunks: { name: string; modulePaths: string[] }[] = [];
-  const root = buildNode([], modulePaths, maxModules, true);
-
-  const nameChunks = (node: ApiNode) => {
-    if (node.type === "chunk") {
-      chunks.push({
-        name: `${chunkPrefix}${chunks.length}`,
-        modulePaths: node.modulePaths,
-      });
-      return;
+  const buildChildren = (prefix: string[], groups: Map<string, string[]>) => {
+    const children: ApiChildren = new Map();
+    for (const [key, paths] of groups) {
+      children.set(key, buildNode([...prefix, key], paths));
     }
-    if (node.self) {
-      nameChunks(node.self);
-    }
-    for (const child of node.children.values()) {
-      nameChunks(child);
-    }
+    return children;
   };
-  nameChunks(root);
-  const chunkNames = new Map(
-    chunks.map((chunk) => [chunk.modulePaths, chunk.name]),
-  );
-
-  const typeOf = (node: ApiNode, visibility: string): string => {
-    if (node.type === "chunk") {
-      const name = chunkNames.get(node.modulePaths)!;
-      return `${segmentType}<FilterApi<typeof ${name}, FunctionReference<any, "${visibility}">>, ${JSON.stringify(node.prefix)}>`;
+  const buildNode = (prefix: string[], paths: string[]): ApiNode => {
+    if (paths.length <= maxModules) {
+      return { type: "chunk", chunk: addChunk(prefix, paths) };
     }
-    const members = [...node.children].map(
-      ([key, child]) => `${JSON.stringify(key)}: ${typeOf(child, visibility)};`,
-    );
-    const branch = `{\n${members.join("\n")}\n}`;
-    if (node === root) {
-      // Kept as a plain object type so TypeScript resolves each top-level
-      // folder only when it is used.
-      return branch;
-    }
-    // A folder split into several chunks: merge and filter again so it types
-    // exactly like the single-chunk shape (empty subfolders dropped).
-    const merged = node.self
-      ? `${typeOf(node.self, visibility)} & ${branch}`
-      : branch;
-    return `FilterApi<${merged}, FunctionReference<any, "${visibility}">>`;
+    const { self, groups } = groupByNextSegment(prefix, paths);
+    return {
+      type: "folder",
+      self: self.length > 0 ? addChunk(prefix, self) : null,
+      children: buildChildren(prefix, groups),
+    };
   };
+  // Every module path has at least one segment, so the root is never a module.
+  const root = buildChildren([], groupByNextSegment([], modulePaths).groups);
 
-  const lines: string[] = [];
-  lines.push(
-    `type ${segmentType}<T, Path extends string[]> = Path extends [infer Head extends string, ...infer Rest extends string[]] ? (Head extends keyof T ? ${segmentType}<T[Head], Rest> : {}) : T;`,
-  );
+  const declareConst = (nameAndType: string) =>
+    opts.useTypeScript
+      ? `const ${nameAndType} = anyApi as any;`
+      : `declare const ${nameAndType};`;
+  const lines = [
+    `type ${SEGMENT_TYPE}<T, Path extends string[]> = Path extends [infer Head extends string, ...infer Rest extends string[]] ? (Head extends keyof T ? ${SEGMENT_TYPE}<T[Head], Rest> : {}) : T;`,
+  ];
   for (const chunk of chunks) {
     const entries = chunk.modulePaths
       .map(
@@ -94,56 +77,70 @@ export function segmentedApiDeclarations(
           `  "${importPath(modulePath)}": typeof ${moduleIdentifier(modulePath)},`,
       )
       .join("\n");
-    lines.push(
-      opts.useTypeScript
-        ? `const ${chunk.name}: ApiFromModules<{\n${entries}\n}> = anyApi as any;`
-        : `declare const ${chunk.name}: ApiFromModules<{\n${entries}\n}>;`,
-    );
+    lines.push(declareConst(`${chunk.name}: ApiFromModules<{\n${entries}\n}>`));
   }
   for (const [name, visibility] of [
     ["api", "public"],
     ["internal", "internal"],
   ] as const) {
     lines.push(apiComment(name, visibility));
+    // The root stays a plain object type so TypeScript resolves each
+    // top-level folder only when it is used.
     lines.push(
-      opts.useTypeScript
-        ? `export const ${name}: ${typeOf(root, visibility)} = anyApi as any;`
-        : `export declare const ${name}: ${typeOf(root, visibility)};`,
+      `export ${declareConst(`${name}: ${objectType(root, visibility)}`)}`,
     );
   }
   return lines.join("\n");
 }
 
-function buildNode(
-  prefix: string[],
-  modulePaths: string[],
-  maxModules: number,
-  isRoot: boolean,
-): ApiNode {
-  if (!isRoot && modulePaths.length <= maxModules) {
-    return { type: "chunk", prefix, modulePaths };
-  }
-  let selfPaths: string[] = [];
+/**
+ * Split `paths` under the folder `prefix` into the module at `prefix` itself
+ * and groups keyed by the next path segment.
+ */
+function groupByNextSegment(prefix: string[], paths: string[]) {
+  const self: string[] = [];
   const groups = new Map<string, string[]>();
-  for (const modulePath of modulePaths) {
+  for (const modulePath of paths) {
     const parts = importPath(modulePath).split("/");
     if (parts.length === prefix.length) {
-      selfPaths = [modulePath];
+      self.push(modulePath);
       continue;
     }
     const key = parts[prefix.length];
-    groups.set(key, [...(groups.get(key) ?? []), modulePath]);
+    const group = groups.get(key);
+    if (group) {
+      group.push(modulePath);
+    } else {
+      groups.set(key, [modulePath]);
+    }
   }
-  const children = new Map<string, ApiNode>();
-  for (const [key, paths] of groups) {
-    children.set(key, buildNode([...prefix, key], paths, maxModules, false));
+  return { self, groups };
+}
+
+function filterApi(type: string, visibility: Visibility) {
+  return `FilterApi<${type}, FunctionReference<any, "${visibility}">>`;
+}
+
+function chunkType(chunk: Chunk, visibility: Visibility) {
+  return `${SEGMENT_TYPE}<${filterApi(`typeof ${chunk.name}`, visibility)}, ${JSON.stringify(chunk.prefix)}>`;
+}
+
+function objectType(children: ApiChildren, visibility: Visibility) {
+  const members = [...children].map(
+    ([key, child]) => `${JSON.stringify(key)}: ${nodeType(child, visibility)};`,
+  );
+  return `{\n${members.join("\n")}\n}`;
+}
+
+function nodeType(node: ApiNode, visibility: Visibility): string {
+  if (node.type === "chunk") {
+    return chunkType(node.chunk, visibility);
   }
-  return {
-    type: "branch",
-    self:
-      selfPaths.length > 0
-        ? { type: "chunk", prefix, modulePaths: selfPaths }
-        : null,
-    children,
-  };
+  // A folder split into several chunks: merge and filter again so it types
+  // exactly like the single-chunk shape (empty subfolders dropped).
+  const children = objectType(node.children, visibility);
+  return filterApi(
+    node.self ? `${chunkType(node.self, visibility)} & ${children}` : children,
+    visibility,
+  );
 }
