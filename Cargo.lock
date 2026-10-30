@@ -456,6 +456,7 @@ dependencies = [
  "isolate",
  "itertools 0.14.0",
  "keybroker",
+ "libc",
  "log_streaming",
  "lru 0.18.5",
  "maplit",
