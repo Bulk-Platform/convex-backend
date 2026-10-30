@@ -35,6 +35,12 @@ use aws_sdk_s3::{
     primitives::ByteStream,
 };
 use errors::ErrorMetadata;
+use iceberg::spec::{
+    PrimitiveType,
+    Schema,
+    TableMetadata,
+    Type,
+};
 use serde::{
     Deserialize,
     Serialize,
@@ -215,10 +221,11 @@ impl ExportStore {
         }
         for (name, location) in &state.tables {
             let Some(current) = published.remove(name) else {
+                let columns = self.read_glue_columns(location).await?;
                 self.glue
                     .create_table()
                     .database_name(&self.database)
-                    .table_input(table_input(name, location, None, state)?)
+                    .table_input(table_input(name, location, None, columns, state)?)
                     .send()
                     .await
                     .map_err(|e| aws_error(e, "create a Glue table"))?;
@@ -230,11 +237,12 @@ impl ExportStore {
             if previous == Some(location) || state.published(&parameters) {
                 continue;
             }
+            let columns = self.read_glue_columns(location).await?;
             let mut update = self
                 .glue
                 .update_table()
                 .database_name(&self.database)
-                .table_input(table_input(name, location, previous, state)?)
+                .table_input(table_input(name, location, previous, columns, state)?)
                 .skip_archive(true);
             if let Some(version_id) = current.version_id {
                 update = update.version_id(version_id);
@@ -257,6 +265,29 @@ impl ExportStore {
                 .map_err(|e| aws_error(e, "drop a Glue table"))?;
         }
         Ok(())
+    }
+
+    /// The Glue columns for the table whose current metadata file is at
+    /// `metadata_location`. Athena reads the Iceberg schema itself, but the
+    /// Glue console, crawlers and Lake Formation show the Glue columns.
+    async fn read_glue_columns(&self, metadata_location: &str) -> Result<Vec<Column>> {
+        let key = metadata_location
+            .strip_prefix(&format!("s3://{}/", self.bucket))
+            .with_context(|| {
+                format!("Metadata location {metadata_location} is outside the bucket")
+            })?;
+        let output = self
+            .s3
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| aws_error(e, "read a table's metadata"))?;
+        let bytes = output.body.collect().await?.into_bytes();
+        let metadata: TableMetadata =
+            serde_json::from_slice(&bytes).context("Cannot parse a table's metadata")?;
+        glue_columns(metadata.current_schema())
     }
 
     async fn ensure_database(&self) -> Result<()> {
@@ -313,10 +344,37 @@ where
     }
 }
 
+/// Glue's Hive type names for the primitive types the export writes. Nested
+/// values are stored as JSON strings, so nested types never appear.
+fn glue_columns(schema: &Schema) -> Result<Vec<Column>> {
+    schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| {
+            let kind = match &*field.field_type {
+                Type::Primitive(PrimitiveType::String) => "string",
+                Type::Primitive(PrimitiveType::Long) => "bigint",
+                Type::Primitive(PrimitiveType::Double) => "double",
+                Type::Primitive(PrimitiveType::Boolean) => "boolean",
+                Type::Primitive(PrimitiveType::Binary) => "binary",
+                Type::Primitive(PrimitiveType::Timestamptz) => "timestamp",
+                other => bail!("Column {} has unsupported type {other}", field.name),
+            };
+            Ok(Column::builder()
+                .name(&field.name)
+                .r#type(kind)
+                .set_comment(field.doc.clone())
+                .build()?)
+        })
+        .collect()
+}
+
 fn table_input(
     name: &str,
     metadata_location: &str,
     previous: Option<&str>,
+    columns: Vec<Column>,
     state: &ExportState,
 ) -> Result<TableInput> {
     let location = metadata_location
@@ -332,16 +390,6 @@ fn table_input(
     if let Some(previous) = previous {
         parameters.insert("previous_metadata_location".to_owned(), previous.to_owned());
     }
-    // The columns mirror `change_log_schema`, which never changes.
-    let columns = [
-        ("_id", "string"),
-        ("ts", "bigint"),
-        ("deleted", "boolean"),
-        ("payload", "string"),
-    ]
-    .into_iter()
-    .map(|(name, kind)| Column::builder().name(name).r#type(kind).build())
-    .collect::<Result<Vec<_>, _>>()?;
     Ok(TableInput::builder()
         .name(name)
         .table_type("EXTERNAL_TABLE")
