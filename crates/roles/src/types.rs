@@ -269,8 +269,8 @@ pub enum RolePolicyAction {
     CreateTeamDomain,
     DeleteTeamDomain,
     ViewTeamDomains,
-    /// Lists every tag on the team's projects, including tags carried only by
-    /// projects the member can't view.
+    /// Reads the tags on the team's projects, and lists every tag on them,
+    /// including tags carried only by projects the member can't view.
     ViewProjectTags,
     // Team Access Tokens
     CreateTeamAccessToken {

@@ -4,10 +4,11 @@ export function ProjectTags({
   tags,
   chipClassName,
 }: {
-  tags: string[];
+  // Undefined when the viewer lacks `team:projectTags:view`.
+  tags?: string[] | null;
   chipClassName?: string;
 }) {
-  if (tags.length === 0) {
+  if (!tags?.length) {
     return null;
   }
 

@@ -4545,8 +4545,7 @@
           "slug",
           "teamId",
           "teamSlug",
-          "createTime",
-          "tags"
+          "createTime"
         ],
         "properties": {
           "id": {
@@ -4601,7 +4600,10 @@
             "description": "The reference of the requesting member's default development deployment\nfor this project, if one exists and is a cloud deployment (e.g.\n\"dev/jane-doe\")."
           },
           "tags": {
-            "type": "array",
+            "type": [
+              "array",
+              "null"
+            ],
             "items": {
               "type": "string"
             }

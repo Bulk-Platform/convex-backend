@@ -1615,7 +1615,7 @@ export interface components {
              *     for this project, if one exists and is a cloud deployment (e.g.
              *     "dev/jane-doe"). */
             devDeploymentReference?: string | null;
-            tags: string[];
+            tags?: string[] | null;
         };
         ProjectSlug: string;
         ProjectTagResponse: {

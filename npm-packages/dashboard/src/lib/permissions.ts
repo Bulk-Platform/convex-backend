@@ -643,14 +643,18 @@ export function teamTokenResource(creator: number | null): ConcreteResource {
   };
 }
 
-type ProjectAttributes = { id: number; slug: string; tags: string[] };
+type ProjectAttributes = {
+  id: number;
+  slug: string;
+  tags?: string[] | null;
+};
 
 function projectSegment(project: ProjectAttributes): ConcreteSegment {
   return {
     kind: "project",
     id: project.id,
     slug: project.slug,
-    tags: project.tags,
+    tags: project.tags ?? [],
   };
 }
 
