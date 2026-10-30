@@ -16,6 +16,9 @@ env:
 jobs:
   build:
     name: Build Convex Backend
+    # These AWS labels and restore-only caches belong to upstream. Bulk uses
+    # bulk_release_backend.yml and its isolated runtime canary instead.
+    if: github.repository == 'get-convex/convex-backend'
     runs-on: [self-hosted, aws, x64, xlarge]
 
     steps:

@@ -28,8 +28,12 @@ if (!versionMatch) {
 
 const tsVersion = versionMatch[1];
 
-// Compare versions
-if (packageVersion !== tsVersion) {
+// Compare versions. Bulk fork releases publish `<upstream>-bulk.<n>` while
+// src/index.ts keeps reporting the upstream version to the backend.
+const isBulkRelease = new RegExp(
+  `^${tsVersion.replace(/\./g, "\\.")}-bulk\\.\\d+$`,
+).test(packageVersion);
+if (packageVersion !== tsVersion && !isBulkRelease) {
   console.error(
     `Version mismatch!\n` +
       `  package.json:  ${packageVersion}\n` +
