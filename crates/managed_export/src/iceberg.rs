@@ -24,9 +24,14 @@ use iceberg::{
     Catalog,
 };
 use parquet_iceberg::file::properties::WriterProperties;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use strum::{
     Display,
     EnumString,
+    IntoStaticStr,
 };
 use value::ConvexObject;
 
@@ -44,8 +49,12 @@ pub use writer::{
 
 /// How a table lays out a document. An export keeps the format it started
 /// with, so its stream never pauses for a format change. New exports start in
-/// `Typed`. The string form is the `convex.porter.encoding` table property.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Display, EnumString)]
+/// `Typed`. The string form is the `convex.porter.encoding` table property and
+/// the `format` field of the export's state.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Display, EnumString, IntoStaticStr, Serialize, Deserialize,
+)]
+#[serde(into = "&'static str", try_from = "String")]
 pub enum Format {
     /// `_id`, `ts`, `deleted`, and the whole document in a JSON `payload`.
     #[strum(serialize = "convex-change-log-json-v1")]
@@ -53,6 +62,14 @@ pub enum Format {
     /// Metadata columns, then one typed column per top-level document field.
     #[strum(serialize = "convex-change-log-typed-v1")]
     Typed,
+}
+
+impl TryFrom<String> for Format {
+    type Error = strum::ParseError;
+
+    fn try_from(encoding: String) -> Result<Self, Self::Error> {
+        encoding.parse()
+    }
 }
 
 /// One document revision in a table's change log. A `None` document records a

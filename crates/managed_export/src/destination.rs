@@ -46,7 +46,10 @@ use serde::{
     Serialize,
 };
 
-use crate::iceberg::S3Destination;
+use crate::iceberg::{
+    Format,
+    S3Destination,
+};
 
 const EXPORT_ID_PARAMETER: &str = "convex.export-id";
 const PAGE_PARAMETER: &str = "convex.page";
@@ -56,6 +59,10 @@ pub struct ExportState {
     /// The `_log_sinks` document of the export that wrote this state. A
     /// different ID means the export was recreated, so the state is ignored.
     pub export_id: String,
+    /// The format of the export's Iceberg tables, for life. A state from
+    /// before this field is in the JSON format, the only one that existed then.
+    #[serde(default = "default_format")]
+    pub format: Format,
     /// Number of pages committed by this export.
     pub page: u64,
     /// Base64 `SyncCursor` after page `page`. `None` before the first page.
@@ -67,10 +74,16 @@ pub struct ExportState {
     pub retired: BTreeSet<String>,
 }
 
+fn default_format() -> Format {
+    Format::Json
+}
+
 impl ExportState {
+    /// A state with no pages, in the format new exports start in.
     pub fn fresh(export_id: &str) -> Self {
         Self {
             export_id: export_id.to_owned(),
+            format: Format::Typed,
             page: 0,
             cursor: None,
             tables: BTreeMap::new(),
@@ -87,6 +100,7 @@ impl ExportState {
     ) -> Self {
         Self {
             export_id: self.export_id.clone(),
+            format: self.format,
             page: self.page + 1,
             cursor: Some(cursor),
             tables,
