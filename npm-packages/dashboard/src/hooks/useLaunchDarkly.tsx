@@ -16,6 +16,7 @@ export const flagDefaults: {
   componentSwitcherTreeEnabled: boolean;
   preAuthorizeStarterPlan: boolean;
   preAuthorizePaymentMethodChange: boolean;
+  tagEditUi: boolean;
 } = {
   commandPaletteDeleteProjects: false,
   enableNewDashboardVersionNotification: false,
@@ -31,6 +32,7 @@ export const flagDefaults: {
   componentSwitcherTreeEnabled: false,
   preAuthorizeStarterPlan: false,
   preAuthorizePaymentMethodChange: false,
+  tagEditUi: false,
 };
 
 export const flagDefaultsKebabCase = Object.entries(flagDefaults).reduce(
