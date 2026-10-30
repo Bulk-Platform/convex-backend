@@ -75,6 +75,10 @@
       "import": "./dist/Checkbox.jsx",
       "types": "./dist/Checkbox.d.ts"
     },
+    "./Chip": {
+      "import": "./dist/Chip.jsx",
+      "types": "./dist/Chip.d.ts"
+    },
     "./ConfirmationDialog": {
       "import": "./dist/ConfirmationDialog.jsx",
       "types": "./dist/ConfirmationDialog.d.ts"
