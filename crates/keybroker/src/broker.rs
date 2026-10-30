@@ -99,6 +99,7 @@ use sync_types::{
 };
 
 use crate::{
+    deployment_jwt::DeploymentJwtKeys,
     encryptor::{
         DeterministicEncryptor,
         Purpose,
@@ -138,6 +139,7 @@ pub struct KeyBroker {
     export_download_encryptor: RandomEncryptor,
     journal_encryptor: RandomEncryptor,
     store_file_encryptor: RandomEncryptor,
+    deployment_jwt_keys: DeploymentJwtKeys,
 }
 
 // This enum encodes a successful authentication decision, and its nontrivial
@@ -882,12 +884,14 @@ impl AdminIdentity {
     }
 }
 
+// `key` is a usable admin key, so it is omitted to keep it out of logs, spans,
+// and error contexts that `{:?}`-format identities.
 impl fmt::Debug for AdminIdentity {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "{}/{:?}/{}/{:?}",
-            self.deployment_name, self.principal, self.key, self.allowed_ops,
+            "{}/{:?}/{:?}/read_only={}",
+            self.deployment_name, self.principal, self.allowed_ops, self.is_read_only,
         )
     }
 }
@@ -944,6 +948,7 @@ impl KeyBroker {
                 &deployment_secret,
                 Purpose::STORE_FILE_AUTHORIZATION,
             )?,
+            deployment_jwt_keys: DeploymentJwtKeys::derive_from_secret(&deployment_secret)?,
         })
     }
 
@@ -968,11 +973,16 @@ impl KeyBroker {
         &self.data_sync_encryptor
     }
 
+    pub fn deployment_jwt_keys(&self) -> &DeploymentJwtKeys {
+        &self.deployment_jwt_keys
+    }
+
     pub fn function_runner_keybroker(&self) -> FunctionRunnerKeyBroker {
         FunctionRunnerKeyBroker {
             instance_name: self.deployment_name.clone(),
             cursor_encryptor: self.cursor_encryptor.clone(),
             store_file_encryptor: self.store_file_encryptor.clone(),
+            deployment_jwt_keys: Some(self.deployment_jwt_keys.clone()),
         }
     }
 
@@ -1055,7 +1065,13 @@ impl KeyBroker {
                     .decode_proto(ADMIN_KEY_VERSION, encrypted_part)
                     .inspect(|_| log_legacy_admin_key())
             })
-            .with_context(|| format!("Couldn't decode the AdminKeyProto {key}"))?;
+            .with_context(|| {
+                format!(
+                    "Couldn't decode the AdminKeyProto for deployment {instance_name:?} (key \
+                     length {})",
+                    key.len()
+                )
+            })?;
         let instance_name = instance_name
             .or(instance_name_from_encrypted_part.as_deref())
             .context("Invalid admin key format")?;
@@ -1351,6 +1367,9 @@ pub struct FunctionRunnerKeyBroker {
     pub instance_name: String,
     pub cursor_encryptor: DeterministicEncryptor,
     pub store_file_encryptor: RandomEncryptor,
+    /// `None` only in a function runner whose caller predates the key: old
+    /// callers can run everything but `ctx.auth.signJwt`.
+    pub deployment_jwt_keys: Option<DeploymentJwtKeys>,
 }
 
 impl FunctionRunnerKeyBroker {
@@ -1361,6 +1380,9 @@ impl FunctionRunnerKeyBroker {
         component: ComponentId,
     ) -> anyhow::Result<StoreFileAuthorization> {
         let now = rt.unix_timestamp();
+        // Snapshot-bounded UDF time can be ahead of wall time. Cap issuance at
+        // wall time so clock skew cannot extend the token's validity.
+        let issued = issued.min(now);
         if (now - issued) > MAX_TS_DELAY {
             anyhow::bail!("Could not issue authorization. Issued TS too far in past.");
         }

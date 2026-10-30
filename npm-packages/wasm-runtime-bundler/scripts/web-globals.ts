@@ -2,12 +2,43 @@
 // `bundle-web-globals.mjs` and evaluated by the guest before a deployment's
 // modules are.
 //
-// These come from `udf-runtime` — the same sources the V8 runtime installs —
-// so the two runtimes agree on behavior rather than each carrying its own
-// implementation. Only the setups that need nothing from the host are here;
-// the rest reach for syscalls that are unavailable while a bundle evaluates.
-import { setupDOMException } from "udf-runtime/src/01_dom_exception";
+// These come from `udf-runtime`, the same sources the V8 runtime installs.
+import { setupDate } from "udf-runtime/src/00_date.js";
+import { setupMisc } from "udf-runtime/src/00_misc";
+import { setupWeakRefs } from "udf-runtime/src/00_weakref";
+import { setupConsole } from "udf-runtime/src/02_console";
+import { setupStructuredClone } from "udf-runtime/src/02_structured_clone";
 import { setupEvent } from "udf-runtime/src/02_event";
+import { setupTimers } from "udf-runtime/src/02_timers";
+import { setupStreams } from "udf-runtime/src/06_streams";
+import { setupBlob } from "udf-runtime/src/09_file";
+import { setupAbortSignal } from "udf-runtime/src/03_abort_signal";
+import { setupAsyncHooks } from "udf-runtime/src/04_async_hooks";
+import { setupHeaders } from "udf-runtime/src/20_headers";
+import { setupFormData } from "udf-runtime/src/21_formdata";
+import { setupRequest } from "udf-runtime/src/23_request";
+import { setupResponse } from "udf-runtime/src/23_response";
+import { setupFetch } from "udf-runtime/src/26_fetch";
+import { setupPerformance } from "udf-runtime/src/27_performance";
+import { setupJsSyscall } from "udf-runtime/src/js_syscall";
+import { setupTextEncodingStreams } from "./text-encoding-streams";
 
-setupDOMException(globalThis);
+setupDate(globalThis);
+setupMisc(globalThis);
+setupWeakRefs(globalThis);
+setupConsole(globalThis);
+setupStructuredClone(globalThis);
 setupEvent(globalThis);
+setupTimers(globalThis);
+setupStreams(globalThis);
+setupTextEncodingStreams(globalThis);
+setupAbortSignal(globalThis);
+setupAsyncHooks(globalThis);
+setupBlob(globalThis);
+setupHeaders(globalThis);
+setupFormData(globalThis);
+setupRequest(globalThis);
+setupResponse(globalThis);
+setupFetch(globalThis);
+setupPerformance(globalThis);
+setupJsSyscall(globalThis);

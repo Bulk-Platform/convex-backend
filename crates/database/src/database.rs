@@ -60,7 +60,6 @@ use common::{
         DATA_SYNC_PAGE_SIZE_LIMIT,
         DEFAULT_DOCUMENTS_PAGE_SIZE,
         LIST_SNAPSHOT_MAX_AGE_SECS,
-        PERSISTENCE_INDEX_ID_ALLOCATION_ENABLED,
         SNAPSHOT_LIST_TIME_LIMIT,
     },
     pause::Fault,
@@ -100,6 +99,7 @@ use common::{
         GenericIndexName,
         IndexId,
         IndexName,
+        IndexRef,
         IndexTableIdentifier,
         PersistenceIndexId,
         PersistenceVersion,
@@ -157,10 +157,10 @@ use itertools::Itertools;
 use keybroker::Identity;
 use search::{
     metrics::SearchType,
-    query::RevisionWithKeys,
     Searcher,
     TextIndexManager,
     TextIndexManagerState,
+    TextSearchResults,
 };
 use short_future::ShortBoxFuture;
 use storage::Storage;
@@ -177,6 +177,7 @@ use usage_tracking::{
 };
 use value::{
     id_v6::DeveloperDocumentId,
+    InternalDocumentId,
     Size,
     TableNamespace,
     TableNumber,
@@ -259,6 +260,7 @@ use crate::{
     ComponentRegistry,
     ComponentsTable,
     DataSyncIterator,
+    LatestTableIterator,
     MultiTableIterator,
     SchemasTable,
     TableIterator,
@@ -324,14 +326,14 @@ pub struct Database<RT: Runtime> {
     retention_workers: LeaderRetentionWorkers,
     pub searcher: Arc<dyn Searcher>,
     pub search_storage: Arc<OnceLock<Arc<dyn Storage>>>,
-    index_cache_handle: Option<IndexCacheHandle>,
+    index_cache_handle: IndexCacheHandle,
     virtual_system_mapping: VirtualSystemMapping,
     pub bootstrap_metadata: BootstrapMetadata,
     invalidation_callback: InvalidationMetricCallback,
     // Caches of snapshot TableMapping and by_id index ids, which are used repeatedly by
     // /api/list_snapshot.
     table_mapping_snapshot_cache: AsyncLru<RT, Timestamp, TableMapping>,
-    by_id_indexes_snapshot_cache: AsyncLru<RT, Timestamp, BTreeMap<TabletId, IndexId>>,
+    by_id_indexes_snapshot_cache: AsyncLru<RT, Timestamp, BTreeMap<TabletId, IndexRef>>,
     component_paths_snapshot_cache: AsyncLru<RT, Timestamp, BTreeMap<ComponentId, ComponentPath>>,
     list_snapshot_table_iterator_cache:
         Arc<tokio::sync::Mutex<Option<ListSnapshotTableIteratorCacheEntry<RT>>>>,
@@ -350,7 +352,7 @@ struct ListSnapshotTableIteratorCacheEntry<RT: Runtime> {
 struct ListSnapshotTableIteratorCacheKey {
     snapshot: Timestamp,
     tablet_ids: Vec<TabletId>,
-    by_id: IndexId,
+    by_id: IndexRef,
     cursor: Option<ResolvedDocumentId>,
 }
 
@@ -406,8 +408,8 @@ pub struct SnapshotPage {
 
 #[derive(Clone)]
 pub struct BootstrapMetadata {
-    pub tables_by_id: IndexId,
-    pub index_by_id: IndexId,
+    pub tables_by_id: IndexRef,
+    pub index_by_id: IndexRef,
     pub tables_tablet_id: TabletId,
     pub index_tablet_id: TabletId,
 }
@@ -425,17 +427,11 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
         D: TryFrom<ConvexObject, Error = anyhow::Error>,
     >(
         persistence_snapshot: &PersistenceSnapshot,
-        index_id: IndexId,
+        index: IndexRef,
         tablet_id: TabletId,
     ) -> anyhow::Result<(Vec<(Timestamp, PackedDocument)>, Vec<ParsedDocument<D>>)> {
         persistence_snapshot
-            .index_scan(
-                index_id,
-                tablet_id,
-                &Interval::all(),
-                Order::Asc,
-                usize::MAX,
-            )
+            .index_scan(index, tablet_id, &Interval::all(), Order::Asc, usize::MAX)
             .map(|row| {
                 let rev = row?.1;
                 let doc = PackedDocument::pack(&rev.value);
@@ -507,7 +503,7 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
         BootstrapMetadata,
     )> {
         let _timer = metrics::load_table_and_index_metadata_timer();
-        let bootstrap_metadata = Self::get_meta_ids(persistence_snapshot.persistence()).await?;
+        let bootstrap_metadata = Self::get_meta_ids(persistence_snapshot).await?;
         let BootstrapMetadata {
             tables_by_id,
             index_by_id,
@@ -702,13 +698,13 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
         let stream = if let Some(by_creation_time) = by_creation_time {
             let stream = table_iterator.stream_documents_in_table_by_index(
                 tablet_id,
-                by_creation_time.id(),
+                IndexRef::try_from(by_creation_time)?,
                 IndexedFields::creation_time(),
                 None,
             );
             stream.map_ok(|(_, rev)| rev).boxed()
         } else {
-            let table_by_id = self.index_registry().must_get_by_id(tablet_id)?.id();
+            let table_by_id = IndexRef::try_from(self.index_registry().must_get_by_id(tablet_id)?)?;
             table_iterator
                 .stream_documents_in_table(tablet_id, table_by_id, None)
                 .boxed()
@@ -718,8 +714,9 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
 
     /// Fetch _tables.by_id and _index.by_id for bootstrapping.
     pub async fn get_meta_ids(
-        persistence: &dyn PersistenceReader,
+        persistence_snapshot: &PersistenceSnapshot,
     ) -> anyhow::Result<BootstrapMetadata> {
+        let persistence = persistence_snapshot.persistence();
         let tables_by_id = persistence
             .get_persistence_global(PersistenceGlobalKey::TablesByIdIndex)
             .await?
@@ -748,12 +745,43 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
             .as_str()
             .context("_index table ID is not string")?
             .parse()?;
+        let tables_by_id =
+            Self::bootstrap_index_ref(persistence_snapshot, index_tablet_id, tables_by_id).await?;
+        let index_by_id =
+            Self::bootstrap_index_ref(persistence_snapshot, index_tablet_id, index_by_id).await?;
         Ok(BootstrapMetadata {
             tables_by_id,
             index_by_id,
             tables_tablet_id,
             index_tablet_id,
         })
+    }
+
+    /// Resolves a bootstrap index from its `_index` document at the snapshot.
+    /// Every other index resolves through the index registry, but these two
+    /// are what the registry is loaded with, so their metadata is read by
+    /// document ID instead.
+    async fn bootstrap_index_ref(
+        persistence_snapshot: &PersistenceSnapshot,
+        index_tablet_id: TabletId,
+        index_id: IndexId,
+    ) -> anyhow::Result<IndexRef> {
+        let document_id = InternalDocumentId::new(index_tablet_id, index_id.0);
+        // `previous_revisions` returns the newest revision strictly before the
+        // timestamp, so ask one past the snapshot.
+        let after_snapshot = persistence_snapshot.timestamp().succ()?;
+        let mut revisions = persistence_snapshot
+            .persistence()
+            .previous_revisions(
+                BTreeSet::from([(document_id, after_snapshot)]),
+                persistence_snapshot.retention_validator(),
+            )
+            .await?;
+        let document = revisions
+            .remove(&(document_id, after_snapshot))
+            .and_then(|revision| revision.value)
+            .with_context(|| format!("bootstrap index {index_id} has no `_index` document"))?;
+        IndexRef::try_from(&TabletIndexMetadata::from_document(document)?)
     }
 
     #[fastrace::trace]
@@ -969,7 +997,7 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
 
         let id_generator = TransactionIdGenerator::new(&self.runtime.clone())?;
         let creation_time =
-            CreationTime::try_from(cmp::max(*self.ts, self.runtime.generate_timestamp()?))?;
+            CreationTime::for_transaction(*self.ts, self.runtime.generate_timestamp()?)?;
         let transaction_index = TransactionIndex::new(
             self.snapshot.index_registry.clone(),
             database_index_snapshot,
@@ -988,27 +1016,6 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
             usage_tracker,
             virtual_system_mapping,
         ))
-    }
-}
-
-pub struct StreamingExportFilter {
-    pub selection: StreamingExportSelection,
-    pub include_hidden: bool,
-    pub include_system: bool,
-}
-
-impl Default for StreamingExportFilter {
-    fn default() -> Self {
-        Self {
-            selection: StreamingExportSelection::default(),
-            // Allow snapshot imports to be streamed by default.
-            // Note this behavior is kind of odd for `--require-empty` imports
-            // because the rows are streamed before they are committed to Convex,
-            // and it's very strange for `--replace` imports because the imported
-            // rows are merged with existing rows.
-            include_hidden: true,
-            include_system: false,
-        }
     }
 }
 
@@ -1115,7 +1122,7 @@ impl<RT: Runtime> Database<RT> {
             write_commits_since_load: Arc::new(AtomicUsize::new(0)),
             searcher,
             search_storage: Arc::new(OnceLock::new()),
-            index_cache_handle: Some(index_cache_handle),
+            index_cache_handle,
             virtual_system_mapping,
             bootstrap_metadata,
             invalidation_callback,
@@ -1223,9 +1230,7 @@ impl<RT: Runtime> Database<RT> {
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.committer.shutdown();
         self.subscriptions.shutdown();
-        if let Some(handle) = &self.index_cache_handle {
-            handle.remove_deployment();
-        }
+        self.index_cache_handle.remove_deployment();
         self.retention_workers.shutdown().await?;
         tracing::info!("Database shutdown");
         Ok(())
@@ -1312,6 +1317,26 @@ impl<RT: Runtime> Database<RT> {
         )
     }
 
+    /// Walk tables at the latest repeatable timestamp instead of a snapshot,
+    /// so the walk never replays the document log. Every page is read at or
+    /// after `min_ts`; see [`LatestTableIterator`] for the consistency it
+    /// offers.
+    pub fn latest_table_iterator(
+        &self,
+        min_ts: RepeatableTimestamp,
+        page_size: usize,
+    ) -> LatestTableIterator<RT> {
+        let database = self.clone();
+        LatestTableIterator::new(
+            self.runtime.clone(),
+            min_ts,
+            self.reader.clone(),
+            self.retention_validator(),
+            page_size,
+            Arc::new(move || database.now_ts_for_reads()),
+        )
+    }
+
     #[fastrace::trace]
     async fn snapshot_table_mapping(
         &self,
@@ -1320,6 +1345,16 @@ impl<RT: Runtime> Database<RT> {
         self.table_mapping_snapshot_cache
             .get(&*ts, || self.clone().compute_snapshot_table_mapping(ts))
             .await
+    }
+
+    /// The `by_id` ref of a system table, from the latest registry, for reading
+    /// the table at any snapshot. These indexes are created at initialization
+    /// and never replaced, and a persistence index ID never changes once
+    /// assigned, so the latest metadata names the physical index every
+    /// snapshot saw; metadata from a snapshot before the ID was assigned would
+    /// name none, and a layout that keys rows by it could not read at all.
+    fn system_by_id_ref(snapshot: &Snapshot, tablet_id: TabletId) -> anyhow::Result<IndexRef> {
+        IndexRef::try_from(snapshot.index_registry.must_get_by_id(tablet_id)?)
     }
 
     #[fastrace::trace]
@@ -1335,10 +1370,7 @@ impl<RT: Runtime> Database<RT> {
             .namespace(TableNamespace::Global)
             .id(&TABLES_TABLE)?
             .tablet_id;
-        let tables_by_id = snapshot
-            .index_registry
-            .must_get_by_id(tables_tablet_id)?
-            .id();
+        let tables_by_id = Self::system_by_id_ref(&snapshot, tables_tablet_id)?;
         let stream = table_iterator.stream_documents_in_table(tables_tablet_id, tables_by_id, None);
         pin_mut!(stream);
         let mut table_mapping = TableMapping::new();
@@ -1360,7 +1392,7 @@ impl<RT: Runtime> Database<RT> {
     async fn snapshot_by_id_indexes(
         &self,
         ts: RepeatableTimestamp,
-    ) -> anyhow::Result<Arc<BTreeMap<TabletId, IndexId>>> {
+    ) -> anyhow::Result<Arc<BTreeMap<TabletId, IndexRef>>> {
         self.by_id_indexes_snapshot_cache
             .get(&*ts, || self.clone().compute_snapshot_by_id_indexes(ts))
             .await
@@ -1370,21 +1402,18 @@ impl<RT: Runtime> Database<RT> {
     async fn compute_snapshot_by_id_indexes(
         self,
         ts: RepeatableTimestamp,
-    ) -> anyhow::Result<BTreeMap<TabletId, IndexId>> {
+    ) -> anyhow::Result<BTreeMap<TabletId, IndexRef>> {
         let table_iterator = self.table_iterator(ts, 100);
         let (_, snapshot) = self.snapshot_manager.lock().latest();
         let index_tablet_id = snapshot.index_registry.index_table();
-        let index_by_id = snapshot
-            .index_registry
-            .must_get_by_id(index_tablet_id)?
-            .id();
+        let index_by_id = Self::system_by_id_ref(&snapshot, index_tablet_id)?;
         let stream = table_iterator.stream_documents_in_table(index_tablet_id, index_by_id, None);
         pin_mut!(stream);
         let mut by_id_indexes = BTreeMap::new();
         while let Some(index_doc) = stream.try_next().await? {
             let index_doc = TabletIndexMetadata::from_document(index_doc.value)?;
             if index_doc.name.is_by_id() {
-                by_id_indexes.insert(*index_doc.name.table(), index_doc.id().internal_id().into());
+                by_id_indexes.insert(*index_doc.name.table(), IndexRef::try_from(&index_doc)?);
             }
         }
         Ok(by_id_indexes)
@@ -1411,10 +1440,7 @@ impl<RT: Runtime> Database<RT> {
             .namespace(TableNamespace::Global)
             .id(&COMPONENTS_TABLE)?
             .tablet_id;
-        let component_by_id = snapshot
-            .index_registry
-            .must_get_by_id(component_tablet_id)?
-            .id();
+        let component_by_id = Self::system_by_id_ref(&snapshot, component_tablet_id)?;
         let stream =
             table_iterator.stream_documents_in_table(component_tablet_id, component_by_id, None);
         pin_mut!(stream);
@@ -1657,6 +1683,31 @@ impl<RT: Runtime> Database<RT> {
         self.reader.version()
     }
 
+    /// The ref for an index a funrun named by `_index` document ID alone,
+    /// which only a funrun predating the persistence ID on the wire does. The
+    /// registry at the snapshot supplies the ID, or the latest registry once
+    /// that snapshot left memory; the two agree because an assigned ID never
+    /// changes. An unknown index gets none; a text or vector index is an error.
+    fn index_ref_at(
+        &self,
+        snapshot: Option<&Snapshot>,
+        index_id: IndexId,
+    ) -> anyhow::Result<IndexRef> {
+        let latest;
+        let registry = match snapshot {
+            Some(snapshot) => &snapshot.index_registry,
+            None => {
+                latest = self.snapshot_manager.lock().latest().1;
+                &latest.index_registry
+            },
+        };
+        registry
+            .enabled_index_by_index_id(&index_id)
+            .or_else(|| registry.pending_index_by_index_id(&index_id))
+            .map(IndexRef::try_from)
+            .unwrap_or(Ok(IndexRef::unresolved(index_id)))
+    }
+
     /// Scan a page of the index, checking in-memory indexes and the index cache
     /// first and falling back to the persistence reader.
     ///
@@ -1665,7 +1716,7 @@ impl<RT: Runtime> Database<RT> {
     pub async fn index_page(
         &self,
         ts: RepeatableTimestamp,
-        index_id: IndexId,
+        index: IndexRef,
         tablet_id: TabletId,
         interval: &Interval,
         order: Order,
@@ -1686,7 +1737,7 @@ impl<RT: Runtime> Database<RT> {
         if let Some(snapshot) = &snapshot
             && let Some(range) = snapshot
                 .in_memory_indexes
-                .range(index_id, interval, order)?
+                .range(index.id(), interval, order)?
         {
             let results = range
                 .into_iter()
@@ -1703,16 +1754,23 @@ impl<RT: Runtime> Database<RT> {
             let persistence_snapshot =
                 RepeatablePersistence::new(self.reader.clone(), ts, self.retention_validator())
                     .read_snapshot(ts)?;
+            let index = if index.persistence_index_id().is_some() {
+                index
+            } else {
+                self.index_ref_at(snapshot.as_ref(), index.id())?
+            };
             let mut reader = Arc::new(persistence_snapshot) as Arc<dyn IndexReader>;
-            if let Some(snapshot) = snapshot
-                && let Some(handle) = self.index_cache_handle.clone()
-            {
+            if let Some(snapshot) = snapshot {
                 // TODO: it is probably OK to still use the index cache even if
                 // we don't have an index_registry at the same timestamp.
-                reader = Arc::new(handle.caching_index_reader(reader, snapshot.index_registry));
+                reader = Arc::new(
+                    self.index_cache_handle
+                        .clone()
+                        .caching_index_reader(reader, snapshot.index_registry),
+                );
             }
             let index_page = reader
-                .index_page(index_id, tablet_id, interval, order, max_size)
+                .index_page(index, tablet_id, interval, order, max_size)
                 .await?;
             let results = index_page
                 .entries
@@ -1957,7 +2015,7 @@ impl<RT: Runtime> Database<RT> {
 
         // TODO: Use `begin_ts` outside of just the "_creationTime".
         let begin_ts = cmp::max(latest_ts.succ()?, self.runtime.generate_timestamp()?);
-        let creation_time = CreationTime::try_from(begin_ts)?;
+        let creation_time = CreationTime::for_transaction(*repeatable_ts, begin_ts)?;
         let id_generator = TransactionIdGenerator::new(&self.runtime)?;
         let transaction_index = TransactionIndex::new(
             snapshot.index_registry.clone(),
@@ -1973,7 +2031,7 @@ impl<RT: Runtime> Database<RT> {
                     )
                     .read_snapshot(repeatable_ts)?,
                 ),
-                self.index_cache_handle.clone(),
+                Some(self.index_cache_handle.clone()),
                 index_cache,
             ),
             Arc::new(TextIndexManagerSnapshot::new(
@@ -2038,7 +2096,7 @@ impl<RT: Runtime> Database<RT> {
             snapshot,
             table_summaries: None,
             persistence_snapshot: repeatable_persistence.read_snapshot(ts)?,
-            index_cache_handle: self.index_cache_handle.clone(),
+            index_cache_handle: Some(self.index_cache_handle.clone()),
             persistence_reader: self.reader.clone(),
             retention_validator: self.retention_validator(),
         })
@@ -2099,8 +2157,16 @@ impl<RT: Runtime> Database<RT> {
         Ok(invalid_ts)
     }
 
-    fn streaming_export_table_filter(
-        filter: &StreamingExportFilter,
+    /// Whether the legacy `document_deltas` / `list_snapshot` APIs export
+    /// `tablet_id`.
+    ///
+    /// We allow snapshot imports to be streamed by default.
+    /// Note this behavior is kind of odd for `--require-empty` imports
+    /// because the rows are streamed before they are committed to Convex,
+    /// and it's very strange for `--replace` imports because the imported
+    /// rows are merged with existing rows.
+    fn legacy_streaming_export_table_filter(
+        selection: &StreamingExportSelection,
         tablet_id: TabletId,
         table_mapping: &TableMapping,
         component_paths: &BTreeMap<ComponentId, ComponentPath>,
@@ -2109,10 +2175,7 @@ impl<RT: Runtime> Database<RT> {
             // Always exclude deleted tablets.
             return Ok(false);
         }
-        if !filter.include_system && table_mapping.is_system_tablet(tablet_id) {
-            return Ok(false);
-        }
-        if !filter.include_hidden && !table_mapping.is_active(tablet_id) {
+        if table_mapping.is_system_tablet(tablet_id) {
             return Ok(false);
         }
 
@@ -2125,9 +2188,7 @@ impl<RT: Runtime> Database<RT> {
             return Ok(false);
         };
 
-        Ok(filter
-            .selection
-            .is_table_included(component_path, table_name))
+        Ok(selection.is_table_included(component_path, table_name))
     }
 
     #[fastrace::trace]
@@ -2135,7 +2196,7 @@ impl<RT: Runtime> Database<RT> {
         &self,
         identity: Identity,
         cursor: Option<Timestamp>,
-        filter: StreamingExportFilter,
+        selection: StreamingExportSelection,
         rows_read_limit: usize,
         rows_returned_limit: usize,
     ) -> anyhow::Result<DocumentDeltas> {
@@ -2211,8 +2272,8 @@ impl<RT: Runtime> Database<RT> {
                 new_cursor = Some(ts);
             }
             // Skip deltas for system and non-selected tables.
-            if Self::streaming_export_table_filter(
-                &filter,
+            if Self::legacy_streaming_export_table_filter(
+                &selection,
                 id.table(),
                 &table_mapping,
                 &component_paths,
@@ -2225,9 +2286,7 @@ impl<RT: Runtime> Database<RT> {
                     .cloned()
                     .unwrap_or_else(ComponentPath::root);
                 let id = DeveloperDocumentId::new(table_number, id.internal_id());
-                let column_filter = filter
-                    .selection
-                    .column_filter(&component_path, &table_name)?;
+                let column_filter = selection.column_filter(&component_path, &table_name)?;
                 let filtered_doc = maybe_doc
                     .map(|doc| column_filter.filter_document(doc.to_developer()))
                     .transpose()?;
@@ -2268,7 +2327,7 @@ impl<RT: Runtime> Database<RT> {
         identity: Identity,
         snapshot: Option<Timestamp>,
         cursor: Option<ResolvedDocumentId>,
-        filter: StreamingExportFilter,
+        selection: StreamingExportSelection,
         rows_read_limit: usize,
         rows_returned_limit: usize,
     ) -> anyhow::Result<SnapshotPage> {
@@ -2316,8 +2375,8 @@ impl<RT: Runtime> Database<RT> {
                     return None;
                 }
 
-                match Self::streaming_export_table_filter(
-                    &filter,
+                match Self::legacy_streaming_export_table_filter(
+                    &selection,
                     tablet_id,
                     &table_mapping,
                     &component_paths,
@@ -2450,9 +2509,7 @@ impl<RT: Runtime> Database<RT> {
                 .get(&component_id)
                 .cloned()
                 .unwrap_or_else(ComponentPath::root);
-            let column_filter = filter
-                .selection
-                .column_filter(&component_path, &table_name)?;
+            let column_filter = selection.column_filter(&component_path, &table_name)?;
 
             let filtered_doc = column_filter.filter_document(doc.to_developer())?;
 
@@ -2642,7 +2699,6 @@ impl<RT: Runtime> Database<RT> {
         let index_name = query.index_name.clone();
         let index_size = index.metadata().config.estimate_pricing_size_bytes()?;
         let resolved: vector::InternalVectorSearch = query.resolve(&table_mapping)?;
-        let dimensions = resolved.vector.len() as u64;
         let search_storage = self.search_storage();
         let results: Vec<_> = snapshot
             .vector_indexes
@@ -2661,7 +2717,7 @@ impl<RT: Runtime> Database<RT> {
             .component_registry
             .must_component_path(component_id, &mut TransactionReadSet::new())?;
         usage.track_vector_egress(component_path.clone(), index_name.table(), size);
-        usage.track_vector_query(component_path, index_name, index_size, dimensions);
+        usage.track_vector_query(component_path, index_name, index_size);
         timer.finish();
         Ok((results, usage.gather_user_stats()))
     }
@@ -2673,7 +2729,7 @@ impl<RT: Runtime> Database<RT> {
         query: pb::searchlight::TextQuery,
         pending_updates: Vec<DocumentUpdate>,
         ts: RepeatableTimestamp,
-    ) -> anyhow::Result<RevisionWithKeys> {
+    ) -> anyhow::Result<TextSearchResults> {
         let snapshot = self.snapshot(ts)?;
         let index = snapshot
             .index_registry
@@ -2713,14 +2769,12 @@ fn new_bootstrap_enabled<T: IndexTableIdentifier>(
     next_persistence_index_id: &mut u32,
 ) -> IndexMetadata<T> {
     let mut metadata = IndexMetadata::new_enabled(name, fields);
-    if *PERSISTENCE_INDEX_ID_ALLOCATION_ENABLED {
-        let persistence_index_id = PersistenceIndexId::new(*next_persistence_index_id)
-            .expect("bootstrap persistence index IDs are nonzero");
-        *next_persistence_index_id = next_persistence_index_id
-            .checked_add(1)
-            .expect("bootstrap persistence index IDs cannot exhaust u32");
-        metadata.assign_persistence_index_id(persistence_index_id);
-    }
+    let persistence_index_id = PersistenceIndexId::new(*next_persistence_index_id)
+        .expect("bootstrap persistence index IDs are nonzero");
+    *next_persistence_index_id = next_persistence_index_id
+        .checked_add(1)
+        .expect("bootstrap persistence index IDs cannot exhaust u32");
+    metadata.assign_persistence_index_id(persistence_index_id);
     metadata
 }
 
@@ -2745,16 +2799,42 @@ pub struct ConflictingRead {
 }
 
 fn occ_write_source_string(
-    source: &str,
+    source: &WriteSource,
     document_id: String,
     is_same_write_source: bool,
-) -> String {
+) -> Option<String> {
     let preamble = if is_same_write_source {
         "Another call to this mutation".to_string()
     } else {
-        format!("A call to \"{source}\"")
+        match source {
+            WriteSource::Udf(_) => format!("A call to \"{}\"", source.display_name()?),
+            WriteSource::SystemUdf(_) | WriteSource::System(_) => {
+                convex_writer_description(source).to_string()
+            },
+        }
     };
-    format!("{preamble} changed the document with ID \"{document_id}\"")
+    Some(format!(
+        "{preamble} changed the document with ID \"{document_id}\""
+    ))
+}
+
+/// Convex's own writers have internal names, so describe them by what the
+/// developer did.
+pub(crate) fn convex_writer_description(source: &WriteSource) -> &'static str {
+    match source {
+        WriteSource::SystemUdf(identifier) => {
+            let (_, udf_path) = (**identifier).clone().into_component_and_udf_path();
+            if udf_path.starts_with("_system/frontend/") {
+                "An edit in the Convex dashboard"
+            } else {
+                "A Convex system operation"
+            }
+        },
+        WriteSource::System(label) if label.contains("fivetran") => "A Fivetran sync",
+        WriteSource::System(label) if label.contains("airbyte") => "An Airbyte sync",
+        WriteSource::System(label) if label.starts_with("snapshot_import") => "A data import",
+        WriteSource::Udf(_) | WriteSource::System(_) => "A Convex system operation",
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2796,13 +2876,11 @@ impl ConflictingReadWithWriteSource {
 
         // We want to show the document's ID only if we know which mutation changed it,
         // so use it only if we have a write source.
-        let occ_msg = self.write_source.display_name().map(|write_source| {
-            occ_write_source_string(
-                &write_source,
-                self.read.id.to_string(),
-                *current_writer == self.write_source,
-            )
-        });
+        let occ_msg = occ_write_source_string(
+            &self.write_source,
+            self.read.id.to_string(),
+            *current_writer == self.write_source,
+        );
 
         let write_source = self.write_source.display_name();
 
@@ -2855,10 +2933,10 @@ impl ConflictingReadWithWriteSource {
     }
 }
 
-/// `op` requires system identity, and the caller does not have it.
-pub fn unauthorized_error(op: &'static str) -> ErrorMetadata {
+/// `op` is an internal name, so it stays out of the message.
+pub fn unauthorized_error(_op: &'static str) -> ErrorMetadata {
     ErrorMetadata::forbidden(
         "SystemIdentityRequired",
-        format!("Operation {op} not permitted"),
+        "You don't have permission to perform this operation.",
     )
 }

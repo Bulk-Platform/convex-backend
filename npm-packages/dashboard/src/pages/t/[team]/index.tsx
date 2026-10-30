@@ -29,6 +29,7 @@ import {
   useSnapBackOnEmptyPage,
 } from "hooks/useCursorPagination";
 import { useHasCustomRolePermission } from "api/roles";
+import { PROPOSED_PROJECT_RESOURCE } from "lib/permissions";
 import { permissionDeniedTip } from "elements/permissionDeniedTip";
 import { withAuthenticatedPage } from "lib/withAuthenticatedPage";
 import Head from "next/head";
@@ -233,7 +234,7 @@ function ProjectActions({ team }: { team: TeamResponse }) {
   const canCreateCustom = useHasCustomRolePermission(
     team.id,
     "project:create",
-    { segments: [{ kind: "project", id: 0, slug: "" }] },
+    PROPOSED_PROJECT_RESOURCE,
     true,
   );
   const canCreate = canCreateCustom !== false;

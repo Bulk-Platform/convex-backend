@@ -48,7 +48,11 @@ use common::{
     },
 };
 use shuttle::{
-    scheduler::RandomScheduler,
+    scheduler::{
+        PctScheduler,
+        RandomScheduler,
+    },
+    sync::Barrier,
     Config,
     Runner,
 };
@@ -92,7 +96,79 @@ struct Ctx {
     index_doc_id: ResolvedDocumentId,
 }
 
+struct PausingWriteLogReader {
+    inner: Arc<MockWriteLogReader>,
+    index_table: TabletIndexName,
+    validated: Arc<Barrier>,
+    resume: Arc<Barrier>,
+}
+
+impl WriteLogIndexReader for PausingWriteLogReader {
+    fn iter_writes_after<'a>(
+        &self,
+        index_name: &TabletIndexName,
+        ts: Timestamp,
+        storage: &'a mut ErasedSlot,
+    ) -> anyhow::Result<Box<dyn Iterator<Item = &'a DatabaseIndexWrite> + 'a>> {
+        let writes = self.inner.iter_writes_after(index_name, ts, storage)?;
+        if index_name != &self.index_table {
+            return Ok(writes);
+        }
+        // Index metadata is the final validation check. Pause after exhausting
+        // its snapshot so subsequent writes cannot change the validation result.
+        let mut pause = Some((self.validated.clone(), self.resume.clone()));
+        Ok(Box::new(writes.chain(iter::from_fn(move || {
+            if let Some((validated, resume)) = pause.take() {
+                validated.wait();
+                resume.wait();
+            }
+            None
+        }))))
+    }
+}
+
+struct PausedPopulate {
+    thread: shuttle::thread::JoinHandle<()>,
+    key: CacheKey,
+    resume: Arc<Barrier>,
+}
+
+impl PausedPopulate {
+    fn finish(self) {
+        self.resume.wait();
+        self.thread.join().unwrap();
+    }
+}
+
 impl Ctx {
+    fn pause_populate(&self, ts: RepeatableTimestamp) -> PausedPopulate {
+        let validated = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let mut ctx = self.clone();
+        ctx.handle.write_log_reader = Arc::new(PausingWriteLogReader {
+            inner: self.write_log.clone(),
+            index_table: TabletIndexName::by_id(self.handle.index_tablet),
+            validated: validated.clone(),
+            resume: resume.clone(),
+        });
+        let thread = ctx.spawn(move |ctx| ctx.populate(ts, Order::Asc, 100));
+        validated.wait();
+        let key = CacheKey {
+            deployment_id: self.handle.deployment_id,
+            index_id: self.index_id,
+            interval: Arc::new(Interval::all()),
+            order: Order::Asc,
+            max_size: 100,
+        };
+        let entry = self.handle.shared_cache.cache.get(&key).unwrap();
+        assert!(entry.index_page_at_ts(ts).is_none());
+        PausedPopulate {
+            thread,
+            key,
+            resume,
+        }
+    }
+
     /// Spawn a worker thread, handing it its own clone of the context (a
     /// fresh handle into the same shared cache).
     fn spawn(&self, f: impl FnOnce(Ctx) + Send + 'static) -> shuttle::thread::JoinHandle<()> {

@@ -3,7 +3,6 @@
 use std::{
     collections::BTreeMap,
     fmt::Debug,
-    ops::Add,
     sync::Arc,
     time::Duration,
 };
@@ -21,7 +20,6 @@ use common::{
     types::{
         IndexName,
         ModuleEnvironment,
-        StorageUuid,
         UdfIdentifier,
     },
     RequestId,
@@ -31,8 +29,10 @@ use derive_more::{
     AddAssign,
 };
 use events::usage::{
+    FunctionCallSample,
     FunctionCallUsageFields,
     InsightReadLimitCall,
+    StorageCallSample,
     UsageEvent,
     UsageEventLogger,
 };
@@ -250,26 +250,33 @@ impl UsageCounter {
         };
 
         let (component_path, udf_id) = udf_path.clone().into_component_and_udf_path();
+        let memory_megabytes = call_type.memory_megabytes();
+        let user_execution_millis = call_type.user_execution_millis();
         usage_metrics.push(UsageEvent::FunctionCall {
             fields: FunctionCallUsageFields {
-                id: execution_id.to_string(),
-                request_id: request_id.to_string(),
-                status: if success { "success" } else { "failure" }.to_string(),
                 component_path,
                 udf_id,
                 udf_id_type: udf_id_type.to_string(),
                 tag: call_type.tag().to_string(),
-                memory_megabytes: call_type.memory_megabytes(),
-                duration_millis: call_type.duration_millis(),
-                user_execution_millis: call_type.user_execution_millis(),
                 environment: call_type.environment(),
                 is_tracked: should_track_calls,
-                response_sha256: call_type.response_sha256(),
                 is_occ: call_type.is_occ(),
                 occ_table_name: call_type.occ_table_name(),
-                occ_document_id: call_type.occ_document_id(),
-                occ_write_source: call_type.occ_write_source(),
                 occ_retry_count: call_type.occ_retry_count(),
+                calls: 1,
+                duration_millis: call_type.duration_millis(),
+                user_execution_millis,
+                compute_mb_ms: memory_megabytes * call_type.duration_millis(),
+                user_compute_mb_ms: user_execution_millis.map(|millis| memory_megabytes * millis),
+                sample: FunctionCallSample {
+                    id: execution_id.to_string(),
+                    request_id: request_id.to_string(),
+                    memory_megabytes,
+                    occ_document_id: call_type.occ_document_id(),
+                    occ_write_source: call_type.occ_write_source(),
+                    status: if success { "success" } else { "failure" }.to_string(),
+                    response_sha256: call_type.response_sha256(),
+                },
             },
         });
 
@@ -348,115 +355,76 @@ impl UsageCounter {
                 egress,
             });
         }
-        // Merge "by table" bandwidth stats.
-        for ((component_path, table_name), ingress) in stats.database_ingress {
-            usage_metrics.push(UsageEvent::DatabaseBandwidth {
-                id: execution_id.to_string(),
-                request_id: request_id.to_string(),
-                component_path: component_path.serialize(),
-                udf_id: udf_id.clone(),
-                table_name,
-                ingress,
-                ingress_v2: 0,
-                egress: 0,
-                egress_rows: 0,
-                egress_v2: 0,
-                virtual_table_ingress: 0,
-                virtual_table_egress: 0,
-            });
+        // Merge the "by table" bandwidth stats. They're tracked in separate
+        // maps but describe the same access.
+        #[derive(Default)]
+        struct DatabaseBandwidthCounters {
+            ingress_v2: u64,
+            egress: u64,
+            egress_rows: u64,
+            egress_v2: u64,
+            virtual_table_ingress: u64,
+            virtual_table_egress: u64,
         }
-        for ((component_path, table_name), ingress) in stats.database_ingress_v2 {
-            usage_metrics.push(UsageEvent::DatabaseBandwidth {
-                id: execution_id.to_string(),
-                request_id: request_id.to_string(),
-                component_path: component_path.serialize(),
-                udf_id: udf_id.clone(),
-                table_name,
-                ingress: 0,
-                ingress_v2: ingress,
-                egress: 0,
-                egress_rows: 0,
-                egress_v2: 0,
-                virtual_table_ingress: 0,
-                virtual_table_egress: 0,
-            });
+        let mut database_bandwidth: BTreeMap<
+            (ComponentPath, TableNameString),
+            DatabaseBandwidthCounters,
+        > = BTreeMap::new();
+        for (key, ingress) in stats.database_ingress_v2 {
+            database_bandwidth.entry(key).or_default().ingress_v2 += ingress;
         }
-        for ((component_path, table_name), egress) in stats.database_egress.clone() {
-            let rows = stats
-                .database_egress_rows
-                .get(&(component_path.clone(), table_name.clone()))
-                .unwrap_or(&0);
-            usage_metrics.push(UsageEvent::DatabaseBandwidth {
-                id: execution_id.to_string(),
-                request_id: request_id.to_string(),
-                component_path: component_path.serialize(),
-                udf_id: udf_id.clone(),
-                table_name,
-                ingress: 0,
-                ingress_v2: 0,
-                egress,
-                egress_rows: *rows,
-                egress_v2: 0,
-                virtual_table_ingress: 0,
-                virtual_table_egress: 0,
-            });
+        for (key, egress) in stats.database_egress {
+            database_bandwidth.entry(key).or_default().egress += egress;
         }
-        for ((component_path, table_name), egress) in stats.database_egress_v2.clone() {
-            let rows = stats
-                .database_egress_rows
-                .get(&(component_path.clone(), table_name.clone()))
-                .unwrap_or(&0);
-            usage_metrics.push(UsageEvent::DatabaseBandwidth {
-                id: execution_id.to_string(),
-                request_id: request_id.to_string(),
-                component_path: component_path.serialize(),
-                udf_id: udf_id.clone(),
-                table_name,
-                ingress: 0,
-                ingress_v2: 0,
-                egress: 0,
-                egress_rows: *rows,
-                egress_v2: egress,
-                virtual_table_ingress: 0,
-                virtual_table_egress: 0,
-            });
+        for (key, egress) in stats.database_egress_v2 {
+            database_bandwidth.entry(key).or_default().egress_v2 += egress;
         }
-        for ((component_path, table_name), ingress) in stats.virtual_table_ingress {
-            usage_metrics.push(UsageEvent::DatabaseBandwidth {
-                id: execution_id.to_string(),
-                request_id: request_id.to_string(),
-                component_path: component_path.serialize(),
-                udf_id: udf_id.clone(),
-                table_name,
-                ingress: 0,
-                ingress_v2: 0,
-                egress: 0,
-                egress_rows: 0,
-                egress_v2: 0,
-                virtual_table_ingress: ingress,
-                virtual_table_egress: 0,
-            });
+        for (key, egress_rows) in stats.database_egress_rows {
+            database_bandwidth.entry(key).or_default().egress_rows += egress_rows;
         }
-        for ((component_path, table_name), egress) in stats.virtual_table_egress {
+        for (key, ingress) in stats.virtual_table_ingress {
+            database_bandwidth
+                .entry(key)
+                .or_default()
+                .virtual_table_ingress += ingress;
+        }
+        for (key, egress) in stats.virtual_table_egress {
+            database_bandwidth
+                .entry(key)
+                .or_default()
+                .virtual_table_egress += egress;
+        }
+        let mut bandwidth_by_component: BTreeMap<ComponentPath, DatabaseBandwidthCounters> =
+            BTreeMap::new();
+        for ((component_path, _), bandwidth) in &database_bandwidth {
+            let component_bandwidth = bandwidth_by_component
+                .entry(component_path.clone())
+                .or_default();
+            component_bandwidth.ingress_v2 += bandwidth.ingress_v2;
+            component_bandwidth.egress += bandwidth.egress;
+            component_bandwidth.egress_rows += bandwidth.egress_rows;
+            component_bandwidth.egress_v2 += bandwidth.egress_v2;
+            component_bandwidth.virtual_table_ingress += bandwidth.virtual_table_ingress;
+            component_bandwidth.virtual_table_egress += bandwidth.virtual_table_egress;
+        }
+        for (component_path, bandwidth) in bandwidth_by_component {
             usage_metrics.push(UsageEvent::DatabaseBandwidth {
                 id: execution_id.to_string(),
-                request_id: request_id.to_string(),
+                request_id: Some(request_id.to_string()),
                 component_path: component_path.serialize(),
                 udf_id: udf_id.clone(),
-                table_name,
-                ingress: 0,
-                ingress_v2: 0,
-                egress: 0,
-                egress_rows: 0,
-                egress_v2: 0,
-                virtual_table_ingress: 0,
-                virtual_table_egress: egress,
+                table_name: (),
+                ingress_v2: bandwidth.ingress_v2,
+                egress_rows: bandwidth.egress_rows,
+                egress_v2: bandwidth.egress_v2,
+                virtual_table_ingress: bandwidth.virtual_table_ingress,
+                virtual_table_egress: bandwidth.virtual_table_egress,
             });
         }
 
         // Check read limits and add InsightReadLimit event if thresholds are exceeded
-        let total_rows: u64 = stats.database_egress_rows.values().sum();
-        let total_bytes: u64 = stats.database_egress.values().sum();
+        let total_rows: u64 = database_bandwidth.values().map(|b| b.egress_rows).sum();
+        let total_bytes: u64 = database_bandwidth.values().map(|b| b.egress).sum();
 
         let row_threshold =
             (*TRANSACTION_MAX_READ_SIZE_ROWS as f64 * *FUNCTION_LIMIT_WARNING_RATIO) as u64;
@@ -468,29 +436,23 @@ impl UsageCounter {
 
         if did_exceed_document_threshold || did_exceed_byte_threshold {
             let mut calls = Vec::new();
-            let component_path: Option<ComponentPath> =
-                match stats.database_egress_rows.first_key_value() {
-                    Some(((component_path, _), _)) => Some(component_path.clone()),
-                    None => {
-                        tracing::error!(
-                            "Failed to find component path despite thresholds being exceeded"
-                        );
-                        None
-                    },
-                };
+            let component_path = database_bandwidth
+                .iter()
+                .find(|(_, bandwidth)| bandwidth.egress_rows > 0)
+                .map(|((component_path, _), _)| component_path.clone());
+            if component_path.is_none() {
+                tracing::error!("Failed to find component path despite thresholds being exceeded");
+            }
 
             if let Some(component_path) = component_path {
-                for ((cp, table_name), egress_rows) in stats.database_egress_rows.into_iter() {
-                    let egress = stats
-                        .database_egress
-                        .get(&(cp, table_name.clone()))
-                        .copied()
-                        .unwrap_or(0);
-
+                for ((_, table_name), bandwidth) in &database_bandwidth {
+                    if bandwidth.egress_rows == 0 {
+                        continue;
+                    }
                     calls.push(InsightReadLimitCall {
-                        table_name,
-                        bytes_read: egress,
-                        documents_read: egress_rows,
+                        table_name: table_name.clone(),
+                        bytes_read: bandwidth.egress,
+                        documents_read: bandwidth.egress_rows,
                     });
                 }
 
@@ -552,6 +514,7 @@ impl UsageCounter {
             TextIndexQueryUsage {
                 num_searches,
                 bytes_searched,
+                filtered_bytes_searched,
             },
         ) in stats.text_query_usage
         {
@@ -563,6 +526,7 @@ impl UsageCounter {
                 index_name: index_name.to_string(),
                 num_searches,
                 bytes_searched,
+                filtered_bytes_searched,
             })
         }
         for (
@@ -570,7 +534,6 @@ impl UsageCounter {
             VectorIndexQueryUsage {
                 num_searches,
                 bytes_searched,
-                dimensions,
             },
         ) in stats.vector_query_usage
         {
@@ -582,7 +545,6 @@ impl UsageCounter {
                 index_name: index_name.to_string(),
                 num_searches,
                 bytes_searched,
-                dimensions,
             })
         }
 
@@ -617,9 +579,7 @@ pub trait StorageUsageTracker: Send + Sync {
         &self,
         component_path: ComponentPath,
         storage_api: &'static str,
-        storage_id: StorageUuid,
         content_type: Option<ContentType>,
-        sha256: Sha256Digest,
     ) -> Box<dyn StorageCallTracker>;
 }
 
@@ -683,9 +643,7 @@ impl StorageUsageTracker for UsageCounter {
         &self,
         component_path: ComponentPath,
         storage_api: &'static str,
-        storage_id: StorageUuid,
         content_type: Option<ContentType>,
-        sha256: Sha256Digest,
     ) -> Box<dyn StorageCallTracker> {
         let execution_id = ExecutionId::new();
         metrics::storage::log_storage_call();
@@ -693,12 +651,11 @@ impl StorageUsageTracker for UsageCounter {
             .record_async(vec![UsageEvent::StorageCall {
                 id: execution_id.to_string(),
                 component_path: component_path.serialize(),
-                // Ideally we would track the Id<_storage> instead of the StorageUuid
-                // but it's a bit annoying for now, so just going with this.
-                storage_id: storage_id.to_string(),
                 call: storage_api.to_string(),
-                content_type: content_type.map(|c| c.to_string()),
-                sha256: sha256.as_hex(),
+                sample: StorageCallSample {
+                    content_type: content_type.map(|c| c.to_string()),
+                },
+                count: 1,
             }])
             .await;
 
@@ -956,14 +913,12 @@ impl FunctionUsageTracker {
         component_path: ComponentPath,
         index_name: IndexName,
         index_size: u64,
-        dimensions: u64,
     ) {
         let mut state = self.state.lock();
         let key = (component_path, index_name);
         *state.vector_query_usage.entry(key).or_default() += VectorIndexQueryUsage {
             num_searches: 1,
             bytes_searched: index_size,
-            dimensions,
         };
     }
 
@@ -990,12 +945,14 @@ impl FunctionUsageTracker {
         component_path: ComponentPath,
         index_name: IndexName,
         index_size: u64,
+        filtered_bytes_searched: u64,
     ) {
         let mut state = self.state.lock();
         let key = (component_path, index_name);
         *state.text_query_usage.entry(key).or_default() += TextIndexQueryUsage {
             num_searches: 1,
             bytes_searched: index_size,
+            filtered_bytes_searched,
         };
     }
 
@@ -1054,9 +1011,7 @@ impl StorageUsageTracker for FunctionUsageTracker {
         &self,
         component_path: ComponentPath,
         storage_api: &'static str,
-        _storage_id: StorageUuid,
         _content_type: Option<ContentType>,
-        _sha256: Sha256Digest,
     ) -> Box<dyn StorageCallTracker> {
         let mut state = self.state.lock();
         metrics::storage::log_storage_call();
@@ -1074,30 +1029,18 @@ type StorageAPI = String;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Add, Default, AddAssign)]
 pub struct TextIndexQueryUsage {
     pub num_searches: u64,
+    /// Total size of the index's disk segments, once per search.
     pub bytes_searched: u64,
+    /// Segment bytes scaled by the share of documents matching each search's
+    /// filter conditions. Reported alongside `bytes_searched` so the two can
+    /// be compared; billing reads `bytes_searched`.
+    pub filtered_bytes_searched: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, AddAssign)]
+#[derive(Debug, Clone, PartialEq, Eq, Add, Default, AddAssign)]
 pub struct VectorIndexQueryUsage {
     pub num_searches: u64,
     pub bytes_searched: u64,
-    pub dimensions: u64,
-}
-
-impl Add for VectorIndexQueryUsage {
-    type Output = Self;
-
-    fn add(self, other: Self) -> Self {
-        Self {
-            num_searches: self.num_searches + other.num_searches,
-            // Take the max of the index_size
-            bytes_searched: self.bytes_searched + other.bytes_searched,
-            // Take the max of the num_dimensions. num_dimensions shouldn't usually change, but if
-            // there is some change to the index that commits in the middle of an action
-            // between two vector searches, just take the max dimensions.
-            dimensions: self.dimensions.max(other.dimensions),
-        }
-    }
 }
 
 /// User-facing UDF stats, built
@@ -1341,6 +1284,7 @@ fn to_text_query_usage(
                 index_name: Some(index_name.to_string()),
                 num_searches: Some(usage.num_searches),
                 bytes_searched: Some(usage.bytes_searched),
+                filtered_bytes_searched: Some(usage.filtered_bytes_searched),
             },
         )
         .collect()
@@ -1357,7 +1301,6 @@ fn to_vector_query_usage(
                 index_name: Some(index_name.to_string()),
                 num_searches: Some(usage.num_searches),
                 bytes_searched: Some(usage.bytes_searched),
-                dimensions: Some(usage.dimensions),
             },
         )
         .collect()
@@ -1378,11 +1321,14 @@ fn from_text_query_usage(
             let bytes_searched = u
                 .bytes_searched
                 .context("Missing `num_segment_searches` field")?;
+            // Absent from records written before the field existed.
+            let filtered_bytes_searched = u.filtered_bytes_searched.unwrap_or(0);
             Ok((
                 (component_path, index_name),
                 TextIndexQueryUsage {
                     num_searches,
                     bytes_searched,
+                    filtered_bytes_searched,
                 },
             ))
         })
@@ -1405,13 +1351,11 @@ fn from_vector_query_usage(
             let bytes_searched = u
                 .bytes_searched
                 .context("Missing `num_segment_searches` field")?;
-            let dimensions = u.dimensions.context("Missing `num_dimensions` field")?;
             Ok((
                 (component_path, index_name),
                 VectorIndexQueryUsage {
                     num_searches,
                     bytes_searched,
-                    dimensions,
                 },
             ))
         })

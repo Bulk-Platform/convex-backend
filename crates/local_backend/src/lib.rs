@@ -41,6 +41,7 @@ use common::{
         new_rate_limiter,
         Runtime,
     },
+    sentry::proxied_sentry_transport_factory,
     shutdown::ShutdownSignal,
     types::{
         ConvexOrigin,
@@ -84,6 +85,7 @@ use serde::Serialize;
 pub use sync::subscription_reconnect::SubscriptionReconnectRateLimiter;
 
 pub mod admin;
+mod ai_gateway;
 mod app_metrics;
 mod args_structs;
 pub mod authentication;
@@ -96,6 +98,7 @@ pub mod deploy_config;
 pub mod deploy_config2;
 pub mod deployment_audit_log;
 pub mod deployment_info;
+pub mod deployment_jwks;
 pub mod deployment_state;
 pub mod environment_variables;
 pub mod http_actions;
@@ -272,12 +275,15 @@ pub async fn make_app(
         )),
         QueryCache::new(*UDF_CACHE_MAX_SIZE),
         fetch_client,
-        config.local_log_sink.clone(),
+        proxied_sentry_transport_factory(config.convex_http_proxy.clone(), config.name()),
         preempt_tx.clone(),
         Arc::new(InProcessExportProvider),
         deleted_tablet_receiver,
         oidc_http_client,
-        None,
+        Some(Arc::new(ai_gateway::LocalAiGatewayTokenMinter::new(
+            config.control_plane_url.clone(),
+            config.control_plane_access_token.clone(),
+        ))),
         SourceMapCache::new(runtime.clone()),
     )
     .await?;

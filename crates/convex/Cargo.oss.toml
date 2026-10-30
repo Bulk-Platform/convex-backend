@@ -7,16 +7,16 @@ edition = "2021"
 rust-version = "1.85"
 resolver = "2"
 license = "Apache-2.0"
-repository = "https://github.com/get-convex/convex-rs"
+repository = "https://github.com/convex/convex-rs"
 homepage = "https://www.convex.dev/"
 
 [features]
 default = [ "native-tls-vendored" ]
+rustls-tls-native-roots = [ "tokio-tungstenite/rustls-tls-native-roots" ]
+testing = [ "convex_sync_types/testing", "proptest", "proptest-derive", "parking_lot" ]
 native-tls = [ "tokio-tungstenite/native-tls" ]
 native-tls-vendored = [ "tokio-tungstenite/native-tls-vendored" ]
-rustls-tls-native-roots = [ "tokio-tungstenite/rustls-tls-native-roots" ]
 rustls-tls-webpki-roots = [ "tokio-tungstenite/rustls-tls-webpki-roots" ]
-testing = [ "convex_sync_types/testing", "proptest", "proptest-derive", "parking_lot" ]
 
 [dependencies]
 anyhow = { version = "1" }
@@ -53,6 +53,7 @@ tracing-subscriber = { features = [ "env-filter" ], version = "0.3.17" }
 [lints.rust]
 unused_extern_crates = "warn"
 unused_features = "allow"
+unexpected_cfgs = { level = "warn", check-cfg = [ "cfg(rust_analyzer)" ] }
 
 [lints.clippy]
 await_holding_lock = "warn"

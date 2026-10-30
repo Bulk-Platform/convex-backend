@@ -3,6 +3,7 @@ import { version } from "../../index.js";
 import {
   AnyFunctionReference,
   FunctionReference,
+  FunctionReference_future,
   FunctionType,
 } from "../api.js";
 import { performAsyncSyscall } from "../impl/syscall.js";
@@ -49,6 +50,17 @@ export type FunctionHandle<
 > = string & FunctionReference<Type, "internal", Args, ReturnType>;
 
 /**
+ * A {@link FunctionHandle} with the type semantics of {@link FunctionReference_future}.
+ *
+ * @public
+ */
+export type FunctionHandle_future<
+  Type extends FunctionType,
+  Args extends DefaultFunctionArgs = any,
+  ReturnType = any,
+> = string & FunctionReference_future<Type, "internal", Args, ReturnType>;
+
+/**
  * Create a serializable reference to a Convex function.
  * Passing a this reference to another component allows that component to call this
  * function during the current function execution or at any later time.
@@ -66,12 +78,9 @@ export async function createFunctionHandle<
   Args extends DefaultFunctionArgs,
   ReturnType,
 >(
-  functionReference: FunctionReference<
-    Type,
-    "public" | "internal",
-    Args,
-    ReturnType
-  >,
+  functionReference:
+    | FunctionReference<Type, "public" | "internal", Args, ReturnType>
+    | FunctionReference_future<Type, "public" | "internal", Args, ReturnType>,
 ): Promise<FunctionHandle<Type, Args, ReturnType>> {
   const address = getFunctionAddress(functionReference);
   return await performAsyncSyscall("1.0/createFunctionHandle", {

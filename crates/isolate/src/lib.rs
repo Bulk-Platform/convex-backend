@@ -23,7 +23,7 @@ pub mod environment;
 pub mod error;
 mod execution_scope;
 pub mod helpers;
-mod http;
+pub mod http;
 mod is_instance_of_error;
 pub mod isolate;
 pub mod isolate_worker;
@@ -63,6 +63,7 @@ pub use self::{
     termination::{
         ContextId,
         ExecutionHandle,
+        OutOfMemoryError,
     },
     timeout::{
         start_cooperative_request,

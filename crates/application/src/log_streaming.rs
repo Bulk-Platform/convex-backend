@@ -3,16 +3,19 @@ use common::{
     execution_context::RequestMetadata,
     runtime::Runtime,
 };
-use database::{
-    Database,
-    MAX_OCC_FAILURES,
-};
+use database::MAX_OCC_FAILURES;
 use errors::ErrorMetadata;
 use futures::FutureExt;
 use keybroker::Identity;
 use model::{
     backend_info::BackendInfoModel,
-    deployment_audit_log::types::DeploymentAuditLogEvent,
+    deployment_audit_log::{
+        integration_config::{
+            audit_config,
+            audit_credential_changes,
+        },
+        types::DeploymentAuditLogEvent,
+    },
     log_sinks::{
         types::{
             LogSinksRow,
@@ -37,21 +40,6 @@ pub struct LogSinkWithId {
     pub status: SinkState,
 }
 
-pub async fn add_local_log_sink_on_startup<RT: Runtime>(
-    db: Database<RT>,
-    path: String,
-) -> anyhow::Result<()> {
-    let mut tx = db.begin(Identity::system()).await?;
-    let mut log_sink_model = LogSinksModel::new(&mut tx);
-    log_sink_model
-        .add_on_startup(SinkConfig::Local(path.clone()))
-        .await?;
-    db.commit_with_write_source(tx, "add_local_log_sink_startup")
-        .await?;
-    tracing::info!("Local log sink configured at {path}.");
-    Ok(())
-}
-
 impl<RT: Runtime> Application<RT> {
     pub async fn add_log_sink(
         &self,
@@ -69,6 +57,7 @@ impl<RT: Runtime> Application<RT> {
                     let config = config.clone();
                     let sink_type = sink_type.clone();
                     async move {
+                        let audit_config = audit_config(&config);
                         let id = LogSinksModel::new(tx).add_or_update(config).await?;
                         let id_str = id.encode();
                         Ok((
@@ -76,6 +65,7 @@ impl<RT: Runtime> Application<RT> {
                             vec![DeploymentAuditLogEvent::CreateIntegration {
                                 id: id_str,
                                 r#type: sink_type,
+                                config: audit_config,
                             }],
                         ))
                     }
@@ -94,6 +84,21 @@ impl<RT: Runtime> Application<RT> {
         id: &String,
         config: SinkConfig,
     ) -> anyhow::Result<()> {
+        self.patch_log_sink_config_and_status(identity, request_metadata, id, config, false)
+            .await
+    }
+
+    /// Like `patch_log_sink_config`, and with `reset_to_pending` also sets the
+    /// status to Pending in the same transaction, so no status written for the
+    /// old config can land after the new config.
+    pub async fn patch_log_sink_config_and_status(
+        &self,
+        identity: Identity,
+        request_metadata: RequestMetadata,
+        id: &String,
+        config: SinkConfig,
+        reset_to_pending: bool,
+    ) -> anyhow::Result<()> {
         let sink_type = config.sink_type().as_str().to_string();
         let developer_id = DeveloperDocumentId::decode(id).map_err(|_| {
             anyhow::anyhow!(ErrorMetadata::bad_request(
@@ -111,12 +116,22 @@ impl<RT: Runtime> Application<RT> {
                 let id_str = id.clone();
                 async move {
                     let mut model = LogSinksModel::new(tx);
+                    let previous_config = model.must_get(developer_id).await?.config.clone();
+                    let previous = audit_config(&previous_config);
+                    let current = audit_config(&config);
+                    let credential_changes = audit_credential_changes(&previous_config, &config);
                     model.patch_config(developer_id, config).await?;
+                    if reset_to_pending {
+                        model.patch_status(developer_id, SinkState::Pending).await?;
+                    }
                     Ok((
                         (),
                         vec![DeploymentAuditLogEvent::UpdateIntegration {
                             id: id_str,
                             r#type: sink_type,
+                            previous,
+                            current,
+                            credential_changes,
                         }],
                     ))
                 }
@@ -223,6 +238,7 @@ impl<RT: Runtime> Application<RT> {
                     let row: ParsedDocument<LogSinksRow> =
                         LogSinksModel::new(tx).must_get(developer_id).await?;
                     let sink_type = row.config.sink_type().as_str().to_string();
+                    let config = audit_config(&row.config);
                     LogSinksModel::new(tx)
                         .mark_for_removal(developer_id)
                         .await?;
@@ -231,6 +247,7 @@ impl<RT: Runtime> Application<RT> {
                         vec![DeploymentAuditLogEvent::DeleteIntegration {
                             id,
                             r#type: sink_type,
+                            config,
                         }],
                     ))
                 }

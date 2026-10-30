@@ -44,7 +44,7 @@ export interface paths {
         head?: never;
         /**
          * Update project
-         * @description Update a project's name and/or slug. Returns the updated project.
+         * @description Update a project's name, slug, and/or tags. Returns the updated project.
          */
         patch: operations["update project"];
         trace?: never;
@@ -63,6 +63,28 @@ export interface paths {
          *     as `cursor` to fetch the next page.
          */
         get: operations["list projects"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/list_project_tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List project tags
+         * @description List a page of the distinct tags used by a team's projects, ordered by tag
+         *     name. Pass the `nextCursor` from the previous response as `cursor` to fetch
+         *     the next page.
+         */
+        get: operations["list project tags"];
         put?: never;
         post?: never;
         delete?: never;
@@ -339,6 +361,26 @@ export interface paths {
         get: operations["list local deployments for team"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/deployments/{deployment_name}/mint_ai_gateway_jwt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mint an AI gateway JWT
+         * @description Mints a short-lived AI gateway JWT for a local deployment.
+         */
+        post: operations["mint ai gateway jwt"];
         delete?: never;
         options?: never;
         head?: never;
@@ -694,7 +736,12 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Create a team */
+        /**
+         * Create a team
+         * @description This endpoint is not publicly accessible. It is reserved for specific
+         *     integrations that have been granted permission to create teams on behalf of
+         *     users. To request access, contact platforms@convex.dev.
+         */
         post: operations["create team"];
         delete?: never;
         options?: never;
@@ -833,7 +880,9 @@ export interface paths {
          * Update default environment variables
          * @description Creates, updates, or deletes default environment variables for the specified
          *     project. When `value` is a string, the variable is upserted. When `value` is
-         *     null, the variable is deleted.
+         *     null, the variable is deleted. Each item in `changes` can set
+         *     `applyToExistingDeployments` to true to asynchronously upsert or delete the
+         *     variable on every existing cloud deployment of that item's `deploymentType`.
          */
         post: operations["update default environment variables"];
         delete?: never;
@@ -957,6 +1006,15 @@ export interface components {
         AccessTokenId: number;
         /** @description Encrypted admin key */
         AdminKey: string;
+        /** @description The wire format of the claims sent to the gateway.
+         *
+         *     All three are absent when we cannot identify the caller. A caller in the
+         *     root component has a `function_name` but no `component_path`. */
+        AttributionClaims: {
+            componentPath?: string | null;
+            functionName?: string | null;
+            functionType?: string | null;
+        };
         /** @description The identity that executed an audit log action. */
         AuditLogActor: {
             /** @enum {string} */
@@ -988,7 +1046,7 @@ export interface components {
             /** @description The identity that executed the action */
             actor: components["schemas"]["AuditLogActor"];
             /** @enum {string} */
-            action: "team:join" | "team:create" | "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "deployment:create" | "deployment:delete" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "project:updateMemberRole" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:create" | "billing:subscription:resume" | "billing:subscription:cancel" | "billing:subscription:changePlan" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "team:disableExceedingSpendingLimits" | "billing:spendingLimit:update" | "team:applyReferralCode" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:verify" | "oauthApplication:generateClientSecret" | "integration:workos:team:create" | "integration:workos:environment:create" | "integration:workos:environment:delete" | "integration:workos:environment:retrieveCredentials" | "integration:workos:team:disconnect" | "integration:workos:team:inviteMember" | "integration:workos:projectEnvironment:create" | "integration:workos:projectEnvironment:delete" | "integration:workos:projectEnvironment:retrieveCredentials" | "sso:enable" | "sso:disable" | "sso:update" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "deployment:transfer" | "deployment:receive" | "deployment:update" | "customRole:create" | "customRole:update" | "customRole:delete";
+            action: "team:join" | "team:create" | "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "deployment:create" | "deployment:delete" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "project:updateMemberRole" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:create" | "billing:subscription:resume" | "billing:subscription:cancel" | "billing:subscription:changePlan" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "member:token:createWithSsoAccess" | "team:domain:create" | "team:domain:delete" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "team:disableExceedingSpendingLimits" | "billing:spendingLimit:update" | "team:applyReferralCode" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:verify" | "oauthApplication:generateClientSecret" | "integration:workos:team:create" | "integration:workos:environment:create" | "integration:workos:environment:delete" | "integration:workos:environment:retrieveCredentials" | "integration:workos:team:disconnect" | "integration:workos:team:inviteMember" | "integration:workos:projectEnvironment:create" | "integration:workos:projectEnvironment:delete" | "integration:workos:projectEnvironment:retrieveCredentials" | "sso:enable" | "sso:disable" | "sso:update" | "member:loginWithSso" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "deployment:transfer" | "deployment:receive" | "deployment:update" | "customRole:create" | "customRole:update" | "customRole:delete";
             /**
              * Format: int64
              * @description Time the event was created, in milliseconds since epoch.
@@ -1070,6 +1128,9 @@ export interface components {
              *     environment variable with the given name and deployment
              *     type if it exists (and do nothing if it doesn’t exist). */
             value?: string | null;
+            /** @description Apply this change to every existing cloud deployment of the selected
+             *     type, overwriting/deleting any existing values. Defaults to false. */
+            applyToExistingDeployments?: boolean;
         };
         DefaultEnvironmentVariableResponse: {
             name: string;
@@ -1148,6 +1209,12 @@ export interface components {
         };
         /** Format: int64 */
         MemberId: number;
+        MintLocalAiGatewayJwtArgs: {
+            attribution: components["schemas"]["AttributionClaims"];
+        };
+        MintLocalAiGatewayJwtResponse: {
+            token: string;
+        };
         PaginatedDefaultEnvironmentVariablesResponse: {
             items: components["schemas"]["DefaultEnvironmentVariableResponse"][];
             pagination: components["schemas"]["PaginationMetadata"];
@@ -1251,6 +1318,7 @@ export interface components {
              *     used. */
             deploymentClass?: string | null;
             deploymentRegion?: null | components["schemas"]["RegionName"];
+            tags?: string[] | null;
         };
         PlatformCreateProjectResponse: {
             /** @description Deprecated alias for `id`, kept for backwards compatibility. */
@@ -1511,6 +1579,9 @@ export interface components {
         PlatformUpdateProjectArgs: {
             name?: null | components["schemas"]["ProjectName"];
             slug?: null | components["schemas"]["ProjectSlug"];
+            /** @description Replaces the project's full set of tags; `[]` clears them. If omitted,
+             *     the tags are left unchanged. */
+            tags?: string[] | null;
         };
         PreviewDeploymentIdentifier: string;
         /** Format: int64 */
@@ -1537,12 +1608,27 @@ export interface components {
              *     this project, if one exists (an active local deployment or default
              *     cloud dev deployment). */
             devDeploymentName?: string | null;
+            /** @description The reference of the default production deployment for this project,
+             *     if one exists (e.g. "production"). */
+            prodDeploymentReference?: string | null;
+            /** @description The reference of the requesting member's default development deployment
+             *     for this project, if one exists and is a cloud deployment (e.g.
+             *     "dev/jane-doe"). */
+            devDeploymentReference?: string | null;
+            tags?: string[] | null;
         };
         ProjectSlug: string;
+        ProjectTagResponse: {
+            name: string;
+        };
+        ProjectTagsResponse: {
+            items: components["schemas"]["ProjectTagResponse"][];
+            pagination: components["schemas"]["PaginationMetadata"];
+        };
         ProposedTeamName: string;
         ReferralCode: string;
         /** @enum {string} */
-        RegionName: "aws-us-east-1" | "aws-eu-west-1";
+        RegionName: "aws-us-east-1" | "aws-eu-west-1" | "aws-ca-central-1" | "aws-ap-southeast-2";
         /** @enum {string} */
         RequestDestination: "convexCloud" | "convexSite";
         /** @enum {string} */
@@ -1552,8 +1638,8 @@ export interface components {
             effect: components["schemas"]["RoleStatementEffect"];
             actions: components["schemas"]["RoleStatementActions"];
             /**
-             * @description Resource path like `project:*`, `project:slug=my-app`, or
-             *     `project:*:deployment:type=prod`.
+             * @description Resource path like `project:*`, `project:slug=my-app`,
+             *     `project:tag=prod`, or `project:*:deployment:type=prod`.
              * @example project:*
              */
             resource: string;
@@ -1562,7 +1648,7 @@ export interface components {
          * @description An action that can be allowed or denied by a custom role statement.
          * @enum {string}
          */
-        RoleStatementAction: "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "project:view" | "project:updateMemberRole" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "defaultEnvironmentVariable:view" | "deployment:create" | "deployment:transfer" | "deployment:receive" | "deployment:updateReference" | "deployment:updateDashboardEditConfirmation" | "deployment:updateExpiresAt" | "deployment:updateSendLogsToClient" | "deployment:updateClass" | "deployment:updateIsDefault" | "deployment:updateType" | "deployment:delete" | "deployment:view" | "deployment:integrations:view" | "deployment:integrations:write" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:customDomain:view" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "member:view" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:changePlan" | "billing:spendingLimit:update" | "billing:view" | "billing:invoices:view" | "team:auditLog:view" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:view" | "oauthApplication:generateClientSecret" | "team:usage:view" | "deployment:insights:view" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "deployment:backups:view" | "sso:enable" | "sso:disable" | "sso:update" | "sso:view" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "directorySync:view" | "customRole:view" | "integration:view" | "integration:create" | "integration:update" | "integration:delete" | "deployment:deploy" | "deployment:env:view" | "deployment:env:write" | "deployment:pause" | "deployment:unpause" | "deployment:logs:view" | "deployment:metrics:view" | "deployment:data:view" | "deployment:data:write" | "deployment:backups:download" | "deployment:functions:actAsUser" | "deployment:functions:runInternalQueries" | "deployment:functions:runInternalMutations" | "deployment:functions:runInternalActions" | "deployment:functions:runTestQuery" | "deployment:auditLog:view" | "deployment:usageLimits:view" | "deployment:usageLimits:write" | "deployment:usage:view" | "deployment:aiGateway:use";
+        RoleStatementAction: "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "project:view" | "project:updateMemberRole" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "defaultEnvironmentVariable:view" | "deployment:create" | "deployment:transfer" | "deployment:receive" | "deployment:updateReference" | "deployment:updateDashboardEditConfirmation" | "deployment:updateExpiresAt" | "deployment:updateSendLogsToClient" | "deployment:updateClass" | "deployment:updateIsDefault" | "deployment:updateType" | "deployment:delete" | "deployment:view" | "deployment:integrations:view" | "deployment:integrations:write" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:customDomain:view" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "member:view" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:changePlan" | "billing:spendingLimit:update" | "billing:view" | "billing:invoices:view" | "team:auditLog:view" | "team:domain:create" | "team:domain:delete" | "team:domain:view" | "team:projectTags:view" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:view" | "oauthApplication:generateClientSecret" | "team:usage:view" | "deployment:insights:view" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "deployment:backups:view" | "sso:enable" | "sso:disable" | "sso:update" | "sso:view" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "directorySync:view" | "customRole:view" | "integration:view" | "integration:create" | "integration:update" | "integration:delete" | "deployment:deploy" | "deployment:env:view" | "deployment:env:write" | "deployment:pause" | "deployment:unpause" | "deployment:logs:view" | "deployment:metrics:view" | "deployment:data:view" | "deployment:data:write" | "deployment:backups:download" | "deployment:functions:actAsUser" | "deployment:functions:runInternalQueries" | "deployment:functions:runInternalMutations" | "deployment:functions:runInternalActions" | "deployment:functions:runTestQuery" | "deployment:auditLog:view" | "deployment:usageLimits:view" | "deployment:usageLimits:write" | "deployment:usage:view" | "deployment:aiGateway:use";
         RoleStatementActions: components["schemas"]["RoleStatementWildcardAction"] | components["schemas"]["RoleStatementAction"][];
         /**
          * @description Whether a rule grants or revokes access.
@@ -1607,9 +1693,6 @@ export interface components {
             /** @description The custom roles attached to this team member. Present iff
              *     `role` is `custom`. */
             customRoles?: components["schemas"]["TeamMemberCustomRole"][] | null;
-            /** @description Present only on directory-sync teams. `true` means the member's IdP
-             *     account is suspended. */
-            dsyncSuspended?: boolean | null;
         };
         /** @description A custom role attached to a team member, denormalized with the
          *     role's display name so API consumers can render members without a
@@ -1659,6 +1742,7 @@ export interface components {
 }
 export type AccessTokenId = components['schemas']['AccessTokenId'];
 export type AdminKey = components['schemas']['AdminKey'];
+export type AttributionClaims = components['schemas']['AttributionClaims'];
 export type AuditLogActor = components['schemas']['AuditLogActor'];
 export type AuditLogEventResponse = components['schemas']['AuditLogEventResponse'];
 export type CancelInvitationArgs = components['schemas']['CancelInvitationArgs'];
@@ -1693,6 +1777,8 @@ export type ListLocalDeploymentsResponse = components['schemas']['ListLocalDeplo
 export type ListTeamAccessTokensResponse = components['schemas']['ListTeamAccessTokensResponse'];
 export type ManagedBy = components['schemas']['ManagedBy'];
 export type MemberId = components['schemas']['MemberId'];
+export type MintLocalAiGatewayJwtArgs = components['schemas']['MintLocalAiGatewayJwtArgs'];
+export type MintLocalAiGatewayJwtResponse = components['schemas']['MintLocalAiGatewayJwtResponse'];
 export type PaginatedDefaultEnvironmentVariablesResponse = components['schemas']['PaginatedDefaultEnvironmentVariablesResponse'];
 export type PaginatedDeploymentsResponse = components['schemas']['PaginatedDeploymentsResponse'];
 export type PaginatedPersonalAccessTokensResponse = components['schemas']['PaginatedPersonalAccessTokensResponse'];
@@ -1726,6 +1812,8 @@ export type ProjectId = components['schemas']['ProjectId'];
 export type ProjectName = components['schemas']['ProjectName'];
 export type ProjectResponse = components['schemas']['ProjectResponse'];
 export type ProjectSlug = components['schemas']['ProjectSlug'];
+export type ProjectTagResponse = components['schemas']['ProjectTagResponse'];
+export type ProjectTagsResponse = components['schemas']['ProjectTagsResponse'];
 export type ProposedTeamName = components['schemas']['ProposedTeamName'];
 export type ReferralCode = components['schemas']['ReferralCode'];
 export type RegionName = components['schemas']['RegionName'];
@@ -1832,6 +1920,8 @@ export interface operations {
                 limit?: number;
                 /** @description Search query to filter projects by name or slug (case-insensitive) */
                 q?: string;
+                /** @description Only return projects with this tag. This parameter can be provided more than once to match projects with any of several tags */
+                tag?: string[];
             };
             header?: never;
             path: {
@@ -1848,6 +1938,33 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PlatformPaginatedProjectsResponse"];
+                };
+            };
+        };
+    };
+    "list project tags": {
+        parameters: {
+            query?: {
+                /** @description Cursor for pagination */
+                cursor?: string;
+                /** @description Maximum number of tags to return (default: 100, max: 100) */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Team ID */
+                team_id: components["schemas"]["TeamId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectTagsResponse"];
                 };
             };
         };
@@ -2206,6 +2323,32 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ListLocalDeploymentsResponse"];
+                };
+            };
+        };
+    };
+    "mint ai gateway jwt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Local deployment name */
+                deployment_name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MintLocalAiGatewayJwtArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MintLocalAiGatewayJwtResponse"];
                 };
             };
         };
@@ -2617,7 +2760,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Caller is not authorized to create teams */
+            /** @description This application is not authorized to create teams. This endpoint is reserved for specific integrations that are allowed to create users. If you need to create teams for your users, please contact us at platforms@convex.dev */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2669,7 +2812,7 @@ export interface operations {
                 to: number;
                 /** @description Only return events performed by this member. */
                 memberId?: null | components["schemas"]["MemberId"];
-                action?: "team:join" | "team:create" | "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "deployment:create" | "deployment:delete" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "project:updateMemberRole" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:create" | "billing:subscription:resume" | "billing:subscription:cancel" | "billing:subscription:changePlan" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "team:disableExceedingSpendingLimits" | "billing:spendingLimit:update" | "team:applyReferralCode" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:verify" | "oauthApplication:generateClientSecret" | "integration:workos:team:create" | "integration:workos:environment:create" | "integration:workos:environment:delete" | "integration:workos:environment:retrieveCredentials" | "integration:workos:team:disconnect" | "integration:workos:team:inviteMember" | "integration:workos:projectEnvironment:create" | "integration:workos:projectEnvironment:delete" | "integration:workos:projectEnvironment:retrieveCredentials" | "sso:enable" | "sso:disable" | "sso:update" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "deployment:transfer" | "deployment:receive" | "deployment:update" | "customRole:create" | "customRole:update" | "customRole:delete";
+                action?: "team:join" | "team:create" | "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "deployment:create" | "deployment:delete" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "project:updateMemberRole" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:create" | "billing:subscription:resume" | "billing:subscription:cancel" | "billing:subscription:changePlan" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "member:token:createWithSsoAccess" | "team:domain:create" | "team:domain:delete" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "team:disableExceedingSpendingLimits" | "billing:spendingLimit:update" | "team:applyReferralCode" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:verify" | "oauthApplication:generateClientSecret" | "integration:workos:team:create" | "integration:workos:environment:create" | "integration:workos:environment:delete" | "integration:workos:environment:retrieveCredentials" | "integration:workos:team:disconnect" | "integration:workos:team:inviteMember" | "integration:workos:projectEnvironment:create" | "integration:workos:projectEnvironment:delete" | "integration:workos:projectEnvironment:retrieveCredentials" | "sso:enable" | "sso:disable" | "sso:update" | "member:loginWithSso" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "deployment:transfer" | "deployment:receive" | "deployment:update" | "customRole:create" | "customRole:update" | "customRole:delete";
                 /** @description Maximum number of events to return (1-100, defaults to 15). */
                 limit?: number | null;
                 /** @description Cursor from a previous response to fetch the next page. */

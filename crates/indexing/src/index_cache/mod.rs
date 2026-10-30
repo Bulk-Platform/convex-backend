@@ -1,7 +1,7 @@
 use std::{
     collections::{
-        hash_map::Entry,
-        HashMap as StdHashMap,
+        btree_map::Entry,
+        BTreeMap,
         HashSet,
     },
     sync::{
@@ -32,7 +32,6 @@ use common::{
 };
 #[cfg(not(feature = "shuttle-testing"))]
 use dashmap::DashMap;
-use imbl::OrdSet;
 use interval_map::IntervalMap;
 use metrics::StaticMetricLabel;
 use moka::{
@@ -100,14 +99,14 @@ impl CacheKey {
 
 struct IndexIntervalsInner {
     map: IntervalMap,
-    id_to_params: StdHashMap<SubscriberId, (Arc<Interval>, Order, usize)>,
+    id_to_params: BTreeMap<SubscriberId, (Arc<Interval>, Order, usize)>,
     /// Maps each registered (interval, order, max_size) to its (SubscriberId,
     /// refcount). Each call to `insert` increments the refcount; each call to
     /// `remove` decrements it. The entry is only removed from the IntervalMap
     /// when the refcount reaches zero
     /// Refcounting is necessary to prevent the lazy eviction listener
     /// from unregistering an interval that a concurrent populate re-registered.
-    params_to_id: StdHashMap<(Arc<Interval>, Order, usize), (SubscriberId, usize)>,
+    params_to_id: BTreeMap<(Arc<Interval>, Order, usize), (SubscriberId, usize)>,
     next_id: SubscriberId,
 }
 
@@ -123,8 +122,8 @@ impl IndexIntervals {
         Self {
             inner: Arc::new(Mutex::new(IndexIntervalsInner {
                 map: IntervalMap::new(),
-                id_to_params: StdHashMap::new(),
-                params_to_id: StdHashMap::new(),
+                id_to_params: BTreeMap::new(),
+                params_to_id: BTreeMap::new(),
                 next_id: 0,
             })),
         }
@@ -299,18 +298,23 @@ impl IndexCache {
                 .collect();
 
             for (index_id, intervals) in entries {
-                for (interval, order, max_size) in intervals.intervals() {
-                    self.cache.remove(CacheKey {
-                        deployment_id,
-                        index_id,
-                        interval,
-                        order,
-                        max_size,
-                    });
-                }
+                self.evict(deployment_id, index_id, &intervals);
             }
         }
         log_index_cache_size(self.cache.weighted_size());
+    }
+
+    /// The caller must release all DashMap locks before evicting cache entries.
+    fn evict(&self, deployment_id: DeploymentId, index_id: IndexId, intervals: &IndexIntervals) {
+        for (interval, order, max_size) in intervals.intervals() {
+            self.cache.remove(CacheKey {
+                deployment_id,
+                index_id,
+                interval,
+                order,
+                max_size,
+            });
+        }
     }
 
     /// Whether `(interval, order, max_size)` is currently registered for this
@@ -377,12 +381,16 @@ impl IndexCacheHandle {
     }
 
     fn remove_index(&self, index_id: &IndexId) {
-        self.shared_cache
+        // Release the DashMap locks before acquiring the cache lock in `evict`.
+        let removed = self
+            .shared_cache
             .index_to_intervals
-            .entry(self.deployment_id)
-            .and_modify(|e| {
-                e.remove(index_id);
-            });
+            .get(&self.deployment_id)
+            .and_then(|d| d.remove(index_id));
+        if let Some((index_id, intervals)) = removed {
+            self.shared_cache
+                .evict(self.deployment_id, index_id, &intervals);
+        }
     }
 
     pub(crate) fn get(
@@ -478,23 +486,19 @@ impl IndexCacheHandle {
             timer.add_label(StaticMetricLabel::new("result", "already_exists"));
             return;
         }
-        let mut entries_size = 0;
-        let entries: OrdSet<Arc<IndexEntry>> = index_page
-            .entries
-            .into_iter()
-            .inspect(|entry| {
-                entries_size += std::mem::size_of::<IndexEntry>() + entry.heap_size();
-            })
-            .collect();
+        let IndexPage { entries, cursor } = index_page;
+        let entries_size = entries
+            .iter()
+            .map(|entry| std::mem::size_of::<IndexEntry>() + entry.heap_size())
+            .sum();
         let Some(index) = index_registry.enabled_index_by_index_id(&index_id) else {
             timer.add_label(StaticMetricLabel::new("result", "unknown_index"));
             return;
         };
         let cached_interval = CachedInterval {
             is_ready: false,
-            entries,
-            order,
-            cursor: index_page.cursor,
+            entries: entries.into(),
+            cursor,
             entries_size,
             begin_ts: ts,
             populate_id,
@@ -618,9 +622,10 @@ impl IndexCacheHandle {
         let _timer = cache_apply_writes_timer();
         let deployment_id = self.deployment_id;
         for (index_name, writes) in writes_by_index {
-            // When an index is modified, we remove it from the index_to_intervals map so it
-            // can't be queried again. Doesn't really matter if it is added, removed, or
-            // updated. If it's added, future populates will populate it.
+            // When an index is modified, we untrack it and evict its cached entries, so
+            // no reader at or after the modification can be served one. This covers
+            // staging, which keeps the IndexId while writes to the staged index skip
+            // apply_writes, so entries kept through a stage/unstage would be stale.
             if &TabletIndexName::by_id(self.index_tablet) == index_name {
                 for write in writes.clone() {
                     self.remove_index(&IndexId(write.document_id.internal_id()))
@@ -670,8 +675,8 @@ pub struct CachedInterval {
     /// Whether this interval is ready to serve reads (it has been validated by
     /// reading the write log up to the latest timestamp)
     is_ready: bool,
-    entries: OrdSet<Arc<IndexEntry>>,
-    order: Order,
+    /// Stored in the order returned by the index reader.
+    entries: Arc<[Arc<IndexEntry>]>,
     cursor: CursorPosition,
     entries_size: usize,
     begin_ts: RepeatableTimestamp,
@@ -696,7 +701,7 @@ impl CachedInterval {
         // Since writes to this interval invalidate the cache entry, the entries
         // are always from the original populate snapshot, valid at any ts >=
         // begin_ts. The cursor is also from the original page.
-        let entries = self.order.apply(self.entries.iter().cloned()).collect();
+        let entries = self.entries.iter().cloned().collect();
         Some((
             IndexPage {
                 entries,
@@ -707,19 +712,14 @@ impl CachedInterval {
     }
 
     fn size(&self) -> usize {
-        std::mem::size_of::<Self>() + self.entries_size + self.cursor.heap_size()
+        std::mem::size_of::<Self>()
+            + std::mem::size_of_val(self.entries.as_ref())
+            + self.entries_size
+            + self.cursor.heap_size()
     }
 }
 
-// These tests are compiled (so rust-analyzer resolves them) under both the
-// regular and `shuttle-testing` configs, but each `#[test]` is `#[ignore]`d
-// under `shuttle-testing`: that feature swaps in shuttle's synchronization
-// primitives crate-wide, which panic when used outside a shuttle runner. The
-// shuttle suite itself lives in `index_cache/shuttle_tests.rs`.
-//
-// NOTE: any new test added here must carry the same
-// `#[cfg_attr(feature = "shuttle-testing", ignore = ...)]` attribute, or it
-// will panic under `cargo test --features shuttle-testing`.
 /// Shuttle-based concurrency tests. See `index_cache/shuttle_tests.rs`.
-#[cfg(all(test, feature = "shuttle-testing"))]
+/// N.B.: `cfg(rust_analyzer)` is enabled in rust-analyzer only, not in rustc.
+#[cfg(any(all(test, feature = "shuttle-testing"), rust_analyzer))]
 mod shuttle_tests;

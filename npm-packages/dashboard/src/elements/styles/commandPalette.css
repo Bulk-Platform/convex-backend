@@ -66,7 +66,13 @@
   }
 }
 
-[cmdk-item]:has([data-secondary-action]) {
+/* Rows whose body is its own element — a link, or the part of the row that
+   sits next to a secondary action button — carry the row's padding and
+   selected background on that element instead, so it spans the whole row
+   (minus the button) and a link's hit area matches what it looks like.
+   Scoped to a direct child so a nested body (a tooltip wrapper's, say) can't
+   zero this row's padding with nothing to put it back. */
+[cmdk-item]:has(> [data-item-primary]) {
   @apply gap-0 p-0;
 
   &[data-selected="true"],

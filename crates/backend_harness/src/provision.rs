@@ -55,6 +55,7 @@ static SELF_HOSTED_DOCKER_COMPOSE: LazyLock<PathBuf> =
     LazyLock::new(|| REPO_ROOT.join("self-hosted/docker/docker-compose.yml"));
 
 const PROD_PROVISION_HOST: &str = "https://api.convex.dev";
+const BACKEND_HARNESS_CLIENT_ID: &str = concat!("backend-harness-", env!("CARGO_PKG_VERSION"));
 /// Port usher runs on locally
 const USHER_PORT: u16 = 8002;
 /// Port funrun runs on locally, overriding its default of 40994. Must stay
@@ -65,8 +66,6 @@ const FUNRUN_PORT: u16 = 8005;
 /// Address of local test backend through usher
 static USHER_INSTANCE_URL: LazyLock<String> =
     LazyLock::new(|| format!("http://carnitas.local.convex.cloud:{USHER_PORT}"));
-
-const LOCAL_LOG_SINK_FILENAME: &str = "log_sink.jsonl";
 
 /// Ports the open-source `convex-local-backend` binds. Overridable via env so a
 /// second backend stack (e.g. the conductor stack, which uses 8000) can run
@@ -163,27 +162,17 @@ enum ProvisionHandle {
         _backend_handle: tokio::process::Child,
         _usher_handle: Option<tokio::process::Child>,
         _funrun_handle: Option<tokio::process::Child>,
-        tempdir: tempfile::TempDir,
+        _tempdir: tempfile::TempDir,
     },
     LocalConductor {
         _conductor_handle: tokio::process::Child,
         _usher_handle: tokio::process::Child,
         _funrun_handle: Option<tokio::process::Child>,
-        tempdir: tempfile::TempDir,
+        _tempdir: tempfile::TempDir,
     },
 }
 
 impl ProvisionHandle {
-    fn local_log_sink(&self) -> Option<PathBuf> {
-        match self {
-            ProvisionHandle::BigBrain { .. } => None,
-            ProvisionHandle::LocalBackend { tempdir, .. }
-            | ProvisionHandle::LocalConductor { tempdir, .. } => {
-                Some(tempdir.path().join(LOCAL_LOG_SINK_FILENAME))
-            },
-        }
-    }
-
     fn url(&self) -> Option<String> {
         match self {
             ProvisionHandle::BigBrain { .. } => None,
@@ -227,7 +216,7 @@ pub async fn with_provision<T, F, Fut>(
     func: F,
 ) -> anyhow::Result<T>
 where
-    F: FnOnce(String, String, Option<PathBuf>) -> Fut,
+    F: FnOnce(String, String) -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
     let Provision {
@@ -243,7 +232,7 @@ where
     )
     .await?;
 
-    let result = func(deployment_url, admin_key, handle.local_log_sink()).await;
+    let result = func(deployment_url, admin_key).await;
     match provision_request {
         ProvisionRequest::NewProject => {
             handle.cleanup().await?;
@@ -465,8 +454,6 @@ async fn provision(
                 .arg("--in-process-searchlight")
                 .arg("--do-not-require-ssl")
                 .arg(db_path.clone())
-                .arg("--local-log-sink")
-                .arg(tempdir_handle.path().join(LOCAL_LOG_SINK_FILENAME))
                 .arg("--convex-origin-base")
                 .arg(format!("http://local.convex.cloud:{USHER_PORT}"))
                 .arg("--convex-site-base")
@@ -491,6 +478,7 @@ async fn provision(
             // Give it ~15 seconds to start up (5 retries with 500ms exponential backoff)
             wait_for_http_health(
                 &USHER_INSTANCE_URL.parse()?,
+                BACKEND_HARNESS_CLIENT_ID,
                 Some("0.0.0-backendharness"),
                 // We should include a random instance name here, but it would need to match our
                 // admin key. Right now the admin key is static, so either we use a static name
@@ -508,7 +496,7 @@ async fn provision(
                     _conductor_handle: conductor_handle,
                     _usher_handle: usher_handle,
                     _funrun_handle: funrun_handle,
-                    tempdir: tempdir_handle,
+                    _tempdir: tempdir_handle,
                 },
                 USHER_INSTANCE_URL.clone(),
             )
@@ -554,6 +542,7 @@ async fn provision(
             // Give it ~15 seconds to start up (5 retries with 500ms exponential backoff)
             wait_for_http_health(
                 &backend_url.parse()?,
+                BACKEND_HARNESS_CLIENT_ID,
                 Some("0.0.0-backendharness"),
                 // We should include a random instance name here, but it would need to match our
                 // admin key. Right now the admin key is static, so either we use a static name
@@ -571,7 +560,7 @@ async fn provision(
                     _backend_handle: backend_handle,
                     _usher_handle: None,
                     _funrun_handle: None,
-                    tempdir: tempdir_handle,
+                    _tempdir: tempdir_handle,
                 },
                 backend_url,
             )
@@ -607,6 +596,7 @@ async fn provision(
             // Give it ~15 seconds to start up (5 retries with 500ms exponential backoff)
             wait_for_http_health(
                 &backend_url.parse()?,
+                BACKEND_HARNESS_CLIENT_ID,
                 Some("0.0.0-backendharness"),
                 // We should include a random instance name here, but it would need to match our
                 // admin key. Right now the admin key is static, so either we use a static name
@@ -624,7 +614,7 @@ async fn provision(
                     _backend_handle: backend_handle,
                     _usher_handle: None,
                     _funrun_handle: None,
-                    tempdir: tempdir_handle,
+                    _tempdir: tempdir_handle,
                 },
                 backend_url,
             )

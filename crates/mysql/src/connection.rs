@@ -1,14 +1,18 @@
 use std::{
     env,
+    io::ErrorKind,
     mem,
     path::PathBuf,
     str::FromStr,
+    sync::OnceLock,
     time::Duration,
 };
 
 use ::metrics::StaticMetricLabel;
+use anyhow::Context as _;
 use common::{
     errors::{
+        database_deadlock_error,
         database_operational_error,
         database_timeout_error,
         DatabaseOperationalError,
@@ -56,6 +60,8 @@ use mysql_async::{
     prelude::Queryable,
     Conn,
     DriverError,
+    IoError,
+    IsolationLevel,
     Opts,
     OptsBuilder,
     Params,
@@ -89,9 +95,8 @@ fn classify_mysql_error(e: mysql_async::Error) -> anyhow::Error {
         mysql_async::Error::Driver(
             DriverError::PoolDisconnected | DriverError::ConnectionClosed,
         )
-        | mysql_async::Error::Io(_)
         | mysql_async::Error::Server(mysql_async::ServerError {
-            // Expected operational Vitess errors:
+            // Expected operational MySQL/Aurora errors:
             code:
             | 1290 // EROptionPreventsStatement "The MySQL server is running with the --read-only option so it cannot execute this statement"
             | 2013 // CRServerLost
@@ -101,20 +106,47 @@ fn classify_mysql_error(e: mysql_async::Error) -> anyhow::Error {
         }) => {
             database_operational_error(e.into())
         },
+        mysql_async::Error::Io(ref io_error) if is_operational_mysql_io_error(io_error) => {
+            database_operational_error(e.into())
+        },
         mysql_async::Error::Server(mysql_async::ServerError {
             // ERUnknownError
             code: 1105,
             ref message,
             ..
-        }) if message.contains("primary is not serving")
-            || message.contains("for tx killer rollback")
-            || message.contains("connection pool timed out")
-            || message.contains("connection timed out") =>
-        {
+        }) if message.contains("connection timed out") =>         {
             database_operational_error(e.into())
         },
+        mysql_async::Error::Server(mysql_async::ServerError {
+            code: ER_LOCK_DEADLOCK,
+            ..
+        }) => database_deadlock_error(e.into()),
         _ => e.into(),
     }
+}
+
+fn is_operational_mysql_io_error(error: &IoError) -> bool {
+    let IoError::Io(error) = error else {
+        return false;
+    };
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+    ) ||
+        // This DNS failure shares an ErrorKind with unrelated errors; match
+        // its exact message to identify temporary resolution failures.
+        error.to_string()
+            == "failed to lookup address information: Temporary failure in name resolution"
+}
+
+const ER_LOCK_DEADLOCK: u16 = 1213;
+pub(crate) const ER_NO_SUCH_TABLE: u16 = 1146;
+
+pub(crate) fn is_no_such_table_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|error| error.downcast_ref::<mysql_async::ServerError>())
+        .any(|database_error| database_error.code == ER_NO_SUCH_TABLE)
 }
 
 // Guard against connections hanging during bootstrapping -- which means
@@ -492,10 +524,15 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
     pub async fn transaction(
         &mut self,
         db_cluster_name: &str,
+        isolation: Option<IsolationLevel>,
     ) -> anyhow::Result<MySqlTransaction<'_>> {
         let timer = begin_transaction_timer(db_cluster_name);
         log_transaction(self.labels.clone());
-        let inner = with_timeout(self.conn.start_transaction(TxOpts::new())).await?;
+        let mut tx_opts = TxOpts::new();
+        if let Some(isolation) = isolation {
+            tx_opts.with_isolation_level(isolation);
+        }
+        let inner = with_timeout(self.conn.start_transaction(tx_opts)).await?;
         timer.finish();
         Ok(MySqlTransaction {
             inner,
@@ -542,15 +579,11 @@ impl MySqlTransaction<'_> {
         statement: &str,
         params: Vec<MySqlValue>,
     ) -> anyhow::Result<()> {
-        let future = if self.use_prepared_statements {
-            let statement = format_mysql_binary_protocol(self.db_name, statement)?;
-            self.inner.exec_drop(statement, Params::Positional(params))
-        } else {
-            let statement =
-                format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
-            self.inner.query_drop(statement)
-        };
-        with_timeout(future).await
+        if !self.use_prepared_statements {
+            return self.query_drop(statement, params).await;
+        }
+        let statement = format_mysql_binary_protocol(self.db_name, statement)?;
+        with_timeout(self.inner.exec_drop(statement, Params::Positional(params))).await
     }
 
     /// Execute a SQL statement, returning the number of rows affected.
@@ -559,19 +592,38 @@ impl MySqlTransaction<'_> {
         statement: &str,
         params: Vec<MySqlValue>,
     ) -> anyhow::Result<u64> {
-        let affected_rows = if self.use_prepared_statements {
-            let statement = format_mysql_binary_protocol(self.db_name, statement)?;
+        if !self.use_prepared_statements {
+            return self.query_iter(statement, params).await;
+        }
+        let statement = format_mysql_binary_protocol(self.db_name, statement)?;
+        Ok(
             with_timeout(self.inner.exec_iter(statement, Params::Positional(params)))
                 .await?
-                .affected_rows()
-        } else {
-            let statement =
-                format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
-            with_timeout(self.inner.query_iter(statement))
-                .await?
-                .affected_rows()
-        };
-        Ok(affected_rows)
+                .affected_rows(),
+        )
+    }
+
+    /// Executes a raw query using the text protocol, even when the connection
+    /// is configured to use prepared statements.
+    pub async fn query_drop(
+        &mut self,
+        statement: &str,
+        params: Vec<MySqlValue>,
+    ) -> anyhow::Result<()> {
+        let statement = format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
+        with_timeout(self.inner.query_drop(statement)).await
+    }
+
+    /// Like [`Self::query_drop`], returning the number of rows affected.
+    pub async fn query_iter(
+        &mut self,
+        statement: &str,
+        params: Vec<MySqlValue>,
+    ) -> anyhow::Result<u64> {
+        let statement = format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
+        Ok(with_timeout(self.inner.query_iter(statement))
+            .await?
+            .affected_rows())
     }
 
     pub async fn commit(self) -> anyhow::Result<()> {
@@ -581,6 +633,7 @@ impl MySqlTransaction<'_> {
 }
 
 pub struct ConvexMySqlPool<RT: Runtime> {
+    pub(crate) v6_replica: OnceLock<crate::v6_replica::ReplicaTarget<RT>>,
     pool: Pool,
     use_prepared_statements: bool,
     runtime: Option<RT>,
@@ -673,6 +726,7 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
             opts = opts.ssl_opts(ssl_opts);
         }
         Ok(Self {
+            v6_replica: OnceLock::new(),
             pool: Pool::new(opts),
             use_prepared_statements,
             runtime,
@@ -711,6 +765,15 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
 
     pub fn cluster_name(&self) -> &str {
         &self.cluster_name
+    }
+
+    /// Set before opening deployments: each writer keeps its initial target
+    /// for its lifetime.
+    pub fn set_v6_replica(&self, target: crate::V6ReplicaTarget<RT>) -> anyhow::Result<()> {
+        self.v6_replica
+            .set(target)
+            .ok()
+            .context("V6 replica target is already set")
     }
 
     /// Report gauges with information about the MySQL pool.

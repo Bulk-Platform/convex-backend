@@ -66,6 +66,7 @@ use crate::{
     ops::{
         run_v8_op,
         start_async_op,
+        uncatchable_developer_error,
     },
     strings,
     termination::{
@@ -281,6 +282,17 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> RequestScope<
         let async_op_key = strings::asyncOp.create(scope)?;
         convex_value.set(scope, async_op_key.into(), async_op_value.into());
 
+        let setup_temporal_key = strings::setupTemporal.create(scope)?;
+        let setup_temporal: v8::Local<v8::Function> = convex_value
+            .get(scope, setup_temporal_key.into())
+            .context("Missing Temporal setup")?
+            .try_into()
+            .context("Temporal setup must be a function")?;
+        convex_value.delete(scope, setup_temporal_key.into());
+        setup_temporal
+            .call(scope, convex_value.into(), &[])
+            .context("Failed to set up Temporal")?;
+
         timer.finish();
         Ok(isolate_context)
     }
@@ -334,21 +346,22 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> RequestScope<
     }
 
     fn handle_syscall_or_op_error(scope: &mut ExecutionScope<RT, E>, err: anyhow::Error) {
-        if let Some(uncatchable_error) = err.downcast_ref::<UncatchableDeveloperError>() {
-            scope.handle().terminate(
-                ContextTerminationReason::UncatchableDeveloperError(
-                    uncatchable_error.js_error.clone(),
-                )
-                .into(),
-            );
-            let message = uncatchable_error.js_error.message.to_string();
-            let message_v8 = v8::String::new(scope, &message[..]).unwrap();
-            let exception = v8::Exception::error(scope, message_v8);
-            scope.throw_exception(exception);
-            return;
-        }
+        let err = match err.downcast::<UncatchableDeveloperError>() {
+            Ok(UncatchableDeveloperError { message }) => {
+                let js_error = uncatchable_developer_error(scope, message);
+                let message_v8 = v8::String::new(scope, &js_error.message[..]).unwrap();
+                scope.handle().terminate(
+                    ContextTerminationReason::UncatchableDeveloperError(js_error).into(),
+                );
+                let exception = v8::Exception::error(scope, message_v8);
+                scope.throw_exception(exception);
+                return;
+            },
+            Err(err) => err,
+        };
 
-        let err = match err.downcast::<JsException>() {
+        let js_exception = err.downcast::<JsException>();
+        let err = match js_exception {
             Ok(js_exception) => match js_exception.to_v8(scope) {
                 Ok(e) => {
                     scope.throw_exception(e);
@@ -402,8 +415,19 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> RequestScope<
         ExecutionScope::new(v8_scope)
     }
 
+    /// Drains the microtask queue and the message loop.
+    ///
+    /// An isolate with an isolate-level termination is discarded and must not
+    /// enter V8 again. Each drain can reach the heap limit and terminate the
+    /// isolate, so the check runs before each V8 call.
     pub fn checkpoint(&mut self) {
+        if self.handle.is_not_clean().is_some() {
+            return;
+        }
         self.scope.perform_microtask_checkpoint();
+        if self.handle.is_not_clean().is_some() {
+            return;
+        }
         pump_message_loop(self.scope);
     }
 

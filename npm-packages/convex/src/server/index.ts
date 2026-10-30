@@ -55,7 +55,12 @@ export type {
   Auth,
   AuthConfig,
   AuthProvider,
+  MutationAuth,
   UserIdentity,
+  ReservedJwtClaim,
+  ReservedJwtClaimPrefix,
+  SignJwtClaims,
+  SignJwtOptions,
   UserIdentityAttributes,
 } from "./authentication.js";
 export * from "./database.js";
@@ -103,7 +108,11 @@ export {
   internalMutationGeneric,
   internalQueryGeneric,
 } from "./impl/registration_impl.js";
-export { getServiceToken } from "./impl/actions_impl.js";
+export {
+  getServiceToken,
+  getServiceUrl,
+  type ServiceName,
+} from "./impl/actions_impl.js";
 export type {
   TransactionMetric,
   TransactionMetrics,
@@ -174,6 +183,7 @@ export {
 export type {
   ApiFromModules,
   AnyApi,
+  FunctionReference_future,
   FilterApi,
   FunctionType,
   FunctionReference,
@@ -204,6 +214,7 @@ export type {
   ComponentDefinition,
   AnyComponents,
   FunctionHandle,
+  FunctionHandle_future,
 } from "./components/index.js";
 
 /**

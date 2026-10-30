@@ -46,7 +46,6 @@ use tower_http::{
     },
     decompression::RequestDecompressionLayer,
 };
-use udf::HTTP_ACTION_BODY_LIMIT;
 use utoipa::{
     openapi::security::{
         ApiKey,
@@ -83,6 +82,7 @@ use crate::{
         push_config,
     },
     deploy_config2,
+    deployment_jwks::deployment_jwks,
     environment_variables::{
         list_environment_variables,
         platform_router,
@@ -99,6 +99,7 @@ use crate::{
         cancel_developer_job,
         create_function_handle,
         create_service_token,
+        get_service_url,
         internal_action_post,
         internal_mutation_post,
         internal_query_post,
@@ -425,6 +426,7 @@ pub fn router(st: LocalAppState) -> Router {
     Router::new()
         .nest("/api", api_routes)
         .merge(health_check_routes(version))
+        .route("/.well-known/jwks.json", get(deployment_jwks))
         .layer(cors())
         .with_state(st)
         .merge(migrated)
@@ -460,6 +462,7 @@ where
         .route("/mutation", post(internal_mutation_post))
         .route("/action", post(internal_action_post))
         .route("/create_service_token", post(create_service_token))
+        .route("/get_service_url", post(get_service_url))
         .route("/schedule_job", post(schedule_job))
         .route("/vector_search", post(vector_search))
         .route("/cancel_job", post(cancel_developer_job))
@@ -493,7 +496,6 @@ pub fn http_action_routes() -> Router<RouterState> {
     Router::new()
         .route("/{*rest}", http_action_handler())
         .route("/", http_action_handler())
-        .layer(DefaultBodyLimit::max(HTTP_ACTION_BODY_LIMIT))
 }
 
 pub fn app_metrics_routes<S>() -> Router<S>

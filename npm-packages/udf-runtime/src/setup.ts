@@ -1,6 +1,9 @@
 import { setupURL } from "./00_url.js";
 import { setupCrypto } from "./00_crypto.js";
 import { setupDate } from "./00_date.js";
+import { setupMisc } from "./00_misc.js";
+import { patchDateTimeFormat, setupTemporal } from "./00_temporal.js";
+import { setupWeakRefs } from "./00_weakref.js";
 import { setupDOMException } from "./01_dom_exception.js";
 import { setupConsole } from "./02_console";
 import { setupEvent } from "./02_event";
@@ -12,14 +15,12 @@ import { setupTextEncoding } from "./08_text_encoding.js";
 import { setupBlob } from "./09_file.js";
 import { setupHeaders } from "./20_headers.js";
 import { setupFormData } from "./21_formdata.js";
-import { requestFromConvexJson, setupRequest } from "./23_request.js";
-import { convexJsonFromResponse, setupResponse } from "./23_response.js";
+import { setupRequest } from "./23_request.js";
+import { setupResponse } from "./23_response.js";
 import { setupFetch } from "./26_fetch.js";
 import { setupPerformance } from "./27_performance.js";
 import { setupSourceMapping } from "./errors.js";
-import { throwUncatchableDeveloperError } from "./helpers.js";
-import { getBlob, storeBlob } from "./storage.js";
-import { performOp } from "udf-syscall-ffi";
+import { setupJsSyscall } from "./js_syscall.js";
 import { setupStructuredClone } from "./02_structured_clone.js";
 
 /**
@@ -31,10 +32,14 @@ import { setupStructuredClone } from "./02_structured_clone.js";
 export function setup(global: any) {
   setupSourceMapping();
   setupDate(global);
+  patchDateTimeFormat(global, global.Date.now);
+  // V8 installs Temporal when deserializing a context, after snapshot setup.
+  global.Convex.setupTemporal = () => setupTemporal(global);
   // NB: It's important we call into `setupMisc` before the other setup functions
   // since those may call into 3rd party libraries we bundle, which may then
   // retain references to globals we modify, like `Date` or `FinalizationRegistry`.
   setupMisc(global);
+  setupWeakRefs(global);
 
   // These need to be set up in order of the numbers in their filenames (taken
   // from Deno) since later ones depend on the earlier ones.
@@ -57,123 +62,5 @@ export function setup(global: any) {
   setupFetch(global);
   setupPerformance(global);
 
-  global.Convex.jsSyscall = (op: string, args: Record<string, any>) => {
-    switch (op) {
-      case "requestFromConvexJson":
-        return requestFromConvexJson(args as any);
-      case "convexJsonFromResponse":
-        return convexJsonFromResponse(args as any);
-      case "storage/storeBlob":
-        return storeBlob(args as any);
-      case "storage/getBlob":
-        return getBlob(args as any);
-      default:
-        return throwUncatchableDeveloperError(`Unknown JS syscall: ${op}`);
-    }
-  };
-}
-
-function setupMisc(global) {
-  // Patch `Math.random` with our own deterministic RNG.
-  delete global.Math.random;
-  global.Math.random = function () {
-    return performOp("random");
-  };
-
-  // Proxy process.env. with a syscall that gets the environment variable's value.
-  const handler = {
-    get(_target: any, prop: any, receiver: any) {
-      if (typeof prop === "string") {
-        const value = performOp("environmentVariables/get", prop);
-        // Map null to undefined in case other libraries check explicitly for undefined
-        // Note serde Value enum in rust does not have an undefined variant, only null.
-        if (value === null) {
-          if (prop === "inspect") {
-            return () => "[process.env]";
-          }
-          return undefined;
-        }
-        return value;
-      } else {
-        return Reflect.get(_target, prop, receiver);
-      }
-    },
-  };
-  const env = new Proxy({}, handler);
-  global.process = { env };
-
-  // defined in browsers and required by the WinterCG Minimum Common Web Platform API draft
-  // https://common-min-api.proposal.wintercg.org/
-  global.self = global;
-
-  // Patch `WeakRef` with a noop implementation since it externalizes non-deterministic GC decisions.
-  delete global.WeakRef;
-  global.WeakRef = WeakRef;
-
-  // Patch `FinalizationRegistry` with our own version that does nothing.
-  delete global.FinalizationRegistry;
-  global.FinalizationRegistry = FinalizationRegistry;
-}
-
-// No-op implementation of https://tc39.es/ecma262/multipage/managing-memory.html#sec-finalization-registry.prototype.register
-class FinalizationRegistry {
-  constructor(callbackFn: (heldValue: any) => void) {
-    if (typeof callbackFn !== "function") {
-      throw new TypeError("cleanup must be callable");
-    }
-  }
-
-  register(target, heldValue, unregisterToken) {
-    if (!CanBeHeldWeakly(target)) {
-      throw new TypeError("target must be an object");
-    }
-    if (target === heldValue) {
-      throw new TypeError("target and holdings must not be same");
-    }
-    if (unregisterToken !== undefined && !CanBeHeldWeakly(unregisterToken)) {
-      throw new TypeError("unregisterToken must be an object");
-    }
-  }
-
-  unregister(unregisterToken) {
-    if (!CanBeHeldWeakly(unregisterToken)) {
-      throw new TypeError("unregisterToken must be an object");
-    }
-  }
-
-  get [Symbol.toStringTag]() {
-    return "FinalizationRegistry";
-  }
-}
-
-// Implementation of https://tc39.es/ecma262/multipage/managing-memory.html#sec-weak-ref-objects
-// that is just a strong reference under the hood.
-class WeakRef {
-  #target: any;
-
-  constructor(target) {
-    if (target === undefined || !CanBeHeldWeakly(target)) {
-      throw new TypeError("target must be an object");
-    }
-    this.#target = target;
-  }
-
-  deref() {
-    return this.#target;
-  }
-
-  get [Symbol.toStringTag]() {
-    return "WeakRef";
-  }
-}
-
-// https://tc39.es/ecma262/multipage/executable-code-and-execution-contexts.html#sec-canbeheldweakly
-function CanBeHeldWeakly(v: any) {
-  if (typeof v === "object" || typeof v === "function") {
-    return true;
-  }
-  if (typeof v === "symbol" || Symbol.keyFor(v) === undefined) {
-    return true;
-  }
-  return false;
+  setupJsSyscall(global);
 }

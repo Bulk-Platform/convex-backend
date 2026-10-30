@@ -132,8 +132,11 @@ export const Default: Story = {};
 async function openConfigure(canvasElement: HTMLElement, label: string) {
   const canvas = within(canvasElement);
   await waitFor(() => canvas.getByText(label));
-  const heading = canvas.getByText(label);
-  const panel = heading.closest("div")!.parentElement!;
+  // The nearest ancestor holding a configure button is this integration's card.
+  let panel = canvas.getByText(label).parentElement!;
+  while (!within(panel).queryByTestId("configure-integration")) {
+    panel = panel.parentElement!;
+  }
   await userEvent.click(within(panel).getByTestId("configure-integration"));
   // Log-stream integrations open a slide-over panel and exception-reporting
   // ones open a modal; both render with role="dialog".
@@ -153,6 +156,14 @@ export const ConfigureSentry: Story = {
 export const ConfigureDatadog: Story = {
   play: async ({ canvasElement }) => {
     await openConfigure(canvasElement, "Datadog");
+  },
+};
+
+// Each Analytics export destination is behind its own LaunchDarkly flag.
+export const ConfigureS3Export: Story = {
+  render: () => renderIntegrations({ s3ExportIntegrationEnabled: true }),
+  play: async ({ canvasElement }) => {
+    await openConfigure(canvasElement, "AWS S3");
   },
 };
 

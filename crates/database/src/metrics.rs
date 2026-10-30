@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    time::Duration,
+};
 
 use ::search::metrics::{
     SearchType,
@@ -6,8 +9,12 @@ use ::search::metrics::{
 };
 use common::{
     identity::IDENTITY_LABEL,
+    persistence::PersistenceIndexEntry,
     runtime::Runtime,
-    types::Timestamp,
+    types::{
+        IndexWriteMode,
+        Timestamp,
+    },
 };
 use errors::ErrorMetadata;
 use keybroker::Identity;
@@ -325,8 +332,8 @@ register_convex_histogram!(
     "Time from enqueueing a commit to it reaching the committer thread: the committer queue wait, \
      plus the wait for a pre-validation lane and the off-thread conflict check itself"
 );
-pub fn commit_queue_timer() -> Timer<VMHistogram> {
-    Timer::new(&DATABASE_COMMIT_QUEUE_SECONDS)
+pub fn log_commit_dequeued(time_in_queue: Duration) {
+    log_distribution(&DATABASE_COMMIT_QUEUE_SECONDS, time_in_queue.as_secs_f64());
 }
 
 register_convex_histogram!(
@@ -336,6 +343,15 @@ register_convex_histogram!(
 );
 pub fn commit_timer() -> StatusTimer {
     StatusTimer::new(&DATABASE_COMMIT_SECONDS)
+}
+
+register_convex_histogram!(
+    DATABASE_COMMIT_PERSISTED_SECONDS,
+    "Time from a commit's submission until persistence acknowledges its write. Excludes time \
+     waiting for the committed timestamp to become repeatable."
+);
+pub fn log_commit_persisted(elapsed: Duration) {
+    log_distribution(&DATABASE_COMMIT_PERSISTED_SECONDS, elapsed.as_secs_f64());
 }
 
 register_convex_histogram!(
@@ -464,6 +480,87 @@ pub fn commit_index_rows(num_rows: u64) {
     log_counter(&DATABASE_COMMIT_INDEX_ROWS, num_rows);
 }
 
+register_convex_counter!(
+    DATABASE_COMMIT_INDEX_ENTRIES_TOTAL,
+    "Logical index entries in commits acknowledged by persistence",
+    &["operation", "is_system_index", "mode"]
+);
+register_convex_counter!(
+    DATABASE_COMMIT_INDEX_BYTES_TOTAL,
+    "Logical index bytes in commits acknowledged by persistence, measured with \
+     PersistenceIndexEntry::size",
+    &["operation", "is_system_index", "mode"]
+);
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, strum::IntoStaticStr)]
+enum IndexWriteOperation {
+    #[strum(serialize = "unchanged_key")]
+    Unchanged,
+    #[strum(serialize = "new_key")]
+    New,
+    #[strum(serialize = "removed_key")]
+    Removed,
+}
+
+impl From<&PersistenceIndexEntry> for IndexWriteOperation {
+    fn from(entry: &PersistenceIndexEntry) -> Self {
+        match (entry.value, entry.prev) {
+            (Some(_), Some(_)) => Self::Unchanged,
+            (Some(_), None) => Self::New,
+            (None, _) => Self::Removed,
+        }
+    }
+}
+
+#[derive(Eq, PartialEq, Ord, PartialOrd)]
+struct IndexWriteLabels {
+    operation: IndexWriteOperation,
+    is_system_index: bool,
+    mode: IndexWriteMode,
+}
+
+#[derive(Default)]
+struct IndexWriteTotals {
+    entries: u64,
+    bytes: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct CommitIndexWriteMetrics {
+    totals: BTreeMap<IndexWriteLabels, IndexWriteTotals>,
+}
+
+impl CommitIndexWriteMetrics {
+    pub(crate) fn record(&mut self, entry: &PersistenceIndexEntry, is_system_index: bool) {
+        let totals = self
+            .totals
+            .entry(IndexWriteLabels {
+                operation: entry.into(),
+                is_system_index,
+                mode: entry.mode,
+            })
+            .or_default();
+        totals.entries += 1;
+        totals.bytes += entry.size();
+    }
+
+    pub(crate) fn log(self) {
+        for (key, totals) in self.totals {
+            let labels = vec![
+                StaticMetricLabel::new("operation", <&'static str>::from(key.operation)),
+                StaticMetricLabel::new("is_system_index", key.is_system_index.as_label()),
+                StaticMetricLabel::new("mode", <&'static str>::from(key.mode)),
+            ];
+            log_counter_with_labels(
+                &DATABASE_COMMIT_INDEX_ENTRIES_TOTAL,
+                totals.entries,
+                labels.clone(),
+            );
+            log_counter_with_labels(&DATABASE_COMMIT_INDEX_BYTES_TOTAL, totals.bytes, labels);
+        }
+    }
+}
+
 register_convex_histogram!(
     DATABASE_SUBSCRIPTIONS_UPDATE_SECONDS,
     "Time to advance the SubscriptionManager's log"
@@ -479,8 +576,8 @@ pub fn committer_full_error() -> ErrorMetadata {
 
     ErrorMetadata::overloaded(
         "CommitterFullError",
-        "Too many concurrent commits in a short period of time. Spread your writes out over time \
-         or throttle them to avoid errors.",
+        "Too many writes in a short period of time. Reduce your writes, spread your writes out \
+         over time or remove unused indexes to reduce load and avoid errors.",
     )
 }
 
@@ -667,6 +764,39 @@ pub fn log_retention_index_entries_deleted(deleted_rows: usize, source: IndexRet
             <&'static str>::from(source),
         )],
     )
+}
+
+register_convex_histogram!(
+    RETENTION_UNIQUE_INDEXES_TOTAL,
+    "Number of distinct indexes a retention pass found expired entries for",
+    &["source"]
+);
+pub fn log_retention_unique_indexes(unique_indexes: usize, source: IndexRetentionSource) {
+    log_distribution_with_labels(
+        &RETENTION_UNIQUE_INDEXES_TOTAL,
+        unique_indexes as f64,
+        vec![StaticMetricLabel::new(
+            "source",
+            <&'static str>::from(source),
+        )],
+    )
+}
+
+register_convex_histogram!(
+    INDEX_BACKFILL_MARKER_CLEANUP_SECONDS,
+    "Time for one index backfill marker cleanup pass",
+    &STATUS_LABEL
+);
+pub fn index_backfill_marker_cleanup_timer() -> StatusTimer {
+    StatusTimer::new(&INDEX_BACKFILL_MARKER_CLEANUP_SECONDS)
+}
+
+register_convex_counter!(
+    INDEX_BACKFILL_MARKERS_DELETED_TOTAL,
+    "The total number of index backfill markers persistence returns as having been deleted"
+);
+pub fn log_index_backfill_markers_deleted(deleted_rows: u64) {
+    log_counter(&INDEX_BACKFILL_MARKERS_DELETED_TOTAL, deleted_rows)
 }
 
 register_convex_counter!(
@@ -1033,4 +1163,20 @@ register_convex_histogram!(
 );
 pub fn log_write_throughput(bytes: u64) {
     log_distribution(&WRITE_THROUGHPUT_BYTES, bytes as f64);
+}
+
+register_convex_counter!(
+    WRITE_THROUGHPUT_ROWS_LIMIT_EXCEEDED_TOTAL,
+    "Total number of times mutation execution was rejected due to the rows written limit"
+);
+pub fn log_write_throughput_rows_limit_exceeded() {
+    log_counter(&WRITE_THROUGHPUT_ROWS_LIMIT_EXCEEDED_TOTAL, 1);
+}
+
+register_convex_histogram!(
+    WRITE_THROUGHPUT_ROWS,
+    "Document and index rows written within the write throughput window"
+);
+pub fn log_write_throughput_rows(rows: u64) {
+    log_distribution(&WRITE_THROUGHPUT_ROWS, rows as f64);
 }

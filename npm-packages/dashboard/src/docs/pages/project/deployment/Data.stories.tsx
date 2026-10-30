@@ -217,6 +217,12 @@ const mockConvexClient = mockConvexReactClient()
       staged: false,
       backfill: { state: "done" as const },
     },
+    {
+      name: "search_description",
+      fields: { searchField: "description", filterFields: ["name"] },
+      staged: false,
+      backfill: { state: "done" as const },
+    },
   ])
   .registerQueryFake(udfs.getTableMapping.default, () => ({
     1: "channels",
@@ -288,7 +294,11 @@ const meta = {
       return storyFn();
     },
   ],
-  render: () => (
+  render: renderDataPage,
+} satisfies Meta<typeof DataView>;
+
+function renderDataPage() {
+  return (
     <ConnectedDeploymentContext.Provider value={mockConnectedDeployment}>
       <ConvexProvider client={mockConvexClient}>
         <DeploymentInfoContext.Provider
@@ -311,18 +321,16 @@ const meta = {
         </DeploymentInfoContext.Provider>
       </ConvexProvider>
     </ConnectedDeploymentContext.Provider>
-  ),
-} satisfies Meta<typeof DataView>;
+  );
+}
 
 export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Default: Story = {};
 
-/**
- * Shows the Data page with filter panel open, sorting by the `by_name` index.
- */
-export const Filters: Story = {
+/** Shows the Data page's index filter bar, sorting by the `by_name` index. */
+export const IndexFilterBar: Story = {
   parameters: {
     nextjs: {
       router: {
@@ -339,19 +347,7 @@ export const Filters: Story = {
         },
       },
     },
-    screenshotSelector: '[data-testid="filterMenu"]',
-  },
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-
-    // Wait for the Filter button to appear and click it to open the filter panel
-    await waitFor(
-      async () => {
-        await expect(canvas.queryByLabelText("Filter")).toBeTruthy();
-      },
-      { timeout: 5000 },
-    );
-    await userEvent.click(canvas.getByLabelText("Filter"));
+    screenshotSelector: '[data-testid="indexFilterBar"]',
   },
 };
 
@@ -362,16 +358,15 @@ export const AddDocument: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
 
-    // Wait for the toolbar to be visible
+    // Anchored to the exact name: the filter bar's "Add a filter" button also
+    // starts with "add".
     await waitFor(async () => {
       await expect(
-        canvas.getByRole("button", { name: /add|import/i }),
+        canvas.getByRole("button", { name: /^add$/i }),
       ).toBeDefined();
     });
 
-    // Click the "Add" button
-    const addButton = canvas.getByRole("button", { name: /add/i });
-    await userEvent.click(addButton);
+    await userEvent.click(canvas.getByRole("button", { name: /^add$/i }));
 
     // Wait for the add documents panel to appear
     await waitFor(async () => {
@@ -665,6 +660,12 @@ const mockConvexClientWithComponents = mockConvexReactClient()
       staged: false,
       backfill: { state: "done" as const },
     },
+    {
+      name: "search_description",
+      fields: { searchField: "description", filterFields: ["name"] },
+      staged: false,
+      backfill: { state: "done" as const },
+    },
   ])
   .registerQueryFake(udfs.getTableMapping.default, () => ({
     1: "channels",
@@ -752,7 +753,7 @@ export const ComponentDropdown: Story = {
  * Open a header trigger's anchored command palette menu.
  *
  * `DeploymentInfoProvider` moves its children from a fragment into a context
- * provider once `deploymentAuth` resolves, which makes React rebuild the page
+ * provider once deployment auth resolves, which makes React rebuild the page
  * subtree. A trigger looked up before that rebuild is detached by the time it
  * is clicked, and clicking a detached node dispatches events that reach no
  * handler — so re-look-up the trigger on every attempt and retry until the menu

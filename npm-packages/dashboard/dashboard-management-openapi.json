@@ -87,6 +87,23 @@
         }
       }
     },
+    "/preferences": {
+      "get": {
+        "operationId": "get_preferences",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreferencesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/profile": {
       "get": {
         "operationId": "get_profile",
@@ -207,6 +224,26 @@
         "operationId": "delete_account",
         "responses": {
           "200": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/set_preference": {
+      "put": {
+        "operationId": "set_preference",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetPreferenceArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
             "description": ""
           }
         }
@@ -508,6 +545,18 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "tag",
+            "in": "query",
+            "description": "Only return projects with this tag. This parameter can be provided more than once to match projects with any of several tags",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             }
           }
         ],
@@ -828,34 +877,6 @@
         "responses": {
           "204": {
             "description": ""
-          }
-        }
-      }
-    },
-    "/instances/{deployment_name}/auth": {
-      "post": {
-        "operationId": "get_deployment_auth_dashboard",
-        "parameters": [
-          {
-            "name": "deployment_name",
-            "in": "path",
-            "description": "",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InstanceAuthForDashboardInteractionsResponse"
-                }
-              }
-            }
           }
         }
       }
@@ -1596,6 +1617,58 @@
         }
       }
     },
+    "/teams/{team_id}/get_prices": {
+      "get": {
+        "tags": [
+          "alpha"
+        ],
+        "operationId": "get_prices",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Inclusive lower bound in YYYY-MM-DD format, using UTC.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "Inclusive upper bound in YYYY-MM-DD format, using UTC.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetPricesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/teams/{team_id}/list_active_plans": {
       "get": {
         "operationId": "list_active_plans",
@@ -1891,8 +1964,8 @@
     },
     "/teams/{team_id}/list_credits": {
       "get": {
-        "summary": "List a team's prepaid credits, ordered by the order they'll be drawn down.",
-        "description": "Every credit is returned in one response, so `pagination.hasMore` is always\nfalse. The envelope is shaped for paging so that adding it later is a\nbackwards-compatible change.",
+        "summary": "List a team's USD prepaid credits in Orb's drawdown order.",
+        "description": "Balances are dollar amounts; included usage in custom pricing units has\nseparate ledgers. Every credit is returned in one response, so\n`pagination.hasMore` is always false. The envelope is shaped for paging so\nthat adding it later is a backwards-compatible change.",
         "operationId": "list_credits",
         "parameters": [
           {
@@ -2042,49 +2115,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/TeamCurrentBillingPeriodResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/teams/{team_slug}/usage/get_token_info": {
-      "get": {
-        "operationId": "get_token_info",
-        "parameters": [
-          {
-            "name": "team_slug",
-            "in": "path",
-            "description": "",
-            "required": true
-          },
-          {
-            "name": "from",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            },
-            "style": "form"
-          },
-          {
-            "name": "to",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            },
-            "style": "form"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GetTokenInfoResponse"
                 }
               }
             }
@@ -2832,14 +2862,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "oneOf": [
-                    {
-                      "type": "null"
-                    },
-                    {
-                      "$ref": "#/components/schemas/SSOOrganizationResponse"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/SSOOrganizationResponse"
                 }
               }
             }
@@ -2928,6 +2951,111 @@
         }
       }
     },
+    "/teams/{team_id}/domains": {
+      "get": {
+        "operationId": "list_team_domains",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListTeamDomainsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/teams/{team_id}/domains/{domain_id}": {
+      "delete": {
+        "operationId": "delete_team_domain",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TeamId"
+            }
+          },
+          {
+            "name": "domain_id",
+            "in": "path",
+            "description": "WorkOS organization domain ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/teams/{team_id}/domains/portal_link": {
+      "post": {
+        "operationId": "generate_domain_portal_link",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerateDomainPortalLinkResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/teams/{team_id}/directory_sync": {
+      "get": {
+        "operationId": "get_directory_sync",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectorySyncResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/teams/{team_id}/directory_sync/portal_link": {
       "post": {
         "operationId": "generate_directory_sync_configuration_link",
@@ -2953,9 +3081,9 @@
         }
       }
     },
-    "/teams/{team_id}/directory_sync/groups": {
-      "get": {
-        "operationId": "list_directory_sync_groups",
+    "/teams/{team_id}/directory_sync/enable": {
+      "post": {
+        "operationId": "enable_directory_sync",
         "parameters": [
           {
             "name": "team_id",
@@ -2970,7 +3098,113 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "$ref": "#/components/schemas/DirectorySyncResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/teams/{team_id}/directory_sync/disable": {
+      "post": {
+        "operationId": "disable_directory_sync",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/teams/{team_id}/directory_sync/groups": {
+      "get": {
+        "operationId": "list_directory_sync_groups",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Cursor for pagination",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max results per page (default: 100, max: 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
                   "$ref": "#/components/schemas/ListDirectorySyncGroupsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/teams/{team_id}/directory_sync/staged_members": {
+      "get": {
+        "operationId": "list_staged_directory_members",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Cursor for pagination",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max results per page (default: 100, max: 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListStagedDirectoryMembersResponse"
                 }
               }
             }
@@ -3279,6 +3513,9 @@
           "updateDeploymentAccessToken",
           "deleteDeploymentAccessToken",
           "viewDeploymentAccessToken",
+          "createPersonalAccessTokenWithSsoAccess",
+          "createTeamDomain",
+          "deleteTeamDomain",
           "createCustomDomain",
           "deleteCustomDomain",
           "startManualCloudBackup",
@@ -3306,6 +3543,7 @@
           "enableSSO",
           "disableSSO",
           "updateSSO",
+          "loginWithSSO",
           "enableDirectorySync",
           "disableDirectorySync",
           "updateDirectorySyncGroupMapping",
@@ -3666,6 +3904,13 @@
         "properties": {
           "newPlanId": {
             "type": "string"
+          },
+          "promoCode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The promo code the user entered. Redeemed if it's an Orb coupon; a\npromo plan's code is already reflected in `new_plan_id`."
           }
         },
         "additionalProperties": false
@@ -3928,6 +4173,13 @@
             ],
             "format": "int64",
             "minimum": 0
+          },
+          "promoCode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The promo code the user entered. Redeemed if it's an Orb coupon; a\npromo plan's code is already reflected in `plan_id`."
           }
         },
         "additionalProperties": false
@@ -3989,6 +4241,24 @@
             "description": "When the block's remaining balance expires, in milliseconds since the\nepoch. `None` if it doesn't expire."
           }
         }
+      },
+      "CurrentPlanPriceResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/MetricPriceRate"
+          },
+          {
+            "type": "object",
+            "required": [
+              "includedUnits"
+            ],
+            "properties": {
+              "includedUnits": {
+                "type": "string"
+              }
+            }
+          }
+        ]
       },
       "CustomRoleId": {
         "type": "integer",
@@ -4256,6 +4526,40 @@
           }
         }
       },
+      "DirectoryResponse": {
+        "type": "object",
+        "description": "The one directory a team may connect, as WorkOS reports it.",
+        "required": [
+          "id",
+          "state",
+          "linked"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "like \"directory_01ECAZ4NV9QMV47GW873HDCX74\"."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string"
+          },
+          "linked": {
+            "type": "boolean"
+          },
+          "type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The identity provider behind the directory, e.g. \"okta scim v2.0\"."
+          }
+        }
+      },
       "DirectorySyncOffer": {
         "type": "object",
         "required": [
@@ -4289,6 +4593,41 @@
             }
           }
         }
+      },
+      "DirectorySyncResponse": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "mirrored"
+        ],
+        "properties": {
+          "directory": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DirectoryResponse"
+              }
+            ]
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the team has turned directory management on. A directory can\nbe connected and mirrored without it; until this is set nothing from\nthe directory reaches team members."
+          },
+          "mirrored": {
+            "type": "boolean",
+            "description": "Whether Convex holds a mirror of the directory yet. WorkOS delivers the\nroster asynchronously after the directory is linked, so a directory can\nreport itself linked while this is still false, and until it flips the\ngroups and staged rosters have nothing to show."
+          }
+        }
+      },
+      "DirectoryUserState": {
+        "type": "string",
+        "enum": [
+          "active",
+          "inactive",
+          "suspended"
+        ]
       },
       "DisconnectWorkOSTeamRequest": {
         "type": "object",
@@ -4435,6 +4774,17 @@
           }
         }
       },
+      "GenerateDomainPortalLinkResponse": {
+        "type": "object",
+        "required": [
+          "link"
+        ],
+        "properties": {
+          "link": {
+            "type": "string"
+          }
+        }
+      },
       "GenerateSSOConfigurationLinkRequest": {
         "type": "object",
         "required": [
@@ -4504,6 +4854,85 @@
               "boolean",
               "null"
             ]
+          }
+        }
+      },
+      "GetPricesPeriodResponse": {
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "plan",
+          "metrics"
+        ],
+        "properties": {
+          "start": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "end": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "plan": {
+            "$ref": "#/components/schemas/GetPricesPlanResponse"
+          },
+          "metrics": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/CurrentPlanPriceResponse"
+            },
+            "propertyNames": {
+              "type": "string",
+              "enum": [
+                "aiGatewayCostDollars",
+                "searchQueryGb",
+                "dataEgressGb",
+                "actionComputeCpuGbHours",
+                "databaseIoGb",
+                "actionComputeNodeJsGbHours",
+                "queryMutationComputeGbHours",
+                "actionComputeConvexGbHours",
+                "functionCalls",
+                "auditLogBandwidthGb",
+                "databaseStorageGb",
+                "activeDeployments",
+                "fileStorageGb",
+                "searchStorageGb"
+              ]
+            }
+          }
+        }
+      },
+      "GetPricesPlanResponse": {
+        "type": "object",
+        "required": [
+          "planType"
+        ],
+        "properties": {
+          "planType": {
+            "type": "string"
+          }
+        }
+      },
+      "GetPricesResponse": {
+        "type": "object",
+        "required": [
+          "currency",
+          "periods"
+        ],
+        "properties": {
+          "currency": {
+            "type": "string"
+          },
+          "periods": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GetPricesPeriodResponse"
+            }
           }
         }
       },
@@ -4585,49 +5014,6 @@
           }
         }
       },
-      "GetTokenInfoResponse": {
-        "type": "object",
-        "required": [
-          "tokensUsed",
-          "tokensQuota",
-          "centitokensUsed",
-          "centitokensQuota",
-          "isTeamDisabled",
-          "isPaidPlan",
-          "planType"
-        ],
-        "properties": {
-          "tokensUsed": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "tokensQuota": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "centitokensUsed": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "centitokensQuota": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "isTeamDisabled": {
-            "type": "boolean"
-          },
-          "isPaidPlan": {
-            "type": "boolean"
-          },
-          "planType": {
-            "type": "string"
-          }
-        }
-      },
       "GroupRoleMappingResponse": {
         "type": "object",
         "required": [
@@ -4637,10 +5023,10 @@
           "role": {
             "$ref": "#/components/schemas/Role"
           },
-          "customRoleIds": {
+          "customRoles": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/CustomRoleId"
+              "$ref": "#/components/schemas/TeamMemberCustomRole"
             }
           }
         }
@@ -4691,54 +5077,6 @@
             "type": "boolean"
           }
         }
-      },
-      "InstanceAuthForDashboardInteractionsResponse": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "adminKey",
-              "instanceUrl",
-              "kind"
-            ],
-            "properties": {
-              "adminKey": {
-                "$ref": "#/components/schemas/SerializedAccessToken"
-              },
-              "instanceUrl": {
-                "type": "string"
-              },
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "Cloud"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "adminKey",
-              "instanceUrl",
-              "kind"
-            ],
-            "properties": {
-              "adminKey": {
-                "$ref": "#/components/schemas/AdminKey"
-              },
-              "instanceUrl": {
-                "type": "string"
-              },
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "Local"
-                ]
-              }
-            }
-          }
-        ]
       },
       "InvitationEligibleEmailsResponse": {
         "type": "object",
@@ -4886,7 +5224,8 @@
       "ListDirectorySyncGroupsResponse": {
         "type": "object",
         "required": [
-          "groups"
+          "groups",
+          "pagination"
         ],
         "properties": {
           "groups": {
@@ -4894,6 +5233,9 @@
             "items": {
               "$ref": "#/components/schemas/DirectoryGroupResponse"
             }
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/PaginationMetadata"
           }
         }
       },
@@ -4912,6 +5254,38 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/CustomRoleResponse"
+            }
+          }
+        }
+      },
+      "ListStagedDirectoryMembersResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "pagination"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StagedDirectoryMemberResponse"
+            }
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/PaginationMetadata"
+          }
+        }
+      },
+      "ListTeamDomainsResponse": {
+        "type": "object",
+        "required": [
+          "domains"
+        ],
+        "properties": {
+          "domains": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SSOOrganizationDomain"
             }
           }
         }
@@ -4958,7 +5332,8 @@
           "teams",
           "projects",
           "deployments",
-          "optInsToAccept"
+          "optInsToAccept",
+          "preferences"
         ],
         "properties": {
           "teams": {
@@ -4984,6 +5359,9 @@
             "items": {
               "$ref": "#/components/schemas/OptInToAccept"
             }
+          },
+          "preferences": {
+            "$ref": "#/components/schemas/MemberPreferences"
           }
         }
       },
@@ -5025,6 +5403,21 @@
         "format": "int64",
         "minimum": 0
       },
+      "MemberPreferences": {
+        "type": "object",
+        "description": "The preferences a member has set, keyed by preference name. A preference\nthe member has never set is absent, and the client falls back to its own\ndefault.",
+        "additionalProperties": {
+          "$ref": "#/components/schemas/PreferenceValue"
+        },
+        "propertyNames": {
+          "type": "string",
+          "description": "A dashboard preference a member can set. The variant name is what lands in\nthe `member_preferences.name` column, so renaming one orphans the rows\nmembers have already written.",
+          "enum": [
+            "new_data_filters_opened",
+            "new_data_filters_optout"
+          ]
+        }
+      },
       "MemberResponse": {
         "type": "object",
         "required": [
@@ -5045,6 +5438,84 @@
             ]
           }
         }
+      },
+      "MetricPriceAmount": {
+        "type": "object",
+        "required": [
+          "amount"
+        ],
+        "properties": {
+          "amount": {
+            "type": "string"
+          },
+          "percentageDiscount": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        }
+      },
+      "MetricPriceRate": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "rate"
+            ],
+            "properties": {
+              "rate": {
+                "$ref": "#/components/schemas/MetricPriceAmount"
+              }
+            }
+          },
+          {
+            "$ref": "#/components/schemas/RegionalRates"
+          },
+          {
+            "type": "object",
+            "required": [
+              "deploymentClassRate"
+            ],
+            "properties": {
+              "deploymentClassRate": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "object",
+                  "required": [
+                    "regionRate"
+                  ],
+                  "properties": {
+                    "regionRate": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "required": [
+                          "amount"
+                        ],
+                        "properties": {
+                          "amount": {
+                            "type": "string"
+                          },
+                          "percentageDiscount": {
+                            "type": [
+                              "number",
+                              "null"
+                            ],
+                            "format": "double"
+                          }
+                        }
+                      },
+                      "minProperties": 1
+                    }
+                  }
+                },
+                "minProperties": 1
+              }
+            }
+          }
+        ]
       },
       "MfaStatusResponse": {
         "type": "object",
@@ -5576,6 +6047,40 @@
           }
         }
       },
+      "PreferenceName": {
+        "type": "string",
+        "description": "A dashboard preference a member can set. The variant name is what lands in\nthe `member_preferences.name` column, so renaming one orphans the rows\nmembers have already written.",
+        "enum": [
+          "new_data_filters_opened",
+          "new_data_filters_optout"
+        ]
+      },
+      "PreferenceValue": {
+        "oneOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "number",
+            "format": "double"
+          },
+          {
+            "type": "string"
+          }
+        ],
+        "description": "The value of a preference. Serializes as a bare JSON scalar, matching how\nit is stored."
+      },
+      "PreferencesResponse": {
+        "type": "object",
+        "required": [
+          "preferences"
+        ],
+        "properties": {
+          "preferences": {
+            "$ref": "#/components/schemas/MemberPreferences"
+          }
+        }
+      },
       "PreviewDeploymentIdentifier": {
         "type": "string"
       },
@@ -5627,6 +6132,27 @@
               "string",
               "null"
             ]
+          },
+          "prodDeploymentReference": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "devDeploymentReference": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
@@ -5890,8 +6416,40 @@
         "type": "string",
         "enum": [
           "aws-us-east-1",
-          "aws-eu-west-1"
+          "aws-eu-west-1",
+          "aws-ca-central-1",
+          "aws-ap-southeast-2"
         ]
+      },
+      "RegionalRates": {
+        "type": "object",
+        "required": [
+          "regionRate"
+        ],
+        "properties": {
+          "regionRate": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "required": [
+                "amount"
+              ],
+              "properties": {
+                "amount": {
+                  "type": "string"
+                },
+                "percentageDiscount": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "format": "double"
+                }
+              }
+            },
+            "minProperties": 1
+          }
+        }
       },
       "RegisterOauthAppArgs": {
         "type": "object",
@@ -5971,7 +6529,7 @@
           },
           "resource": {
             "type": "string",
-            "description": "Resource path like `project:*`, `project:slug=my-app`, or\n`project:*:deployment:type=prod`.",
+            "description": "Resource path like `project:*`, `project:slug=my-app`,\n`project:tag=prod`, or `project:*:deployment:type=prod`.",
             "example": "project:*"
           }
         }
@@ -6023,6 +6581,10 @@
           "billing:view",
           "billing:invoices:view",
           "team:auditLog:view",
+          "team:domain:create",
+          "team:domain:delete",
+          "team:domain:view",
+          "team:projectTags:view",
           "team:token:create",
           "team:token:update",
           "team:token:delete",
@@ -6111,6 +6673,33 @@
           "*"
         ]
       },
+      "SSOConnectionResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "connectionType",
+          "state",
+          "active"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "connectionType": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "active": {
+            "type": "boolean"
+          }
+        }
+      },
       "SSODomainState": {
         "type": "string",
         "enum": [
@@ -6142,14 +6731,18 @@
       "SSOOrganizationResponse": {
         "type": "object",
         "required": [
-          "createTime",
           "domains",
-          "requireSsoLogin"
+          "requireSsoLogin",
+          "connections"
         ],
         "properties": {
           "createTime": {
-            "type": "integer",
-            "format": "int64"
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the team's identity config was first created. Absent for a team\nthat has never touched SSO, domains or directory sync."
           },
           "domains": {
             "type": "array",
@@ -6159,6 +6752,13 @@
           },
           "requireSsoLogin": {
             "type": "boolean"
+          },
+          "connections": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SSOConnectionResponse"
+            },
+            "description": "SSO connections configured in WorkOS for this organization."
           }
         }
       },
@@ -6197,6 +6797,23 @@
               "$ref": "#/components/schemas/CustomRoleId"
             },
             "description": "Custom role IDs. If provided, must be non-empty. Mutually exclusive with\n`role`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SetPreferenceArgs": {
+        "type": "object",
+        "required": [
+          "name",
+          "value"
+        ],
+        "properties": {
+          "name": {
+            "$ref": "#/components/schemas/PreferenceName"
+          },
+          "value": {
+            "$ref": "#/components/schemas/PreferenceValue",
+            "description": "Must be of the type the preference accepts, otherwise the request is\nrejected with `InvalidPreferenceValue`."
           }
         },
         "additionalProperties": false
@@ -6241,6 +6858,119 @@
           "Disabled",
           "Warning"
         ]
+      },
+      "StagedDirectoryGroupResponse": {
+        "type": "object",
+        "required": [
+          "workosGroupId",
+          "name"
+        ],
+        "properties": {
+          "workosGroupId": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "StagedDirectoryMemberResponse": {
+        "type": "object",
+        "properties": {
+          "member": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StagedMemberResponse"
+              }
+            ]
+          },
+          "directoryUser": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StagedDirectoryUserResponse"
+              }
+            ]
+          }
+        }
+      },
+      "StagedDirectoryUserResponse": {
+        "type": "object",
+        "required": [
+          "directoryUserId",
+          "email",
+          "state",
+          "groups"
+        ],
+        "properties": {
+          "directoryUserId": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/DirectoryUserState"
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StagedDirectoryGroupResponse"
+            }
+          },
+          "role": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Role"
+              }
+            ]
+          },
+          "customRoles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TeamMemberCustomRole"
+            }
+          }
+        }
+      },
+      "StagedMemberResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "email",
+          "role"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/MemberId"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "customRoles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TeamMemberCustomRole"
+            }
+          }
+        }
       },
       "TeamCurrentBillingPeriodResponse": {
         "type": "object",
@@ -6401,6 +7131,22 @@
         "type": "integer",
         "format": "int64",
         "minimum": 0
+      },
+      "TeamMemberCustomRole": {
+        "type": "object",
+        "description": "A custom role attached to a team member, denormalized with the\nrole's display name so API consumers can render members without a\nseparate roles lookup.",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/CustomRoleId"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
       },
       "TeamName": {
         "type": "string"
