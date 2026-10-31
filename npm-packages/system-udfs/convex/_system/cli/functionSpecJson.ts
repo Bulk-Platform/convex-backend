@@ -111,3 +111,99 @@ export function functionSpecPageEntrySize(entry: FunctionSpecPageEntry) {
     96
   );
 }
+
+export type FunctionSpecPage = {
+  page: FunctionSpecPageEntry[];
+  isDone: boolean;
+  // Pass back as `cursor` for the next page: `[modulePath, entriesRead]`
+  // as JSON, so a page can end partway through a module.
+  continueCursor: string | null;
+};
+
+export function parseFunctionSpecCursor(
+  cursor: string | null | undefined,
+): { path: string; skip: number } | null {
+  if (cursor === undefined || cursor === null) {
+    return null;
+  }
+  const parsed: unknown = JSON.parse(cursor);
+  if (
+    !Array.isArray(parsed) ||
+    typeof parsed[0] !== "string" ||
+    !Number.isInteger(parsed[1])
+  ) {
+    throw new Error(`Invalid function spec cursor: ${cursor}`);
+  }
+  return { path: parsed[0], skip: parsed[1] };
+}
+
+/**
+ * Reads entries from `modules` (in path order, starting at `start.path`)
+ * until the page reaches `budget` bytes. The budget is checked between
+ * entries, so a module bigger than a page is split across pages.
+ */
+export async function readFunctionSpecPage(
+  modules: AsyncIterable<ModuleDoc>,
+  start: { path: string; skip: number } | null,
+  budget: number,
+): Promise<FunctionSpecPage> {
+  const page: FunctionSpecPageEntry[] = [];
+  let bytes = 0;
+  let continueCursor = start && JSON.stringify([start.path, start.skip]);
+  for await (const module of modules) {
+    const entries = functionSpecPageEntries(module);
+    const first = module.path === start?.path ? start.skip : 0;
+    for (let i = first; i < entries.length; i++) {
+      if (page.length > 0 && bytes >= budget) {
+        return {
+          page,
+          isDone: false,
+          continueCursor: JSON.stringify([module.path, i]),
+        };
+      }
+      page.push(entries[i]);
+      bytes += functionSpecPageEntrySize(entries[i]);
+    }
+    continueCursor = JSON.stringify([module.path, entries.length]);
+  }
+  return { page, isDone: true, continueCursor };
+}
+
+/**
+ * A lower bound on the size the backend gives the value that Convex JSON
+ * `json` decodes to (`crates/value/src/size.rs`). It counts strings in UTF-16
+ * code units; the backend counts UTF-8 bytes, which are never fewer.
+ */
+export function convexJsonValueSize(json: unknown): number {
+  if (json === null || typeof json === "boolean") {
+    return 1;
+  }
+  if (typeof json === "number") {
+    return 1 + 8;
+  }
+  if (typeof json === "string") {
+    return 1 + json.length + 1;
+  }
+  if (Array.isArray(json)) {
+    let size = 2;
+    for (const item of json) {
+      size += convexJsonValueSize(item);
+    }
+    return size;
+  }
+  const object = json as Record<string, unknown>;
+  const keys = Object.keys(object);
+  if (keys.length === 1 && (keys[0] === "$integer" || keys[0] === "$float")) {
+    return 1 + 8;
+  }
+  if (keys.length === 1 && keys[0] === "$bytes") {
+    const base64 = String(object.$bytes);
+    const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+    return 1 + (base64.length / 4) * 3 - padding + 1;
+  }
+  let size = 2;
+  for (const key of keys) {
+    size += key.length + 1 + convexJsonValueSize(object[key]);
+  }
+  return size;
+}

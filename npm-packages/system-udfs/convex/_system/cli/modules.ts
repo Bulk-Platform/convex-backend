@@ -2,16 +2,18 @@ import { UdfType, Visibility } from "../frontend/common";
 import { queryPrivateSystem } from "../secretSystemTables";
 import { v, Value } from "convex/values";
 import {
+  convexJsonValueSize,
   DEFAULT_ARGS_VALIDATOR,
   DEFAULT_RETURN_VALIDATOR,
-  FunctionSpecPageEntry,
+  FunctionSpecPage,
   functionSpecJson,
-  functionSpecPageEntries,
-  functionSpecPageEntrySize,
   httpRouteSpecJson,
+  parseFunctionSpecCursor,
+  readFunctionSpecPage,
 } from "./functionSpecJson";
 
 export { DEFAULT_ARGS_VALIDATOR, DEFAULT_RETURN_VALIDATOR };
+export type { FunctionSpecPage };
 
 type FunctionSpec = {
   identifier: string;
@@ -34,10 +36,11 @@ type FunctionSpecs = (FunctionSpec | HttpFunctionSpec)[];
 // which runs out of the 64 MiB isolate heap on large apps. The handler now
 // builds the response JSON from the stored validator strings, and the wrapped
 // `invokeQuery` below returns that string as the query result. The response is
-// unchanged. A spec over the default system function result limit (24 MiB)
+// unchanged. A spec whose value is over the backend's 32 MiB limit for any
+// value (`MAX_SIZE` in `crates/value/src/size.rs`), so can never be returned,
 // fails early with an error that points at `apiSpecPage`, rather than running
-// out of memory.
-const MAX_API_SPEC_JSON_BYTES = 24 * (1 << 20);
+// out of memory. The backend still applies the result size limit itself.
+const MAX_VALUE_SIZE = 1 << 25;
 let apiSpecResultJson: string | null = null;
 
 const apiSpecQuery = queryPrivateSystem("ViewData")({
@@ -46,12 +49,13 @@ const apiSpecQuery = queryPrivateSystem("ViewData")({
   },
   handler: async ({ db }): Promise<FunctionSpecs> => {
     const parts: string[] = [];
-    let bytes = 0;
+    // The size of the result array (see `convexJsonValueSize`).
+    let size = 2;
     const add = (json: string) => {
-      bytes += json.length + 1;
-      if (bytes > MAX_API_SPEC_JSON_BYTES) {
+      size += convexJsonValueSize(JSON.parse(json));
+      if (size > MAX_VALUE_SIZE) {
         throw new Error(
-          `The function spec is over ${MAX_API_SPEC_JSON_BYTES >> 20} MiB, too ` +
+          `The function spec is over ${MAX_VALUE_SIZE >> 20} MiB, too ` +
             "large for one response. Read it a page at a time with " +
             "`_system/cli/modules:apiSpecPage`; `npx convex function-spec` " +
             "does from @bulk-platform/convex 1.46.0-bulk.2.",
@@ -96,17 +100,10 @@ export const apiSpec = apiSpecQuery;
 const DEFAULT_PAGE_BYTES = 4 * (1 << 20);
 const MAX_PAGE_BYTES = 8 * (1 << 20);
 
-export type FunctionSpecPage = {
-  page: FunctionSpecPageEntry[];
-  isDone: boolean;
-  // The last module path read; pass it back as `cursor` for the next page.
-  continueCursor: string | null;
-};
-
 /**
- * Bulk: the function spec one page of modules at a time, in module path order.
- * A page ends after the module that takes it past `maxBytes` of validators
- * (default 4 MiB). Validators are returned as JSON strings (`argsJson`,
+ * Bulk: the function spec a page at a time, in module path order. A page ends
+ * once it holds `maxBytes` of validators (default 4 MiB), partway through a
+ * module if need be. Validators are returned as JSON strings (`argsJson`,
  * `returnsJson`), so a page costs little heap and no validator can exceed the
  * value nesting limit.
  */
@@ -121,24 +118,12 @@ export const apiSpecPage = queryPrivateSystem("ViewData")({
       Math.max(maxBytes ?? DEFAULT_PAGE_BYTES, 1),
       MAX_PAGE_BYTES,
     );
-    const page: FunctionSpecPageEntry[] = [];
-    let bytes = 0;
-    let lastPath = cursor ?? null;
+    const start = parseFunctionSpecCursor(cursor);
     const modules = db
       .query("_modules")
       .withIndex("by_path", (q) =>
-        cursor === undefined || cursor === null ? q : q.gt("path", cursor),
+        start === null ? q : q.gte("path", start.path),
       );
-    for await (const module of modules) {
-      lastPath = module.path;
-      for (const entry of functionSpecPageEntries(module)) {
-        page.push(entry);
-        bytes += functionSpecPageEntrySize(entry);
-      }
-      if (bytes >= budget) {
-        return { page, isDone: false, continueCursor: lastPath };
-      }
-    }
-    return { page, isDone: true, continueCursor: lastPath };
+    return await readFunctionSpecPage(modules, start, budget);
   },
 });

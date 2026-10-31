@@ -63,16 +63,19 @@ levels a Convex value allows.
 
 The fork patches `npm-packages/system-udfs/convex/_system/cli/`:
 
-- `apiSpecPage` (new) returns the spec a page of modules at a time, in path
-  order, about 4 MiB per page (`maxBytes`, at most 8 MiB). It takes `cursor`
-  (the previous `continueCursor`) and returns
+- `apiSpecPage` (new) returns the spec a page at a time, in module path order,
+  about 4 MiB per page (`maxBytes`, at most 8 MiB). A page can end partway
+  through a module, so one large module doesn't make a page too big. It takes
+  `cursor` (the previous `continueCursor`, an opaque string) and returns
   `{ page, isDone, continueCursor }`. Each function entry carries `argsJson` and
   `returnsJson` as JSON strings instead of `args` and `returns` values. Bulk's
   spec comes back in 8 pages using about 17 MiB of V8 heap.
 - `apiSpec` keeps its response but builds it as JSON from the stored validator
-  strings, and returns that string through a wrapped `invokeQuery`. A spec over
-  24 MiB fails at once with an error that points to `apiSpecPage`, so the query
-  no longer runs out of memory. Bulk's app gets that error.
+  strings, and returns that string through a wrapped `invokeQuery`. It measures
+  the result the way the backend does, and a spec over 32 MiB, the most any
+  Convex value can hold, fails at once with an error that points to
+  `apiSpecPage`. Smaller specs go to the backend's own result size check
+  (`SYSTEM_FUNCTION_MAX_RESULT_SIZE`, 24 MiB by default), as before.
 
 The `@bulk-platform/convex` CLI pages with `apiSpecPage` from 1.46.0-bulk.2 and
 falls back to `apiSpec` when a backend doesn't have it. Older CLIs call

@@ -3,12 +3,15 @@ import { describe, expect, test } from "vitest";
 import { convexToJson, jsonToConvex, v, Validator } from "convex/values";
 import {
   AnalyzedFunctionDoc,
+  convexJsonValueSize,
   DEFAULT_ARGS_VALIDATOR,
   DEFAULT_RETURN_VALIDATOR,
   functionSpecJson,
   functionSpecPageEntries,
   httpRouteSpecJson,
   ModuleDoc,
+  parseFunctionSpecCursor,
+  readFunctionSpecPage,
 } from "./functionSpecJson";
 
 // How a validator is stored in `_modules` (its JSON is already Convex JSON).
@@ -135,5 +138,101 @@ describe("apiSpecPage entries", () => {
     expect(
       functionSpecPageEntries({ path: "_deps/A.js", analyzeResult: null }),
     ).toEqual([]);
+  });
+});
+
+describe("apiSpecPage paging", () => {
+  // Modules as `_modules` returns them for a cursor: in path order, from the
+  // cursor's module on.
+  async function* from(
+    modules: ModuleDoc[],
+    start: { path: string } | null,
+  ): AsyncIterable<ModuleDoc> {
+    for (const module of modules) {
+      if (start === null || module.path >= start.path) {
+        yield module;
+      }
+    }
+  }
+
+  async function readAll(modules: ModuleDoc[], budget: number) {
+    const pages = [];
+    let cursor: string | null = null;
+    for (;;) {
+      const start = parseFunctionSpecCursor(cursor);
+      const page = await readFunctionSpecPage(
+        from(modules, start),
+        start,
+        budget,
+      );
+      pages.push(page.page);
+      if (page.isDone) {
+        return pages;
+      }
+      cursor = page.continueCursor;
+    }
+  }
+
+  const big = "x".repeat(1000);
+  const modules: ModuleDoc[] = [
+    {
+      path: "a.js",
+      analyzeResult: {
+        functions: ["f1", "f2", "f3", "f4", "f5"].map((name) => ({
+          name,
+          udfType: "Query",
+          args: JSON.stringify({ type: "literal", value: big }),
+        })),
+        httpRoutes: [{ route: { method: "GET", path: "/a" } }],
+      },
+    },
+    { path: "b.js", analyzeResult: null },
+    {
+      path: "c.js",
+      analyzeResult: { functions: [{ name: "g", udfType: "Mutation" }] },
+    },
+  ];
+  const all = modules.flatMap(functionSpecPageEntries);
+
+  test("splits a module bigger than a page", async () => {
+    const pages = await readAll(modules, 2000);
+    expect(pages.map((page) => page.length)).toEqual([2, 2, 3]);
+    expect(pages.flat()).toEqual(all);
+  });
+
+  test("returns everything in one page when it fits", async () => {
+    expect(await readAll(modules, 1 << 20)).toEqual([all]);
+  });
+
+  test("returns one entry per page at the smallest budget", async () => {
+    const pages = await readAll(modules, 1);
+    expect(pages.map((page) => page.length)).toEqual(all.map(() => 1));
+    expect(pages.flat()).toEqual(all);
+  });
+
+  test("rejects a malformed cursor", () => {
+    expect(() => parseFunctionSpecCursor("a.js")).toThrow();
+    expect(() => parseFunctionSpecCursor('["a.js", "1"]')).toThrow(
+      "Invalid function spec cursor",
+    );
+  });
+});
+
+describe("convexJsonValueSize", () => {
+  test("follows the backend's size rules", () => {
+    // { "a": "xy", "b": [1, null, true] }:
+    // 1 + (1 + 1 + 4) + (1 + 1 + (1 + 9 + 1 + 1 + 1)) + 1
+    expect(convexJsonValueSize({ a: "xy", b: [1, null, true] })).toBe(23);
+    expect(convexJsonValueSize(convexToJson(BigInt(10)))).toBe(9);
+    expect(convexJsonValueSize(convexToJson(new ArrayBuffer(6)))).toBe(8);
+    expect(convexJsonValueSize(convexToJson(new ArrayBuffer(5)))).toBe(7);
+    expect(convexJsonValueSize(convexToJson(new ArrayBuffer(4)))).toBe(6);
+  });
+
+  test("measures validators smaller than their JSON", () => {
+    const json = functionSpecJson("orders/queries.js", functions[0]);
+    const size = convexJsonValueSize(JSON.parse(json));
+    expect(size).toBeGreaterThan(json.length / 2);
+    expect(size).toBeLessThan(json.length);
   });
 });
