@@ -8,6 +8,7 @@ import type { RequestContext } from "../src/cli/lib/mcp/requestContext.js";
 import {
   compactValidator,
   FunctionSpecTool,
+  modulePathPrefix,
 } from "../src/cli/lib/mcp/tools/functionSpec.js";
 
 const { fetchFunctionSpecs } = vi.hoisted(() => ({
@@ -178,6 +179,37 @@ describe("functionSpec MCP tool", () => {
     expect(error).toContain("Set includeValidators: false");
     expect(error).not.toContain("Set identifierPrefix");
     expect(error).toContain("Or raise maxCharacters.");
+  });
+});
+
+describe("modulePathPrefix", () => {
+  test("narrows the backend read to modules a prefix can match", async () => {
+    expect(modulePathPrefix("")).toBeUndefined();
+    expect(modulePathPrefix("workflow/")).toBe("workflow/");
+    expect(modulePathPrefix("workflow/defs:get")).toBe("workflow/defs");
+    expect(modulePathPrefix("workflow/defs.js:get")).toBe("workflow/defs.js");
+    expect(modulePathPrefix("/webhooks/")).toBe("http.js");
+    // Every entry a prefix matches lives under its module path prefix.
+    for (const prefix of [
+      "mess",
+      "messages:",
+      "workflow/engine",
+      "/webhooks",
+    ]) {
+      const matched = (await call({ identifierPrefix: prefix })) as {
+        identifier?: string;
+      }[];
+      expect(matched.length).toBeGreaterThan(0);
+      for (const entry of matched) {
+        expect(entry.identifier ?? "http.js:").toMatch(
+          new RegExp("^" + modulePathPrefix(prefix)!.replace(".", "\\.")),
+        );
+      }
+      expect(fetchFunctionSpecs).toHaveBeenLastCalledWith(
+        ctx,
+        expect.objectContaining({ pathPrefix: modulePathPrefix(prefix) }),
+      );
+    }
   });
 });
 
