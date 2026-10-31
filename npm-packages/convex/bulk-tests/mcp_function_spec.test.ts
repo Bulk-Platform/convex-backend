@@ -1,11 +1,14 @@
 // Bulk fork: the MCP `functionSpec` tool filters by identifier prefix, can
-// leave validators out, and refuses results over `maxCharacters` with a list of
-// narrower prefixes.
+// leave validators out or return them as compact strings, and refuses results
+// over `maxCharacters` with a list of narrower prefixes.
 
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { jsonToConvex, v } from "../src/values/index.js";
 import type { RequestContext } from "../src/cli/lib/mcp/requestContext.js";
-import { FunctionSpecTool } from "../src/cli/lib/mcp/tools/functionSpec.js";
+import {
+  compactValidator,
+  FunctionSpecTool,
+} from "../src/cli/lib/mcp/tools/functionSpec.js";
 
 const { fetchFunctionSpecs } = vi.hoisted(() => ({
   fetchFunctionSpecs: vi.fn(),
@@ -105,6 +108,32 @@ describe("functionSpec MCP tool", () => {
     ]);
   });
 
+  test("returns compact validators", async () => {
+    expect(
+      await call({
+        identifierPrefix: "messages:list",
+        validatorFormat: "compact",
+      }),
+    ).toEqual([
+      {
+        identifier: "messages.js:list",
+        functionType: "Query",
+        visibility: { kind: "public" },
+        args: "{ n: int64 }",
+        returns: "Array<{ text: string }>",
+      },
+    ]);
+    const error = await call({
+      validatorFormat: "compact",
+      maxCharacters: 100,
+    }).then(
+      () => null,
+      (e: Error) => e.message,
+    );
+    expect(error).not.toContain("validatorFormat");
+    expect(error).toContain("Set includeValidators: false");
+  });
+
   test("refuses a result over maxCharacters and suggests prefixes", async () => {
     const size = JSON.stringify(spec).length;
     expect(await call({ maxCharacters: size })).toEqual(spec);
@@ -116,6 +145,7 @@ describe("functionSpec MCP tool", () => {
     expect(error).toContain(
       `The function spec is ${size.toLocaleString("en-US")} characters (6 entries), over maxCharacters (500).`,
     );
+    expect(error).toContain('Set validatorFormat: "compact"');
     expect(error).toContain("Set includeValidators: false");
     expect(error).toMatch(/"workflow\/": 3 entries/);
     expect(error).toMatch(/"messages\.js:": 2 entries/);
@@ -148,5 +178,29 @@ describe("functionSpec MCP tool", () => {
     expect(error).toContain("Set includeValidators: false");
     expect(error).not.toContain("Set identifierPrefix");
     expect(error).toContain("Or raise maxCharacters.");
+  });
+});
+
+describe("compactValidator", () => {
+  test("renders every validator type", () => {
+    const validator = v.object({
+      id: v.id("users"),
+      n: v.number(),
+      big: v.int64(),
+      ok: v.boolean(),
+      data: v.bytes(),
+      nothing: v.null(),
+      anything: v.any(),
+      tags: v.optional(v.array(v.string())),
+      kind: v.union(v.literal("a"), v.literal(2), v.literal(3n), v.null()),
+      byUser: v.record(v.id("users"), v.object({})),
+      "odd-name": v.string(),
+    });
+    expect(compactValidator(validator.json)).toBe(
+      '{ id: Id<"users">, n: number, big: int64, ok: boolean, data: bytes, ' +
+        "nothing: null, anything: any, tags?: Array<string>, " +
+        'kind: "a" | 2 | 3n | null, byUser: Record<Id<"users">, {}>, ' +
+        '"odd-name": string }',
+    );
   });
 });

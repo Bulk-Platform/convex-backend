@@ -3,10 +3,16 @@ import { ConvexTool } from "./index.js";
 import { loadSelectedDeploymentCredentials } from "../../api.js";
 import { fetchFunctionSpecs } from "../../functionSpec.js";
 import { getMcpDeploymentSelection } from "../requestContext.js";
-import { convexToJson } from "../../../../values/index.js";
+import {
+  convexToJson,
+  jsonToConvex,
+  JSONValue,
+  ValidatorJSON,
+} from "../../../../values/index.js";
 
-// Bulk: about 50k tokens. A small app's spec is well under this; Bulk's is 40 MB.
-const DEFAULT_MAX_CHARACTERS = 200_000;
+// Bulk: about 20k tokens, under Claude Code's default 25k-token limit on MCP
+// tool output. A small app's spec is well under this; Bulk's is 40 MB.
+const DEFAULT_MAX_CHARACTERS = 80_000;
 const MAX_SUGGESTIONS = 15;
 
 const inputSchema = z.object({
@@ -26,6 +32,12 @@ const inputSchema = z.object({
     .optional()
     .describe(
       "If false, leave out the args and returns validators: return only identifiers, types and visibility. Defaults to true.",
+    ),
+  validatorFormat: z
+    .enum(["json", "compact"])
+    .optional()
+    .describe(
+      'How to return validators. "json" (default) returns validator JSON. "compact" returns each validator as a TypeScript-like string, e.g. "{ id: Id<\\"users\\">, tags?: Array<string> }", usually several times smaller.',
     ),
   maxCharacters: z
     .number()
@@ -50,12 +62,16 @@ with its exported name), its argument validator, its return value validator, its
 (i.e. is it a query, mutation, or action), and its visibility (i.e. is it public or
 internal).
 
-For a large app, filter with identifierPrefix, or set includeValidators to false to
-list functions without their validators. If the result is over maxCharacters, the
-tool returns an error listing narrower prefixes and their sizes.
+For a large app, filter with identifierPrefix, set validatorFormat to "compact", or set
+includeValidators to false to list functions without their validators. If the result is
+over maxCharacters, the tool returns an error listing narrower prefixes and their sizes.
 `.trim();
 
 type FunctionSpecEntry = Record<string, unknown>;
+type Shape = {
+  includeValidators: boolean;
+  validatorFormat: "json" | "compact";
+};
 
 export const FunctionSpecTool: ConvexTool<
   typeof inputSchema,
@@ -84,23 +100,20 @@ export const FunctionSpecTool: ConvexTool<
       componentPath: undefined,
     });
     const prefix = args.identifierPrefix ?? "";
-    const includeValidators = args.includeValidators ?? true;
+    const shape: Shape = {
+      includeValidators: args.includeValidators ?? true,
+      validatorFormat: args.validatorFormat ?? "json",
+    };
     const maxCharacters = args.maxCharacters ?? DEFAULT_MAX_CHARACTERS;
 
     const matched: { key: string; entry: FunctionSpecEntry }[] = [];
     for (const entry of convexToJson(functions) as FunctionSpecEntry[]) {
       const key = matchKey(entry, prefix);
-      if (key === null) {
-        continue;
-      }
-      if (includeValidators) {
+      if (key !== null) {
         matched.push({ key, entry });
-      } else {
-        const { args: _args, returns: _returns, ...rest } = entry;
-        matched.push({ key, entry: rest });
       }
     }
-    const result = matched.map(({ entry }) => entry);
+    const result = matched.map(({ entry }) => shapeEntry(entry, shape));
     const size = JSON.stringify(result).length;
     if (size <= maxCharacters) {
       return result;
@@ -111,7 +124,7 @@ export const FunctionSpecTool: ConvexTool<
       printedMessage: tooLargeMessage({
         matched,
         prefix,
-        includeValidators,
+        shape,
         size,
         maxCharacters,
       }),
@@ -132,25 +145,93 @@ function matchKey(entry: FunctionSpecEntry, prefix: string): string | null {
   return candidates.find((candidate) => candidate.startsWith(prefix)) ?? null;
 }
 
+function shapeEntry(entry: FunctionSpecEntry, shape: Shape): FunctionSpecEntry {
+  if (!("args" in entry) && !("returns" in entry)) {
+    return entry;
+  }
+  const { args, returns, ...rest } = entry;
+  if (!shape.includeValidators) {
+    return rest;
+  }
+  if (shape.validatorFormat === "json") {
+    return entry;
+  }
+  return {
+    ...rest,
+    args: compactValidator(args as ValidatorJSON),
+    returns: compactValidator(returns as ValidatorJSON),
+  };
+}
+
+/**
+ * A validator as a TypeScript-like string, named after the `v` builders where
+ * TypeScript has no equivalent: `{ id: Id<"users">, n?: int64 }`.
+ */
+export function compactValidator(validator: ValidatorJSON): string {
+  switch (validator.type) {
+    case "null":
+    case "number":
+    case "boolean":
+    case "string":
+    case "bytes":
+    case "any":
+    case "commitTs":
+      return validator.type;
+    case "bigint":
+      return "int64";
+    case "literal":
+      return compactLiteral(validator.value);
+    case "id":
+      return `Id<${JSON.stringify(validator.tableName)}>`;
+    case "array":
+      return `Array<${compactValidator(validator.value)}>`;
+    case "record":
+      return `Record<${compactValidator(validator.keys)}, ${compactValidator(validator.values.fieldType)}>`;
+    case "object": {
+      const fields = Object.entries(validator.value).map(
+        ([name, field]) =>
+          `${compactFieldName(name)}${field.optional ? "?" : ""}: ${compactValidator(field.fieldType)}`,
+      );
+      return fields.length === 0 ? "{}" : `{ ${fields.join(", ")} }`;
+    }
+    case "union":
+      return validator.value.map(compactValidator).join(" | ");
+    default:
+      return JSON.stringify(validator);
+  }
+}
+
+function compactLiteral(value: JSONValue): string {
+  const decoded = jsonToConvex(value);
+  return typeof decoded === "bigint" ? `${decoded}n` : JSON.stringify(value);
+}
+
+function compactFieldName(name: string): string {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) ? name : JSON.stringify(name);
+}
+
 function tooLargeMessage(args: {
   matched: { key: string; entry: FunctionSpecEntry }[];
   prefix: string;
-  includeValidators: boolean;
+  shape: Shape;
   size: number;
   maxCharacters: number;
 }): string {
-  const { matched, prefix, includeValidators, size, maxCharacters } = args;
+  const { matched, prefix, shape, size, maxCharacters } = args;
+  const sizeAs = (other: Shape) =>
+    JSON.stringify(matched.map(({ entry }) => shapeEntry(entry, other))).length;
   const scope = prefix === "" ? "" : ` for identifierPrefix "${prefix}"`;
   const lines = [
     `The function spec${scope} is ${size.toLocaleString("en-US")} characters (${matched.length.toLocaleString("en-US")} entries), over maxCharacters (${maxCharacters.toLocaleString("en-US")}). Narrow the request:`,
   ];
-  if (includeValidators) {
-    const withoutValidators = JSON.stringify(
-      matched.map(({ entry }) => {
-        const { args: _args, returns: _returns, ...rest } = entry;
-        return rest;
-      }),
-    ).length;
+  if (shape.includeValidators && shape.validatorFormat === "json") {
+    const compact = sizeAs({ ...shape, validatorFormat: "compact" });
+    lines.push(
+      `- Set validatorFormat: "compact" for TypeScript-like validator strings (${compact.toLocaleString("en-US")} characters).`,
+    );
+  }
+  if (shape.includeValidators) {
+    const withoutValidators = sizeAs({ ...shape, includeValidators: false });
     lines.push(
       `- Set includeValidators: false for identifiers, types and visibility only (${withoutValidators.toLocaleString("en-US")} characters).`,
     );
@@ -163,7 +244,7 @@ function tooLargeMessage(args: {
     const next = end === -1 ? key : prefix + rest.slice(0, end + 1);
     const group = groups.get(next) ?? { entries: 0, characters: 0 };
     group.entries += 1;
-    group.characters += JSON.stringify(entry).length + 1;
+    group.characters += JSON.stringify(shapeEntry(entry, shape)).length + 1;
     groups.set(next, group);
   }
   const largest = [...groups.entries()].sort(
