@@ -94,12 +94,13 @@ export const FunctionSpecTool: ConvexTool<
       ctx,
       deploymentSelection,
     );
+    const prefix = args.identifierPrefix ?? "";
     const functions = await fetchFunctionSpecs(ctx, {
       deploymentUrl: credentials.url,
       adminKey: credentials.adminKey,
       componentPath: undefined,
+      pathPrefix: modulePathPrefix(prefix),
     });
-    const prefix = args.identifierPrefix ?? "";
     const shape: Shape = {
       includeValidators: args.includeValidators ?? true,
       validatorFormat: args.validatorFormat ?? "json",
@@ -131,6 +132,19 @@ export const FunctionSpecTool: ConvexTool<
     });
   },
 };
+
+// The module path prefix that holds every entry `prefix` can match, so the
+// backend reads only those modules. The part before ":" also prefixes the path
+// when ".js" is left out, and HTTP routes are all defined in `http.js`.
+export function modulePathPrefix(prefix: string): string | undefined {
+  if (prefix === "") {
+    return undefined;
+  }
+  if (prefix.startsWith("/")) {
+    return "http.js";
+  }
+  return prefix.split(":")[0];
+}
 
 // The string `prefix` matched for this entry, or null. Function identifiers
 // look like "folder/file.js:name" and match with or without the ".js"; HTTP

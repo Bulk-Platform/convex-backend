@@ -64,6 +64,10 @@ type FunctionSpecPage = {
  * a large app is over the system function result size and value nesting
  * limits. Uses `apiSpec` for a component, and on backends without
  * `apiSpecPage`.
+ *
+ * `pathPrefix` asks the backend for only the modules whose path starts with
+ * it. It narrows the read, not the result: `apiSpec` ignores it, so callers
+ * still filter.
  */
 export async function fetchFunctionSpecs(
   ctx: Context,
@@ -71,6 +75,7 @@ export async function fetchFunctionSpecs(
     deploymentUrl: string;
     adminKey: string;
     componentPath: string | undefined;
+    pathPrefix?: string | undefined;
   },
 ): Promise<Value[]> {
   const legacyApiSpec = async () =>
@@ -96,7 +101,10 @@ export async function fetchFunctionSpecs(
       method: "POST",
       body: JSON.stringify({
         path: "_system/cli/modules:apiSpecPage",
-        args: { cursor },
+        args:
+          args.pathPrefix === undefined
+            ? { cursor }
+            : { cursor, pathPrefix: args.pathPrefix },
         format: "convex_encoded_json",
       }),
     });
