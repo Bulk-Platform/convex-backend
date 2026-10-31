@@ -50,6 +50,51 @@ The implementations live in `crates/common/src/knobs.rs` and
 `crates/local_backend/src/`. Production values belong in `bulk-infra`, not in
 this repository.
 
+### Function spec for large apps
+
+`npx convex function-spec`, the MCP `functionSpec` tool and `npx convex run`'s
+"available functions" list read `_system/cli/modules:apiSpec`, one query that
+returns every function with its validators. Bulk's app has 33.6 MB of validator
+JSON across 5,346 functions. Upstream's query parses all of it into values and
+ran out of memory with up to 192 MiB of user heap, against the 64 MiB default.
+More heap doesn't help: the single response is over the 24 MiB system result
+limit, and two `workflow_engine` return validators are nested deeper than the 64
+levels a Convex value allows.
+
+The fork adds one query, `apiSpecPage`, to
+`npm-packages/system-udfs/convex/_system/cli/modules.ts` (helpers in
+`functionSpecPage.ts`), and leaves upstream's `apiSpec` unchanged:
+
+- It returns the spec a page at a time, in module path order, about 4 MiB per
+  page (`maxBytes`, at most 8 MiB). A page can end partway through a module, so
+  one large module doesn't make a page too big. It takes `cursor` (the previous
+  `continueCursor`, an opaque string) and returns
+  `{ page, isDone, continueCursor }`.
+- Each function entry carries `argsJson` and `returnsJson` as JSON strings
+  instead of `args` and `returns` values. Bulk's spec comes back in 8 pages
+  using about 17 MiB of V8 heap.
+- `pathPrefix` limits the spec to modules whose path starts with it, read
+  through the `by_path` index, so a narrow request reads only those modules. The
+  MCP `functionSpec` tool uses it for `identifierPrefix`.
+
+The `@bulk-platform/convex` CLI pages with `apiSpecPage` from 1.46.0-bulk.2 and
+falls back to `apiSpec` when a backend doesn't have it. Older CLIs call
+`apiSpec`, which runs out of memory on Bulk's app at any heap size.
+
+Tests: `pnpm exec vitest run convex/_system/cli` in `npm-packages/system-udfs`
+checks the entries against upstream's `apiSpec` encoding, paging and prefixes.
+The end-to-end test deploys a generated 4,000-module app (122 MB of spec, more
+than Bulk's per module) to a local backend built from this tree, with the
+default heap, and reads it in full and under one folder. It fails on a build
+without the patch:
+
+```bash
+cargo build -p local_backend --bin convex-local-backend
+cd npm-packages/system-udfs
+node scripts/api-spec-scale-test.mjs \
+  --backend ../../target/debug/convex-local-backend --modules 4000
+```
+
 ## Patch policy
 
 Keep Bulk-only changes narrow, tested, and separable from upstream code. Before
