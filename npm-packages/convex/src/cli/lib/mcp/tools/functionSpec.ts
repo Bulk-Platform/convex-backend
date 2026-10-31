@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { ConvexTool } from "./index.js";
 import { loadSelectedDeploymentCredentials } from "../../api.js";
-import { runSystemQuery } from "../../run.js";
+import { fetchFunctionSpecs } from "../../functionSpec.js";
 import { getMcpDeploymentSelection } from "../requestContext.js";
 import { convexToJson } from "../../../../values/index.js";
 
@@ -48,12 +48,10 @@ export const FunctionSpecTool: ConvexTool<
       ctx,
       deploymentSelection,
     );
-    const functions = await runSystemQuery(ctx, {
+    const functions = await fetchFunctionSpecs(ctx, {
       deploymentUrl: credentials.url,
       adminKey: credentials.adminKey,
-      functionName: "_system/cli/modules:apiSpec",
       componentPath: undefined,
-      args: {},
     });
     return convexToJson(functions);
   },
