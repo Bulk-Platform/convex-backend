@@ -3,16 +3,13 @@ import { describe, expect, test } from "vitest";
 import { convexToJson, jsonToConvex, v, Validator } from "convex/values";
 import {
   AnalyzedFunctionDoc,
-  convexJsonValueSize,
   DEFAULT_ARGS_VALIDATOR,
   DEFAULT_RETURN_VALIDATOR,
-  functionSpecJson,
   functionSpecPageEntries,
-  httpRouteSpecJson,
   ModuleDoc,
   parseFunctionSpecCursor,
   readFunctionSpecPage,
-} from "./functionSpecJson";
+} from "./functionSpecPage";
 
 // How a validator is stored in `_modules` (its JSON is already Convex JSON).
 function stored(validator: Validator<any, any, any>): string {
@@ -57,7 +54,7 @@ const functions: AnalyzedFunctionDoc[] = [
   { name: "legacy", udfType: "Action" },
 ];
 
-// The previous `apiSpec` implementation, as the response JSON.
+// An `apiSpec` entry, as the response JSON.
 function previousApiSpecEntry(path: string, fn: AnalyzedFunctionDoc) {
   return convexToJson({
     identifier: path + ":" + fn.name,
@@ -68,45 +65,8 @@ function previousApiSpecEntry(path: string, fn: AnalyzedFunctionDoc) {
   });
 }
 
-describe("apiSpec JSON", () => {
-  test("matches the previous encoding", () => {
-    for (const fn of functions) {
-      const json = functionSpecJson("orders/queries.js", fn);
-      expect(JSON.parse(json)).toEqual(
-        previousApiSpecEntry("orders/queries.js", fn),
-      );
-    }
-  });
-
-  test("keeps int64 and bytes in Convex JSON form", () => {
-    const parsed = JSON.parse(functionSpecJson("a.js", functions[0]));
-    expect(parsed.args.value.n).toEqual({
-      fieldType: { type: "bigint" },
-      optional: false,
-    });
-    expect(parsed.returns.value.value.status.fieldType.value[2].value).toEqual(
-      convexToJson(BigInt(10)),
-    );
-    // It also round-trips through the client's decoder.
-    expect(convexToJson(jsonToConvex(parsed))).toEqual(parsed);
-  });
-
-  test("escapes identifiers", () => {
-    const fn: AnalyzedFunctionDoc = { name: 'we"ird', udfType: "Query" };
-    expect(JSON.parse(functionSpecJson('dir\\x".js', fn)).identifier).toBe(
-      'dir\\x".js:we"ird',
-    );
-  });
-
-  test("http routes", () => {
-    expect(
-      JSON.parse(httpRouteSpecJson({ route: { method: "POST", path: "/x" } })),
-    ).toEqual({ functionType: "HttpAction", method: "POST", path: "/x" });
-  });
-});
-
 describe("apiSpecPage entries", () => {
-  test("carry the same validators as JSON strings", () => {
+  test("carry the same validators as `apiSpec`, as JSON strings", () => {
     const module: ModuleDoc = {
       path: "orders/queries.js",
       analyzeResult: {
@@ -142,28 +102,33 @@ describe("apiSpecPage entries", () => {
 });
 
 describe("apiSpecPage paging", () => {
-  // Modules as `_modules` returns them for a cursor: in path order, from the
-  // cursor's module on.
+  // Modules as `apiSpecPage` reads them from `_modules`: in path order, from
+  // the cursor's module, or else the prefix, on.
   async function* from(
     modules: ModuleDoc[],
-    start: { path: string } | null,
+    from: string | null,
   ): AsyncIterable<ModuleDoc> {
     for (const module of modules) {
-      if (start === null || module.path >= start.path) {
+      if (from === null || module.path >= from) {
         yield module;
       }
     }
   }
 
-  async function readAll(modules: ModuleDoc[], budget: number) {
+  async function readAll(
+    modules: ModuleDoc[],
+    budget: number,
+    pathPrefix?: string,
+  ) {
     const pages = [];
     let cursor: string | null = null;
     for (;;) {
       const start = parseFunctionSpecCursor(cursor);
       const page = await readFunctionSpecPage(
-        from(modules, start),
+        from(modules, start?.path ?? pathPrefix ?? null),
         start,
         budget,
+        pathPrefix ?? "",
       );
       pages.push(page.page);
       if (page.isDone) {
@@ -210,29 +175,46 @@ describe("apiSpecPage paging", () => {
     expect(pages.flat()).toEqual(all);
   });
 
+  test("reads only modules under a path prefix", async () => {
+    const tree: ModuleDoc[] = [
+      "orders.js",
+      "orders/a.js",
+      "orders/b.js",
+      "orders_old.js",
+      "users/a.js",
+    ].map((path) => ({
+      path,
+      analyzeResult: {
+        functions: [
+          { name: "f", udfType: "Query", args: JSON.stringify(big) },
+          { name: "g", udfType: "Query", args: JSON.stringify(big) },
+        ],
+      },
+    }));
+    const identifiers = async (prefix: string, budget: number) =>
+      (await readAll(tree, budget, prefix))
+        .flat()
+        .map((entry) => ("identifier" in entry ? entry.identifier : null));
+    for (const budget of [1, 2000, 1 << 20]) {
+      expect(await identifiers("orders/", budget)).toEqual([
+        "orders/a.js:f",
+        "orders/a.js:g",
+        "orders/b.js:f",
+        "orders/b.js:g",
+      ]);
+      expect(await identifiers("orders/b.js", budget)).toEqual([
+        "orders/b.js:f",
+        "orders/b.js:g",
+      ]);
+      expect(await identifiers("zzz", budget)).toEqual([]);
+      expect(await identifiers("", budget)).toHaveLength(10);
+    }
+  });
+
   test("rejects a malformed cursor", () => {
     expect(() => parseFunctionSpecCursor("a.js")).toThrow();
     expect(() => parseFunctionSpecCursor('["a.js", "1"]')).toThrow(
       "Invalid function spec cursor",
     );
-  });
-});
-
-describe("convexJsonValueSize", () => {
-  test("follows the backend's size rules", () => {
-    // { "a": "xy", "b": [1, null, true] }:
-    // 1 + (1 + 1 + 4) + (1 + 1 + (1 + 9 + 1 + 1 + 1)) + 1
-    expect(convexJsonValueSize({ a: "xy", b: [1, null, true] })).toBe(23);
-    expect(convexJsonValueSize(convexToJson(BigInt(10)))).toBe(9);
-    expect(convexJsonValueSize(convexToJson(new ArrayBuffer(6)))).toBe(8);
-    expect(convexJsonValueSize(convexToJson(new ArrayBuffer(5)))).toBe(7);
-    expect(convexJsonValueSize(convexToJson(new ArrayBuffer(4)))).toBe(6);
-  });
-
-  test("measures validators smaller than their JSON", () => {
-    const json = functionSpecJson("orders/queries.js", functions[0]);
-    const size = convexJsonValueSize(JSON.parse(json));
-    expect(size).toBeGreaterThan(json.length / 2);
-    expect(size).toBeLessThan(json.length);
   });
 });

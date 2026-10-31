@@ -61,30 +61,31 @@ More heap doesn't help: the single response is over the 24 MiB system result
 limit, and two `workflow_engine` return validators are nested deeper than the 64
 levels a Convex value allows.
 
-The fork patches `npm-packages/system-udfs/convex/_system/cli/`:
+The fork adds one query, `apiSpecPage`, to
+`npm-packages/system-udfs/convex/_system/cli/modules.ts` (helpers in
+`functionSpecPage.ts`), and leaves upstream's `apiSpec` unchanged:
 
-- `apiSpecPage` (new) returns the spec a page at a time, in module path order,
-  about 4 MiB per page (`maxBytes`, at most 8 MiB). A page can end partway
-  through a module, so one large module doesn't make a page too big. It takes
-  `cursor` (the previous `continueCursor`, an opaque string) and returns
-  `{ page, isDone, continueCursor }`. Each function entry carries `argsJson` and
-  `returnsJson` as JSON strings instead of `args` and `returns` values. Bulk's
-  spec comes back in 8 pages using about 17 MiB of V8 heap.
-- `apiSpec` keeps its response but builds it as JSON from the stored validator
-  strings, and returns that string through a wrapped `invokeQuery`. It measures
-  the result the way the backend does, and a spec over 32 MiB, the most any
-  Convex value can hold, fails at once with an error that points to
-  `apiSpecPage`. Smaller specs go to the backend's own result size check
-  (`SYSTEM_FUNCTION_MAX_RESULT_SIZE`, 24 MiB by default), as before.
+- It returns the spec a page at a time, in module path order, about 4 MiB per
+  page (`maxBytes`, at most 8 MiB). A page can end partway through a module, so
+  one large module doesn't make a page too big. It takes `cursor` (the previous
+  `continueCursor`, an opaque string) and returns
+  `{ page, isDone, continueCursor }`.
+- Each function entry carries `argsJson` and `returnsJson` as JSON strings
+  instead of `args` and `returns` values. Bulk's spec comes back in 8 pages
+  using about 17 MiB of V8 heap.
+- `pathPrefix` limits the spec to modules whose path starts with it, read
+  through the `by_path` index, so a narrow request reads only those modules. The
+  MCP `functionSpec` tool uses it for `identifierPrefix`.
 
 The `@bulk-platform/convex` CLI pages with `apiSpecPage` from 1.46.0-bulk.2 and
 falls back to `apiSpec` when a backend doesn't have it. Older CLIs call
-`apiSpec` and can't read Bulk's spec at any heap size.
+`apiSpec`, which runs out of memory on Bulk's app at any heap size.
 
 Tests: `pnpm exec vitest run convex/_system/cli` in `npm-packages/system-udfs`
-checks the JSON against upstream's encoding. The end-to-end test deploys a
-generated 4,000-module app (122 MB of spec, more than Bulk's per module) to a
-local backend built from this tree, with the default heap. It fails on a build
+checks the entries against upstream's `apiSpec` encoding, paging and prefixes.
+The end-to-end test deploys a generated 4,000-module app (122 MB of spec, more
+than Bulk's per module) to a local backend built from this tree, with the
+default heap, and reads it in full and under one folder. It fails on a build
 without the patch:
 
 ```bash

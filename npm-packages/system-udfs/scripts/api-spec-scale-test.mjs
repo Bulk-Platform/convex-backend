@@ -10,8 +10,10 @@
 //
 // - `apiSpecPage` returns the whole spec, page by page, under the default
 //   64 MiB isolate heap, and that it equals the spec the generator expects;
-// - `apiSpec` does not run out of memory. A spec this size is too large for one
-//   response, so it fails early with an error that points to `apiSpecPage`.
+// - with `pathPrefix`, it returns just the functions under that folder.
+//
+// It also reports what upstream's one-shot `apiSpec` does with the same app
+// (it runs out of memory), without failing on it.
 //
 // Usage (from npm-packages/system-udfs, after `cargo build -p local_backend`):
 //   node scripts/api-spec-scale-test.mjs \
@@ -302,8 +304,8 @@ async function main() {
     }
     results.apiSpec.seconds = (Date.now() - legacyStart) / 1000;
 
-    const pagedStart = Date.now();
-    try {
+    const readPaged = async (pathPrefix) => {
+      const started = Date.now();
       const entries = [];
       let cursor = null;
       let pages = 0;
@@ -314,7 +316,7 @@ async function main() {
           url,
           adminKey,
           "_system/cli/modules:apiSpecPage",
-          { cursor },
+          pathPrefix === undefined ? { cursor } : { cursor, pathPrefix },
         );
         pages++;
         bytes += page.bytes;
@@ -323,16 +325,30 @@ async function main() {
         if (page.value.isDone) break;
         cursor = page.value.continueCursor;
       }
-      results.apiSpecPage = { ok: true, pages, bytes, maxPageBytes };
-      results.apiSpecPage.seconds = (Date.now() - pagedStart) / 1000;
-      results.apiSpecPage.problems = checkSpec(entries, options.modules);
-      results.apiSpecPage.ok = results.apiSpecPage.problems.length === 0;
+      const seconds = (Date.now() - started) / 1000;
+      return { entries, summary: { pages, bytes, maxPageBytes, seconds } };
+    };
+
+    try {
+      const { entries, summary } = await readPaged();
+      const problems = checkSpec(entries, options.modules);
+      results.apiSpecPage = { ok: problems.length === 0, ...summary, problems };
     } catch (e) {
-      results.apiSpecPage = {
-        ok: false,
-        error: e.message,
-        seconds: (Date.now() - pagedStart) / 1000,
+      results.apiSpecPage = { ok: false, error: e.message };
+    }
+
+    try {
+      const { entries, summary } = await readPaged(PREFIX);
+      const problems = checkPrefix(entries, options.modules);
+      results.apiSpecPagePrefix = {
+        ok: problems.length === 0,
+        prefix: PREFIX,
+        entries: entries.length,
+        ...summary,
+        problems,
       };
+    } catch (e) {
+      results.apiSpecPagePrefix = { ok: false, error: e.message };
     }
   } finally {
     if (backend && backend.exitCode === null) {
@@ -348,21 +364,34 @@ async function main() {
   console.log(
     JSON.stringify({ modules: options.modules, ...results }, null, 2),
   );
-  const legacyOutOfMemory = /out of memory/.test(results.apiSpec?.error ?? "");
-  if (!results.apiSpecPage?.ok || legacyOutOfMemory) {
+  if (!results.apiSpecPage?.ok || !results.apiSpecPagePrefix?.ok) {
     console.error(
-      "FAIL: " +
-        (results.apiSpecPage?.ok
-          ? "apiSpec ran out of memory"
-          : "apiSpecPage did not return the expected spec"),
+      "FAIL: apiSpecPage did not return the expected spec" +
+        (results.apiSpecPage?.ok ? " for a path prefix" : ""),
     );
     process.exit(1);
   }
   console.error("PASS");
 }
 
-// The spec the generator wrote, checked without materializing validators the
-// test did not generate: identifiers, types, visibility and field counts.
+const PREFIX = "f07/";
+
+function checkPrefix(entries, modules) {
+  const problems = [];
+  let expected = 0;
+  for (let i = 0; i < modules; i++) {
+    if (i % 40 === 7) expected += FUNCTIONS_PER_MODULE;
+  }
+  if (entries.length !== expected) {
+    problems.push(`expected ${expected} entries, got ${entries.length}`);
+  }
+  const outside = entries.filter((e) => !e.identifier?.startsWith(PREFIX));
+  if (outside.length > 0) {
+    problems.push(`${outside.length} entries outside ${PREFIX}`);
+  }
+  return problems;
+}
+
 function checkSpec(entries, modules) {
   const problems = [];
   const expected = modules * FUNCTIONS_PER_MODULE + HTTP_ROUTES;
