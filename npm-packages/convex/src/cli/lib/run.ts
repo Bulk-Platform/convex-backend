@@ -20,6 +20,7 @@ import JSON5 from "json5";
 import path from "path";
 import { readProjectConfig } from "./config.js";
 import { watchAndPush } from "./dev.js";
+import { fetchFunctionSpecs } from "./functionSpec.js";
 import { Logger, DefaultLogger } from "../../browser/logging.js";
 
 export async function runFunctionAndLog(
@@ -73,12 +74,10 @@ export async function runFunctionAndLog(
     }
 
     if (errorMessage.includes("Could not find function")) {
-      const functions = (await runSystemQuery(ctx, {
+      const functions = (await fetchFunctionSpecs(ctx, {
         deploymentUrl: args.deploymentUrl,
         adminKey: args.adminKey,
-        functionName: "_system/cli/modules:apiSpec",
         componentPath: args.componentPath,
-        args: {},
       })) as (
         | {
             functionType: "Query" | "Mutation" | "Action";

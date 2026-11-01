@@ -27,6 +27,7 @@ import {
   Visibility,
 } from "../lib/deployApi/modules.js";
 import { parseValidator, validatorToType } from "./validator_helpers.js";
+import { segmentedApiDeclarations } from "./segmented_api.js";
 
 export function componentApiJs() {
   const lines = [];
@@ -363,21 +364,8 @@ async function* codegenDynamicApiObjects(
       FilterApi,
       FunctionReference,
     } from "convex/server";
-
-    declare const fullApi: ApiFromModules<{
   `;
-  for (const modulePath of modulePaths) {
-    const ident = moduleIdentifier(modulePath);
-    const path = importPath(modulePath);
-    yield `  "${path}": typeof ${ident},`;
-  }
-  yield `}>;`;
-  yield `
-    ${apiComment("api", "public")}
-    export declare const api: FilterApi<typeof fullApi, FunctionReference<any, "public">>;
-    ${apiComment("internal", "internal")}
-    export declare const internal: FilterApi<typeof fullApi, FunctionReference<any, "internal">>;
-  `;
+  yield segmentedApiDeclarations(modulePaths, { useTypeScript: false });
 }
 
 async function* codegenDynamicApiObjectsTS(
@@ -400,21 +388,8 @@ async function* codegenDynamicApiObjectsTS(
       FunctionReference,
     } from "convex/server";
     import { anyApi, componentsGeneric } from "convex/server";
-
-    const fullApi: ApiFromModules<{
   `;
-  for (const modulePath of modulePaths) {
-    const ident = moduleIdentifier(modulePath);
-    const path = importPath(modulePath);
-    yield `  "${path}": typeof ${ident},`;
-  }
-  yield `}> = anyApi as any;`;
-  yield `
-    ${apiComment("api", "public")}
-    export const api: FilterApi<typeof fullApi, FunctionReference<any, "public">> = anyApi as any;
-    ${apiComment("internal", "internal")}
-    export const internal: FilterApi<typeof fullApi, FunctionReference<any, "internal">> = anyApi as any;
-  `;
+  yield segmentedApiDeclarations(modulePaths, { useTypeScript: true });
 }
 
 interface ApiTree {
