@@ -26,6 +26,9 @@ const RELEASE_GREP = "^npm release version [0-9]+\\.[0-9]+\\.[0-9]+";
 const RELEASE_SUBJECT = /^npm release version (\d+\.\d+\.\d+)\b/;
 const SYNC_BRANCH_PREFIX = "bulk/upstream-sync/";
 const LIST_LIMIT = 60;
+// Upstream bumps these all the time; a commit that changes only them is
+// counted, not listed.
+const LOCKFILES = new Set(["Cargo.lock", "npm-packages/pnpm-lock.yaml"]);
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const manifestPath = join(root, "bulk", "patches.txt");
@@ -419,6 +422,10 @@ function mergeCommand(values) {
           ),
         }))
       : [];
+  const lockOnly = touchingBulk.filter((c) =>
+    c.files.every((f) => LOCKFILES.has(f)),
+  );
+  const touchingPatches = touchingBulk.filter((c) => !lockOnly.includes(c));
   const title = `Merge ${what}`;
   const message = `${title} (${short(target.sha)})\n\nMerges ${commits.length} upstream commits from ${short(state.merged)} to ${target.sha}.`;
 
@@ -475,7 +482,7 @@ function mergeCommand(values) {
     `| Merging | \`${short(target.sha)}\` (${target.release ? `npm release ${target.release}` : "upstream main, not an npm release"}) |`,
     `| Upstream commits | ${commits.length} ([compare](${compare})) |`,
     `| …that change \`${NPM_PACKAGE}\` | ${npmCommits.length} |`,
-    `| …that change a Bulk-patched file | ${touchingBulk.length} |`,
+    `| …that change a Bulk-patched file | ${touchingPatches.length}${lockOnly.length > 0 ? ` (and ${lockOnly.length} that change only a lockfile)` : ""} |`,
     `| Changes \`.github/workflows\` | ${touchesWorkflows ? "yes" : "no"} |`,
     "",
     "### Conflicts",
@@ -494,18 +501,27 @@ function mergeCommand(values) {
           "```",
           "",
           ...conflicts.map((c) => `- \`${c}\``),
+          ...(conflicts.includes("Cargo.lock")
+            ? [
+                "",
+                "For `Cargo.lock`, keep both sides' entries (Bulk's added dependencies and upstream's bumps), then check it with `cargo metadata --locked --format-version 1 > /dev/null`.",
+              ]
+            : []),
         ].join("\n"),
     "",
     "### Upstream commits that change Bulk-patched files",
     "",
-    touchingBulk.length === 0
-      ? "None."
-      : touchingBulk
-          .map(
-            (c) =>
-              `- [\`${short(c.sha)}\`](https://github.com/${UPSTREAM_REPO}/commit/${c.sha}) ${c.subject}: ${c.files.map((f) => `\`${f}\``).join(", ")}`,
-          )
-          .join("\n"),
+    [
+      ...touchingPatches.map(
+        (c) =>
+          `- [\`${short(c.sha)}\`](https://github.com/${UPSTREAM_REPO}/commit/${c.sha}) ${c.subject}: ${c.files.map((f) => `\`${f}\``).join(", ")}`,
+      ),
+      ...(lockOnly.length > 0
+        ? [
+            `- ${lockOnly.length} more change only ${[...new Set(lockOnly.flatMap((c) => c.files))].map((f) => `\`${f}\``).join(" and ")}: ${lockOnly.map((c) => `[\`${short(c.sha)}\`](https://github.com/${UPSTREAM_REPO}/commit/${c.sha})`).join(", ")}`,
+          ]
+        : []),
+    ].join("\n") || "None.",
     "",
     `### Upstream commits that change \`${NPM_PACKAGE}\``,
     "",
@@ -524,7 +540,7 @@ function mergeCommand(values) {
   ].join("\n");
 
   console.log(
-    `${title}: ${commits.length} upstream commits, ${npmCommits.length} change the npm package, ${touchingBulk.length} change Bulk-patched files.`,
+    `${title}: ${commits.length} upstream commits, ${npmCommits.length} change the npm package, ${touchingPatches.length} change Bulk-patched files (${lockOnly.length} more only a lockfile).`,
   );
   if (conflicts.length > 0) {
     console.log(
