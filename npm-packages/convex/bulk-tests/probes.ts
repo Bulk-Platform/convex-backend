@@ -1,7 +1,8 @@
 // Bulk fork: type probes for a synthetic project from scale_fixture.ts. Each
-// probe file imports `api` and `internal` from `./_generated/api` and fails to
-// compile if a path resolves to `any` or `never`, to the wrong function, or if
-// a path that should not exist type-checks.
+// probe file imports `api` and `internal` from `./_generated/api` (or another
+// generated module, see {@link ProbeOptions}) and fails to compile if a path
+// resolves to `any` or `never`, to the wrong function, or if a path that
+// should not exist type-checks.
 
 import { ScaleModule } from "./scale_fixture.js";
 
@@ -13,7 +14,19 @@ type IsNever<T> = [T] extends [never] ? true : false;
 type Concrete<T> = IsAny<T> extends true ? false : IsNever<T> extends true ? false : true;
 `;
 
-const PRELUDE = `import { api, internal } from "./_generated/api";
+export type ProbeOptions = {
+  /** Where probes import `api` and `internal` from. */
+  apiModule?: string;
+  /**
+   * How a top-level folder without public functions (`ops/`) appears on
+   * `api`: `"kept"` as `{}` (segmented codegen, see BULK.md) or `"dropped"`
+   * (upstream and static codegen).
+   */
+  emptyTopLevel?: "kept" | "dropped";
+};
+
+const prelude = ({ apiModule = "./_generated/api" }: ProbeOptions = {}) =>
+  `import { api, internal } from "${apiModule}";
 import type { FunctionArgs, FunctionReference, FunctionReturnType } from "convex/server";
 
 ${TYPE_ASSERTIONS}type Get<I extends number> = FunctionReference<"query", "public", { id: string; limit?: number | undefined }, { module: I; id: string }>;
@@ -86,11 +99,15 @@ export function sampleModules(modules: ScaleModule[]) {
  * Probe files with exact-type assertions, spread over `fileCount` files so
  * that each of tsc's checkers resolves `api` on its own.
  */
-export function positiveProbes(modules: ScaleModule[], fileCount = 8) {
+export function positiveProbes(
+  modules: ScaleModule[],
+  options: ProbeOptions = {},
+  fileCount = 8,
+) {
   const sample = sampleModules(modules);
   const files: Record<string, string> = {};
   for (let f = 0; f < fileCount; f++) {
-    const lines = [PRELUDE];
+    const lines = [prelude(options)];
     lines.push(
       `export type ApiConcrete = Expect<Concrete<typeof api>>;`,
       `export type InternalConcrete = Expect<Concrete<typeof internal>>;`,
@@ -117,13 +134,14 @@ export function positiveProbes(modules: ScaleModule[], fileCount = 8) {
     });
     files[`convex/probe_${f}.ts`] = lines.join("\n") + "\n";
   }
-  files["convex/probe_keys.ts"] = keyProbes(modules);
+  files["convex/probe_keys.ts"] = keyProbes(modules, options);
   return files;
 }
 
 /** The exact key sets at the root, in the split `big/` folder and below it. */
-function keyProbes(modules: ScaleModule[]) {
-  const lines = [PRELUDE];
+function keyProbes(modules: ScaleModule[], options: ProbeOptions) {
+  const kept = (options.emptyTopLevel ?? "kept") === "kept";
+  const lines = [prelude(options)];
   const prefixes = [
     [],
     ["big"],
@@ -140,13 +158,17 @@ function keyProbes(modules: ScaleModule[]) {
         prefix.length === 0
           ? `typeof ${root}`
           : `typeof ${accessPath(root, prefix.join("/"))}`;
-      if (prefix.length === 0 && visibility === "public") {
+      if (prefix.length === 0 && visibility === "public" && kept) {
         // Top-level folders without public functions stay on `api` as `{}`
         // (see BULK.md); everything below the top level matches upstream.
         keys = [...keys, ...topLevelWithoutPublic(modules)];
       }
       if (prefix[0] === "ops" && visibility === "public") {
-        lines.push(`export type K${i}${root} = Expect<Equal<${target}, {}>>;`);
+        lines.push(
+          kept
+            ? `export type K${i}${root} = Expect<Equal<${target}, {}>>;`
+            : `export type K${i}${root} = Expect<Equal<"ops" extends keyof typeof api ? true : false, false>>;`,
+        );
         continue;
       }
       lines.push(
@@ -245,18 +267,17 @@ export const NEGATIVE_CASES: { code: string; expect: string; error: string }[] =
  * guard, one per line after the prelude, so tests can check each one fails
  * for the right reason.
  */
-export function negativeProbes() {
-  const prelude = PRELUDE;
+export function negativeProbes(options: ProbeOptions = {}) {
   return {
     "convex/probe_guards.ts":
-      prelude +
+      prelude(options) +
       NEGATIVE_CASES.map(
         (c, i) =>
-          `// @ts-expect-error ${c.error}\n${c.code.replace("const e", `const e${i}`)}`,
+          `// @ts-expect-error ${negativeCaseError(c, options)}\n${c.code.replace("const e", `const e${i}`)}`,
       ).join("\n") +
       "\n",
     "convex/probe_negative.ts":
-      prelude +
+      prelude(options) +
       NEGATIVE_CASES.map((c, i) =>
         c.code.replace("const e", `const e${i}`),
       ).join("\n") +
@@ -264,8 +285,26 @@ export function negativeProbes() {
   };
 }
 
+/**
+ * Negative cases that fail on a different property when `ProbeOptions`
+ * has `emptyTopLevel: "dropped"`.
+ */
+const DROPPED_ERRORS: Record<string, string> = {
+  "export const e = api.ops.m0.sweep;": "Property 'ops' does not exist",
+};
+
+/** The error fragment a negative case must produce under `options`. */
+export function negativeCaseError(
+  c: (typeof NEGATIVE_CASES)[number],
+  options: ProbeOptions = {},
+) {
+  return (
+    (options.emptyTopLevel === "dropped" && DROPPED_ERRORS[c.code]) || c.error
+  );
+}
+
 /** 1-based line of each negative case in `probe_negative.ts`. */
 export function negativeCaseLines() {
-  const preludeLines = PRELUDE.split("\n").length - 1;
+  const preludeLines = prelude().split("\n").length - 1;
   return NEGATIVE_CASES.map((_, i) => preludeLines + i + 1);
 }

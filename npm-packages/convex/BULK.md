@@ -22,13 +22,40 @@ version in `package.json`. It is separate from the backend runtime fork on
 
 | Patch                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Files                                                                      | Test                                                                                                                                                                         |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Segmented `api.d.ts`: one `ApiFromModules` chunk per top-level folder, nested folders split again past 400 modules. Upstream's single chunk collapses to `never` near 1,950 modules in TypeScript 6 and 7 (TypeScript 5.0 does not).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | `src/cli/codegen_templates/segmented_api.ts`, `api.ts`, `component_api.ts` | `bulk-tests/segmented_api.test.ts` compares with upstream's shape on a small fixture. `bulk-tests/segmented_api_scale.test.ts` type-checks 2,621- and 4,021-module projects. |
+| Segmented `api.d.ts`: one `ApiFromModules` chunk per top-level folder, nested folders split again past 400 modules. Upstream's single chunk collapses to `never` near 1,950 modules in TypeScript 6 and 7 (TypeScript 5.0 does not). CommonJS codegen's `api_cjs.d.cts` is the same text, so it is segmented too. Static codegen is unpatched (see below).                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `src/cli/codegen_templates/segmented_api.ts`, `api.ts`, `component_api.ts` | `bulk-tests/segmented_api.test.ts` compares with upstream's shape on a small fixture. `bulk-tests/segmented_api_scale.test.ts` type-checks 2,621- and 4,021-module projects. |
 | Paged function spec: `npx convex function-spec`, the MCP `functionSpec` tool and `npx convex run`'s function list read `_system/cli/modules:apiSpecPage` a page at a time (Bulk runtime fork) and fall back to `apiSpec` when the backend lacks it, or for a component. One `apiSpec` response for Bulk's app is over the system result size and nesting limits. Output is unchanged.                                                                                                                                                                                                                                                                                                                                                                                                                        | `src/cli/lib/functionSpec.ts`, `run.ts`, `mcp/tools/functionSpec.ts`       | `bulk-tests/function_spec.test.ts`. The runtime fork's `npm-packages/system-udfs/scripts/api-spec-scale-test.mjs` covers the backend side.                                   |
 | MCP `functionSpec` filters: optional `identifierPrefix` (matches identifiers with or without `.js`, and HTTP route paths), `includeValidators: false` (identifiers, types and visibility only), `validatorFormat: "compact"` (TypeScript-like validator strings such as `{ id: Id<"users">, n?: int64 }`) and `maxCharacters` (default 80,000, about 20k tokens, under Claude Code's default 25k-token MCP output limit). Over the cap the tool returns an error with the compact and no-validator sizes and the largest narrower prefixes. With a prefix, the backend reads only the matching modules (`apiSpecPage`'s `pathPrefix`, from the part before `:`, or `http.js` for a route path), instead of the whole spec (about 40 MB and 15 s for Bulk's app). Small apps get the same output as upstream. | `src/cli/lib/mcp/tools/functionSpec.ts`                                    | `bulk-tests/mcp_function_spec.test.ts`                                                                                                                                       |
 | Release version `<upstream>-bulk.<n>`. `src/index.ts` keeps the upstream version, which is what the CLI and clients report to the backend.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `scripts/version-check.mjs`                                                | —                                                                                                                                                                            |
 
-`api_cjs.ts` (`generateCommonJSApi`) and static codegen (`staticApi`) are not
-patched.
+### CommonJS and static codegen
+
+`generateCommonJSApi` (`convex codegen --commonjs`) writes `api_cjs.d.cts` with
+the same text as `api.d.ts`: `apiCjsCodegen` reuses `apiCodegen`'s declarations
+and component codegen writes its `api.d.ts` contents twice. So upstream's
+CommonJS types collapse exactly like its `api.d.ts`, and the fork's are
+segmented without a patch of their own.
+
+Static codegen (`codegen.staticApi`, off in Bulk) writes each function's
+`FunctionReference` type out from the backend's validators instead of
+`ApiFromModules`, so it has no cliff. It is upstream's code, unpatched. With
+TypeScript 7.0.2 on the scale fixtures (whole project, probes included):
+
+| Modules | Output               | `api` file | Check time | Memory  |
+| ------- | -------------------- | ---------- | ---------- | ------- |
+| 2,621   | upstream (collapses) | 0.2 MB     | 2.4 s      | 1.2 GB  |
+| 2,621   | segmented            | 0.2 MB     | 2.8 s      | 2.2 GB  |
+| 2,621   | static               | 0.8 MB     | 0.8 s      | 0.8 GB  |
+| 4,021   | upstream (collapses) | 0.3 MB     | 3.2 s      | 1.7 GB  |
+| 4,021   | segmented            | 0.3 MB     | 3.7 s      | 2.9 GB  |
+| 4,021   | static               | 1.2 MB     | 1.3 s      | 1.2 GB  |
+| 20,021  | segmented            | 1.7 MB     | 20.1 s     | 11.7 GB |
+| 20,021  | static               | 6.2 MB     | 7.4 s      | 5.6 GB  |
+
+The CommonJS file checks in the same time and memory as `api.d.ts`. Static
+output grows with the size of the validators, which the fixtures keep small: an
+app with large `args` or `returns` validators gets a larger file, but no
+type-level limit. Like upstream, static `api` drops a top-level folder that has
+no public functions instead of keeping it as `{}`.
 
 ### What the scale tests check
 
@@ -37,8 +64,9 @@ patched.
 that is also a folder) and type-checks them with `typescript@7.0.2` and its
 default 4 checkers, as Bulk does. It runs `tsc` through `npx` (set `BULK_TSC` to
 a local binary to skip the download). For `api.d.ts` and `api.ts` from
-`apiCodegen`, and for both component codegen outputs, the probes in
-`bulk-tests/probes.ts` assert:
+`apiCodegen`, `api_cjs.d.cts` from `apiCjsCodegen` (imported as
+`./_generated/api_cjs.cjs`), static codegen's `api.d.ts` and `api.ts`, and both
+dynamic component codegen outputs, the probes in `bulk-tests/probes.ts` assert:
 
 - exact `FunctionReference`, `FunctionArgs` and `FunctionReturnType` types
   through `api.<folder>.<file>.<fn>` and `internal.…`, in every chunk;
@@ -48,9 +76,9 @@ a local binary to skip the download). For `api.d.ts` and `api.ts` from
   behind `@ts-expect-error`.
 
 Two controls keep the probes honest: upstream's single `ApiFromModules` must
-collapse to `never` at each size, and an `api` typed as `any` must fail the
-probes. A TypeScript 5 run checks the segmented types equal upstream's at 2,621
-modules.
+collapse to `never` at each size, as `api.d.ts` and as `api_cjs.d.cts`, and an
+`api` typed as `any` must fail the probes. A TypeScript 5 run checks the
+segmented types equal upstream's at 2,621 modules.
 
 ### The one difference from upstream
 
