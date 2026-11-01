@@ -1,17 +1,21 @@
-# Bulk Platform Convex Runtime fork
+# Bulk Platform Convex fork
 
 ## Purpose
 
-Bulk self-hosts Convex and uses this fork for the production backend runtime.
-The fork exists so high-capacity installations can tune the two self-hosted HTTP
-listeners independently while keeping the rest of Convex close to upstream.
+Bulk self-hosts Convex and uses this fork for the production backend runtime and
+for `@bulk-platform/convex`, the npm package `bulk_v3/backend_v3` runs codegen
+and deploys with (`npm-packages/convex/BULK.md`). The fork exists so
+high-capacity installations can tune the runtime and so codegen and the CLI work
+for an app of Bulk's size, while keeping the rest of Convex close to upstream.
 
 | Concern                                    | Source of truth                    |
 | ------------------------------------------ | ---------------------------------- |
 | Convex Runtime Rust source                 | This repository                    |
+| `@bulk-platform/convex` npm package        | This repository                    |
+| Bulk patch inventory                       | `bulk/patches.txt`                 |
 | Convex application functions and schema    | `Bulk-Platform/bulk_v3/backend_v3` |
 | Runtime image pins, limits, and deployment | `Bulk-Platform/bulk-infra`         |
-| Upstream Convex source                     | `get-convex/convex-backend`        |
+| Upstream Convex source                     | `convex/convex-backend`            |
 
 The Bulk-only runtime knobs are:
 
@@ -95,6 +99,56 @@ node scripts/api-spec-scale-test.mjs \
   --backend ../../target/debug/convex-local-backend --modules 4000
 ```
 
+## The Bulk line
+
+`main` is the Bulk line. It is upstream `convex/convex-backend` main (formerly
+`get-convex/convex-backend`) merged in, plus the Bulk patches as ordinary
+commits. Both products build from it:
+
+| Product                             | Built by                                        | Released as                                     |
+| ----------------------------------- | ----------------------------------------------- | ----------------------------------------------- |
+| Convex Runtime image                | `.github/workflows/bulk_release_backend.yml`    | `ghcr.io/bulk-platform/convex-backend@sha256:…` |
+| `@bulk-platform/convex` npm package | `.github/workflows/bulk_release_convex_npm.yml` | `<upstream release>-bulk.<n>`                   |
+
+Upstream comes in by merge, never by rebase or cherry-pick, so the Bulk patches
+stay in history as they were written and an upstream change to a patched file
+shows up as a merge conflict or in the sync pull request. Never force-push or
+rebase `main`, and merge every pull request into it with a merge commit
+(squashing a sync pull request would drop the upstream history the tooling
+reads).
+
+By default `main` takes upstream at its npm releases: the
+`npm release version X.Y.Z` commit upstream adds to its own main for each
+release. At that commit the npm package on `main` is exactly upstream X.Y.Z plus
+the Bulk patches, and the runtime is the upstream tree that X.Y.Z shipped with.
+Releases come about weekly. When the runtime needs an upstream fix sooner, merge
+upstream main or a later upstream commit instead (see "Upstream sync"). `main`
+then carries upstream npm-package changes that are in no upstream release yet,
+and the npm release workflow refuses to publish until the next upstream release
+is merged, unless the tag allows it (`npm-packages/convex/BULK.md`, "Release").
+
+Before November 2026 the npm package lived on `bulk/convex-npm`, rebuilt from
+each upstream release by cherry-picking the Bulk commits. That branch was merged
+into `main` as it stood at `1.48.0-bulk.1` and takes no new work: retarget a
+pull request open against it to `main`, where its diff stays the same.
+`bulk/convex-npm-1.46.0` keeps the older line.
+
+## Versions
+
+- npm package: `<upstream release>-bulk.<n>`, for example `1.49.0-bulk.1`. The
+  upstream release is the version in `npm-packages/convex/package.json`, the
+  newest upstream release merged into `main`. Bulk never edits that version or
+  `src/index.ts` (the CLI reports the upstream version to the backend), so
+  release merges never conflict there. `<n>` starts at 1 for each upstream
+  release and counts Bulk releases of it. The tag is `convex-npm/v<version>` on
+  a commit on `main`.
+- Runtime image: tagged with the `main` commit SHA and pinned by digest in
+  `bulk-infra`. `node bulk/upstream.mjs status` at that commit names its
+  upstream base, for example "npm release 1.49.0 + 1 upstream commits".
+
+The two products release independently from the same line. A runtime release
+needs no npm release, and the reverse.
+
 ## Patch policy
 
 Keep Bulk-only changes narrow, tested, and separable from upstream code. Before
@@ -103,31 +157,98 @@ Every retained patch must have:
 
 - a clear production reason;
 - a test or build check at the changed seam;
-- an entry in this document when it changes the supported runtime contract;
+- an entry in `bulk/patches.txt` for every file it changes, and a description in
+  this document (runtime) or `npm-packages/convex/BULK.md` (npm package);
 - a compatible `bulk-infra` change when deployment settings must change.
 
-## Sync with upstream
+### Patch inventory
 
-Add the upstream remote once:
-
-```bash
-git remote add upstream https://github.com/get-convex/convex-backend.git
-git fetch origin --prune
-git fetch upstream --prune
-```
-
-Prepare an upgrade without rewriting shared history:
+`bulk/patches.txt` lists every path where `main` differs from the upstream
+commit it last merged, grouped by patch. Upstream main is linear, so that commit
+is `git merge-base HEAD upstream/main`, and the Bulk-only diff is the diff from
+it to `HEAD`:
 
 ```bash
-git switch -c codex/upgrade-convex-YYYYMMDD origin/main
-git merge --no-ff upstream/main
-git log --oneline upstream/main..HEAD
-git diff --stat upstream/main...HEAD
+git fetch upstream
+node bulk/upstream.mjs status      # merged upstream commit, release, how far behind
+node bulk/upstream.mjs inventory   # the Bulk-only diff by patch, and the Bulk commits
 ```
 
-Resolve conflicts by preserving current upstream behavior first, then replaying
-the small Bulk patch set. Do not force-push `main`. Open a pull request and make
-the upstream commit or release being adopted clear in its description.
+`inventory --check` fails when a changed file is in no entry or an entry matches
+no changed file. `.github/workflows/bulk_checks.yml` runs it on every pull
+request to `main`, so the list stays true: a new patch adds its files, and a
+patch upstream absorbs (or Bulk drops) removes them.
+
+## Upstream sync
+
+`.github/workflows/bulk_upstream_sync.yml` runs daily. When upstream has an npm
+release that `main` hasn't merged, it:
+
+1. merges the release commit into `main` on a branch
+   `bulk/upstream-sync/v<X.Y.Z>`;
+2. runs `bulk_checks.yml` on the merged tree: the patch inventory, the npm
+   package's type check and build, `bulk-tests` (with the TypeScript 7 scale
+   tests at 2,621 and 4,021 modules) and the system-udfs function spec tests;
+3. pushes the branch and opens a pull request listing the upstream commits that
+   change Bulk-patched files, the upstream npm-package changes, conflicts, the
+   patch inventory after the merge, and the check result. A merge with conflicts
+   or failing checks opens as a draft.
+
+A branch that already exists is left alone, so a pull request with a resolved
+merge is never overwritten; a newer upstream release gets its own branch and
+pull request, and the older one can be closed. Run the workflow by hand with
+`target: main` (upstream main) or an upstream main commit SHA to take upstream
+off the release schedule, and with `dry_run: true` to see the pull request
+without pushing.
+
+Reviewing a sync pull request:
+
+1. Read "Upstream commits that change Bulk-patched files" and check each patch
+   still does what its description says.
+2. For a runtime change, build a dev-slot image from the branch before merging
+   (`gh workflow run bulk_release_backend.yml --ref bulk/upstream-sync/vX.Y.Z`)
+   and run the minimum runtime validation below where practical.
+3. Merge with a merge commit. Then release what needs releasing: tag the npm
+   package (`npm-packages/convex/BULK.md`, "Release") and run the runtime image
+   release on `main`.
+
+When the merge conflicts, the branch holds the merge commit with conflict
+markers so the pull request shows them. Redo the merge locally and force-push
+the sync branch, so `main` never gets a commit with markers:
+
+```bash
+git fetch origin
+git fetch upstream
+git switch -C bulk/upstream-sync/vX.Y.Z origin/main
+git merge --no-ff <upstream commit from the pull request>
+# Resolve by keeping upstream's behaviour first, then replaying the Bulk patch.
+git commit
+node bulk/upstream.mjs inventory --check
+git push --force-with-lease origin bulk/upstream-sync/vX.Y.Z
+```
+
+The same merge without the workflow, from a fresh branch:
+
+```bash
+git switch -c bulk/upstream-sync/vX.Y.Z origin/main
+node bulk/upstream.mjs merge --target release --body /tmp/sync-pr.md
+```
+
+`--target` takes `release`, `main` or an upstream main commit. Without
+`--commit-conflicts` a conflicting merge is aborted and only reported.
+
+One-time repository setup for the workflow:
+
+- Add the upstream remote locally once:
+  `git remote add upstream https://github.com/convex/convex-backend.git`.
+- Set the `BULK_UPSTREAM_SYNC_TOKEN` secret to a token with contents,
+  pull-requests and workflows write on this repository (a fine-grained PAT or a
+  GitHub App token). `GITHUB_TOKEN` cannot push a merge that changes
+  `.github/workflows`, and pull requests it opens don't run their own checks.
+  Without the secret, enable "Allow GitHub Actions to create and approve pull
+  requests" under Settings → Actions; upstream merges that change workflows then
+  fail with a pointer to the local procedure.
+- Allow merge commits for pull requests to `main`.
 
 Minimum local validation for runtime changes:
 
@@ -157,17 +278,17 @@ digest. When syncing, keep `.nvmrc` on Node 24 or later; take upstream's patch
 version unless a Bulk canary has shown a regression.
 
 For an isolated dev-slot test before merging, run the GitHub Actions workflow
-from a `codex/upgrade-convex-*` branch:
+from a `bulk/upstream-sync/*` or `codex/upgrade-convex-*` branch:
 
 ```bash
 gh workflow run bulk_release_backend.yml \
   --repo Bulk-Platform/convex-backend \
-  --ref codex/upgrade-convex-YYYYMMDD
+  --ref bulk/upstream-sync/vX.Y.Z
 ```
 
-The upgrade-branch path still publishes only the commit SHA tag and immutable
-digest. It does not update `latest` or any deployment. Pin that digest only on
-the selected disposable dev slot.
+The branch path still publishes only the commit SHA tag and immutable digest. It
+does not update `latest` or any deployment. Pin that digest only on the selected
+disposable dev slot.
 
 After the fork pull request is merged to `main`, run the same workflow on
 `main`:
