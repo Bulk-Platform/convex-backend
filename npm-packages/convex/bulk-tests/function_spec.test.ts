@@ -88,6 +88,20 @@ describe("fetchFunctionSpecs", () => {
     expect(runSystemQuery).not.toHaveBeenCalled();
   });
 
+  test("asks for a path prefix when given one", async () => {
+    responses.push({
+      status: "success",
+      value: { page: [], isDone: true, continueCursor: null },
+    });
+    await fetchFunctionSpecs(ctx, { ...deployment, pathPrefix: "orders/" });
+    expect(requests).toEqual([
+      {
+        path: "_system/cli/modules:apiSpecPage",
+        args: { cursor: null, pathPrefix: "orders/" },
+      },
+    ]);
+  });
+
   test("falls back to apiSpec on a backend without apiSpecPage", async () => {
     responses.push({
       status: "error",
