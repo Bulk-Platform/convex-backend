@@ -42,6 +42,7 @@ const mockProject = {
   name: "My amazing app",
   slug: "my-amazing-app",
   createTime: NOW - 200 * DAY,
+  tags: [],
 };
 // Matches STORYBOOK_PROD_DEPLOYMENT in the docs page decorator, which renders
 // the surrounding dashboard shell for `docsPage.deploymentType: "prod"`.

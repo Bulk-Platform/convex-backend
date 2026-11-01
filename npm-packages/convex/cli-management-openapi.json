@@ -889,6 +889,27 @@
               "string",
               "null"
             ]
+          },
+          "prodDeploymentReference": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "devDeploymentReference": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
           }
         }
       },

@@ -12,6 +12,12 @@ use anyhow::{
     Context,
     Result,
 };
+use common::knobs::S3_EXPORT_MAX_CONCURRENT_TABLE_WRITES;
+use futures::{
+    stream,
+    StreamExt,
+    TryStreamExt,
+};
 use iceberg::{
     io::{
         S3_ACCESS_KEY_ID,
@@ -19,6 +25,7 @@ use iceberg::{
         S3_PATH_STYLE_ACCESS,
         S3_REGION,
         S3_SECRET_ACCESS_KEY,
+        S3_SESSION_TOKEN,
     },
     memory::{
         MemoryCatalogBuilder,
@@ -39,12 +46,17 @@ use iceberg_storage_opendal::OpenDalStorageFactory;
 
 use super::{
     append,
-    change_log_schema,
+    columns::{
+        self,
+        metadata_schema,
+        AddColumn,
+    },
+    json,
     Change,
+    Format,
 };
 
-const ENCODING_PROPERTY: &str = "convex.porter.encoding";
-const ENCODING: &str = "convex-change-log-json-v1";
+const FORMAT_PROPERTY: &str = "convex.porter.encoding";
 const RETIRED_PROPERTY: &str = "convex.porter.retired";
 // Glue lowercases names, so these record the exact source table.
 const COMPONENT_PROPERTY: &str = "convex.porter.component";
@@ -62,6 +74,8 @@ pub struct S3Destination {
     pub endpoint_url: Option<String>,
     pub access_key_id: String,
     pub secret_access_key: String,
+    /// Set when the keys are a role session rather than an IAM user's keys.
+    pub session_token: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -72,6 +86,7 @@ pub struct SourceTable {
 
 pub struct IcebergChangeWriter {
     catalog: Arc<dyn Catalog>,
+    format: Format,
     namespace: NamespaceIdent,
     warehouse_uri: String,
     selected: Vec<SourceTable>,
@@ -103,6 +118,7 @@ impl IcebergChangeWriter {
         locations: &BTreeMap<String, String>,
         retired: &BTreeSet<String>,
         snapshot_properties: HashMap<String, String>,
+        format: Format,
     ) -> Result<Self> {
         ensure!(
             warehouse_uri.starts_with(&format!("s3://{}/", destination.bucket)),
@@ -120,6 +136,9 @@ impl IcebergChangeWriter {
                 destination.secret_access_key,
             ),
         ]);
+        if let Some(token) = destination.session_token {
+            props.insert(S3_SESSION_TOKEN.to_owned(), token);
+        }
         if let Some(endpoint) = destination.endpoint_url {
             props.insert(S3_ENDPOINT.to_owned(), endpoint);
             props.insert(S3_PATH_STYLE_ACCESS.to_owned(), "true".to_owned());
@@ -130,12 +149,23 @@ impl IcebergChangeWriter {
             }))
             .load("porter", props)
             .await?;
-        let mut writer = Self::open(Arc::new(catalog), namespace, warehouse_uri, selected).await?;
+        let mut writer = Self::open(
+            Arc::new(catalog),
+            namespace,
+            warehouse_uri,
+            selected,
+            format,
+        )
+        .await?;
         writer.locations = locations.clone();
         writer.unregistered = locations.clone();
         writer.retired = Some(retired.clone());
         writer.snapshot_properties = snapshot_properties;
         Ok(writer)
+    }
+
+    pub fn format(&self) -> Format {
+        self.format
     }
 
     /// Metadata location of every table after this page, by Glue name.
@@ -152,12 +182,12 @@ impl IcebergChangeWriter {
         self.bytes_written
     }
 
-    async fn register(&mut self, name: &str) -> Result<()> {
-        if let Some(location) = self.unregistered.remove(name) {
+    async fn register(&self, name: &str) -> Result<()> {
+        if let Some(location) = self.unregistered.get(name) {
             self.catalog
                 .register_table(
                     &TableIdent::new(self.namespace.clone(), name.to_owned()),
-                    location,
+                    location.clone(),
                 )
                 .await?;
         }
@@ -178,6 +208,7 @@ impl IcebergChangeWriter {
         namespace: &str,
         warehouse_uri: &str,
         selected: Vec<SourceTable>,
+        format: Format,
     ) -> Result<Self> {
         ensure!(
             is_glue_name(namespace),
@@ -190,6 +221,7 @@ impl IcebergChangeWriter {
         }
         let writer = Self {
             catalog,
+            format,
             namespace,
             warehouse_uri: warehouse_uri.trim_end_matches('/').to_owned(),
             selected,
@@ -242,9 +274,14 @@ impl IcebergChangeWriter {
                     == Self::location(&self.warehouse_uri, source),
             "Iceberg table name or location does not match its source"
         );
+        let fields = metadata.current_schema().as_struct().fields();
+        let schema_matches = match self.format {
+            Format::Json => fields == json::change_log_schema()?.as_struct().fields(),
+            // Field columns follow the metadata columns and differ per table.
+            Format::Typed => fields.starts_with(metadata_schema()?.as_struct().fields()),
+        };
         ensure!(
-            metadata.current_schema().as_struct() == change_log_schema()?.as_struct()
-                && metadata.default_partition_spec().is_unpartitioned(),
+            schema_matches && metadata.default_partition_spec().is_unpartitioned(),
             "Iceberg table schema or partitioning mismatch"
         );
         Ok(())
@@ -279,43 +316,72 @@ impl IcebergChangeWriter {
     }
 
     #[fastrace::trace]
-    async fn load_existing(&mut self, ident: &TableIdent) -> Result<Option<Table>> {
+    async fn load_existing(&self, ident: &TableIdent) -> Result<Option<Table>> {
         self.register(ident.name()).await?;
         if !self.catalog.table_exists(ident).await? {
             return Ok(None);
         }
         let table = self.catalog.load_table(ident).await?;
-        self.validate(&source_of(&table)?, &table)?;
+        self.validate(&source_of(&table, self.format)?, &table)?;
         Ok(Some(table))
     }
 
+    /// The tables a page creates: those without a location yet, and the
+    /// truncated ones [`Self::apply`] drops and recreates. Their seed columns
+    /// come from the caller, which knows the tables' shapes.
+    pub fn new_tables(
+        &self,
+        truncated: &[SourceTable],
+        changes: &[(SourceTable, Change)],
+    ) -> Result<BTreeSet<SourceTable>> {
+        let mut new: BTreeSet<SourceTable> = truncated.iter().cloned().collect();
+        for (source, _) in changes {
+            if !self.locations.contains_key(&Self::table_name(source)?) {
+                new.insert(source.clone());
+            }
+        }
+        Ok(new)
+    }
+
+    /// Creates `source`'s table with the metadata columns and `seeds`.
     #[fastrace::trace]
-    async fn create(&mut self, source: &SourceTable) -> Result<()> {
+    async fn create(&self, source: &SourceTable, seeds: Vec<AddColumn>) -> Result<Table> {
         let name = Self::table_name(source)?;
         let creation = TableCreation::builder()
             .name(name.clone())
             .location(Self::location(&self.warehouse_uri, source))
-            .schema(change_log_schema()?)
+            .schema(match self.format {
+                Format::Json => json::change_log_schema()?,
+                Format::Typed => metadata_schema()?,
+            })
             .properties(HashMap::from([
-                (ENCODING_PROPERTY.to_owned(), ENCODING.to_owned()),
+                (FORMAT_PROPERTY.to_owned(), self.format.to_string()),
                 (COMPONENT_PROPERTY.to_owned(), source.component.clone()),
                 (TABLE_PROPERTY.to_owned(), source.table.clone()),
             ]))
             .build();
         let table = self.catalog.create_table(&self.namespace, creation).await?;
-        self.record(&table)?;
-        self.tables.insert(source.clone(), table);
-        Ok(())
+        Ok(match self.format {
+            Format::Json => {
+                ensure!(seeds.is_empty(), "The JSON format takes no seed columns");
+                table
+            },
+            Format::Typed => columns::commit_columns(&*self.catalog, &table, seeds).await?,
+        })
     }
 
     /// Requires one writer per namespace at a time. An `iceberg` commit rebases
     /// onto the table it reloads by name, so an append that overlaps another
     /// writer's drop and recreate would land in the new table.
+    ///
+    /// `seeds` holds the columns each table in [`Self::new_tables`] starts
+    /// with; a table without an entry starts with the metadata columns only.
     #[fastrace::trace]
     pub async fn apply(
         &mut self,
         truncated: &[SourceTable],
         changes: Vec<(SourceTable, Change)>,
+        mut seeds: BTreeMap<SourceTable, Vec<AddColumn>>,
     ) -> Result<()> {
         Self::check_names(
             &self.warehouse_uri,
@@ -331,41 +397,68 @@ impl IcebergChangeWriter {
             // deployment replaced it with `users`.
             let ident = TableIdent::new(self.namespace.clone(), name);
             if let Some(table) = self.load_existing(&ident).await? {
+                self.unregistered.remove(ident.name());
                 self.catalog.drop_table(&ident).await?;
                 self.locations.remove(ident.name());
                 // The recreated table starts unmarked.
                 if let Some(retired) = &mut self.retired {
                     retired.remove(ident.name());
                 }
-                self.tables.remove(&source_of(&table)?);
+                self.tables.remove(&source_of(&table, self.format)?);
             }
-            self.create(source).await?;
+            let table = self
+                .create(source, seeds.remove(source).unwrap_or_default())
+                .await?;
+            self.record(&table)?;
+            self.tables.insert(source.clone(), table);
         }
         let mut by_table: BTreeMap<SourceTable, Vec<Change>> = BTreeMap::new();
         for (source, change) in changes {
             by_table.entry(source).or_default().push(change);
         }
-        for (source, changes) in by_table {
-            if !self.tables.contains_key(&source) {
-                let ident = TableIdent::new(self.namespace.clone(), Self::table_name(&source)?);
-                if let Some(table) = self.load_existing(&ident).await? {
-                    ensure!(
-                        source_of(&table)? == source,
-                        "Glue table {} belongs to another source table",
-                        ident.name()
-                    );
-                    self.tables.insert(source.clone(), table);
+        // Unique names give each task exclusive ownership of its catalog table.
+        // Collect every result before advancing the page's metadata locations.
+        let writer = &*self;
+        let by_table: Vec<_> = by_table
+            .into_iter()
+            .map(|(source, changes)| {
+                let seeds = seeds.remove(&source).unwrap_or_default();
+                (source, changes, seeds)
+            })
+            .collect();
+        let written: Vec<_> = stream::iter(by_table)
+            .map(|(source, changes, seeds)| async move {
+                let table = if let Some(table) = writer.tables.get(&source) {
+                    table.clone()
                 } else {
-                    self.create(&source).await?;
-                }
-            }
-            let (table, bytes_written) = append(
-                &*self.catalog,
-                &self.tables[&source],
-                &changes,
-                &self.snapshot_properties,
-            )
+                    let name = Self::table_name(&source)?;
+                    let ident = TableIdent::new(writer.namespace.clone(), name);
+                    if let Some(table) = writer.load_existing(&ident).await? {
+                        ensure!(
+                            source_of(&table, writer.format)? == source,
+                            "Glue table {} belongs to another source table",
+                            ident.name()
+                        );
+                        table
+                    } else {
+                        writer.create(&source, seeds).await?
+                    }
+                };
+                let (table, bytes_written) = append(
+                    &*writer.catalog,
+                    &table,
+                    &changes,
+                    &writer.snapshot_properties,
+                    writer.format,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>((source, table, bytes_written))
+            })
+            .buffer_unordered(*S3_EXPORT_MAX_CONCURRENT_TABLE_WRITES)
+            .try_collect()
             .await?;
+        for (source, table, bytes_written) in written {
+            self.unregistered.remove(table.identifier().name());
             self.bytes_written += bytes_written;
             self.record(&table)?;
             self.tables.insert(source, table);
@@ -396,11 +489,12 @@ impl IcebergChangeWriter {
         // Retirement needs the full catalog, including tables untouched by this page.
         for name in self.unregistered.keys().cloned().collect::<Vec<_>>() {
             self.register(&name).await?;
+            self.unregistered.remove(&name);
         }
         for ident in self.catalog.list_tables(&self.namespace).await? {
             if let Some(table) = self.load_existing(&ident).await? {
                 self.record(&table)?;
-                self.tables.insert(source_of(&table)?, table);
+                self.tables.insert(source_of(&table, self.format)?, table);
             }
         }
         let retired = unselected(&self.locations);
@@ -429,12 +523,23 @@ impl IcebergChangeWriter {
     }
 }
 
-fn source_of(table: &Table) -> Result<SourceTable> {
+/// The Convex table behind `table`, which must be in `format`. An export
+/// never changes format, so a table in another format belongs to a retired
+/// export or to an older Porter mid-deploy; its rows may be the only copy, so
+/// the export stops rather than dropping it.
+fn source_of(table: &Table, format: Format) -> Result<SourceTable> {
     let property = |key| table.metadata().properties().get(key).cloned();
+    let encoding = property(FORMAT_PROPERTY).with_context(|| {
+        format!(
+            "Glue table {} was not written by a Convex export",
+            table.identifier()
+        )
+    })?;
+    // An unknown encoding is a format a newer Porter writes.
     ensure!(
-        property(ENCODING_PROPERTY).as_deref() == Some(ENCODING),
-        "Glue table {} was not written by a Convex export",
-        table.identifier()
+        encoding == format.to_string(),
+        "Glue table {} is in the {encoding} format, but this export writes {format}",
+        table.identifier(),
     );
     Ok(SourceTable {
         component: property(COMPONENT_PROPERTY).context("Missing component property")?,

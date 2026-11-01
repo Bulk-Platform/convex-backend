@@ -191,7 +191,7 @@ impl FetchClient for ProxiedFetchClient {
 /// full-duplex body whose first chunk is only produced after the response
 /// headers arrive, so we must not poll it before the request is sent.
 fn streaming_body(
-    body: Pin<Box<dyn Stream<Item = anyhow::Result<Bytes>> + Sync + Send>>,
+    body: Pin<Box<dyn Stream<Item = anyhow::Result<Bytes>> + Send>>,
     request_size: Arc<AtomicU64>,
 ) -> Body {
     Body::wrap_stream(body.inspect(move |b| {

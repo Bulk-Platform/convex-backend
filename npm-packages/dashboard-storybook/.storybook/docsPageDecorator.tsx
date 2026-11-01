@@ -180,6 +180,9 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
     createTime: Date.now(),
     prodDeploymentName: "musical-otter-456",
     devDeploymentName: "happy-capybara-123",
+    prodDeploymentReference: "production",
+    devDeploymentReference: "dev/nicolas",
+    tags: [],
   } as NonNullable<ReturnType<typeof useProjectBySlug>>;
   const shouldMockCurrentProject = title.startsWith("docs/pages/project/");
   const shouldMockCurrentDeployment = title.startsWith(

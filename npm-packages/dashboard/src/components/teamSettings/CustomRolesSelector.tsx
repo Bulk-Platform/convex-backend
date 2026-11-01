@@ -1,6 +1,7 @@
 import { Button } from "@ui/Button";
 import { Menu, MenuItem } from "@ui/Menu";
-import { Cross2Icon, PlusIcon } from "@radix-ui/react-icons";
+import { Chip } from "@ui/Chip";
+import { PlusIcon } from "@radix-ui/react-icons";
 import { useMemo } from "react";
 import sortBy from "lodash/sortBy";
 import type { CustomRoleResponse } from "@convex-dev/platform/managementApi";
@@ -57,17 +58,15 @@ export function CustomRolesSelector({
         {selectedSorted.map((id) => {
           const name = nameById.get(id) ?? `Role #${id}`;
           return (
-            <Button
+            <Chip
               key={id}
-              variant="unstyled"
-              aria-label={`Remove custom role ${name}`}
-              tip="Remove custom role"
-              onClick={() => remove(id)}
-              className="flex cursor-pointer items-center gap-1 rounded-sm border px-1.5 py-1 text-xs text-content-primary shadow-xs transition-colors hover:border-content-error hover:bg-background-error hover:text-content-error hover:shadow-none"
+              onRemove={() => remove(id)}
+              removeLabel={`Remove custom role ${name}`}
+              removeTip="Remove custom role"
+              className="max-w-56"
             >
-              <span className="max-w-48 truncate">{name}</span>
-              <Cross2Icon className="size-3 shrink-0" />
-            </Button>
+              {name}
+            </Chip>
           );
         })}
         {unselectedRoles.length === 0 ? (

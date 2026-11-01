@@ -228,7 +228,7 @@ pub static MAX_ACTION_USER_TIMEOUT: LazyLock<Duration> =
 pub static GET_SERVICE_TOKEN_GUARANTEED_LIFETIME: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(env_config(
         "GET_SERVICE_TOKEN_GUARANTEED_LIFETIME_SECONDS",
-        10 * 60,
+        2 * 60,
     ))
 });
 
@@ -277,6 +277,11 @@ pub static DATA_SYNC_PAGE_SIZE_LIMIT: LazyLock<usize> =
 /// split across pages, so a single transaction larger than this overflows it.
 pub static DATA_SYNC_PAGE_BYTES_LIMIT: LazyLock<usize> =
     LazyLock::new(|| env_config("DATA_SYNC_PAGE_BYTES_LIMIT", 1 << 26)); // 64 MiB
+
+/// Each active table in an S3 export page can buffer Parquet data and issue S3
+/// requests.
+pub static S3_EXPORT_MAX_CONCURRENT_TABLE_WRITES: LazyLock<usize> =
+    LazyLock::new(|| env_config("S3_EXPORT_MAX_CONCURRENT_TABLE_WRITES", 8).max(1));
 
 /// Max number of rows `DataSyncIterator` will read from persistence when
 /// computing a single page. A page can read many more rows than it emits when
@@ -400,6 +405,18 @@ pub static HTTP_SERVER_TCP_BACKLOG: LazyLock<u32> =
 /// action callbacks concurrency since those go over http.
 pub static HTTP_SERVER_MAX_CONCURRENT_REQUESTS: LazyLock<usize> =
     LazyLock::new(|| env_config("HTTP_SERVER_MAX_CONCURRENT_REQUESTS", 1024));
+
+/// Maximum concurrent requests accepted by the self-hosted main backend
+/// listener. This is separate from `HTTP_SERVER_MAX_CONCURRENT_REQUESTS`
+/// because `local_backend` has historically used its own limit.
+pub static LOCAL_BACKEND_MAX_CONCURRENT_REQUESTS: LazyLock<usize> =
+    LazyLock::new(|| env_config("LOCAL_BACKEND_MAX_CONCURRENT_REQUESTS", 128));
+
+/// Maximum concurrent requests accepted by the self-hosted public HTTP-action
+/// proxy. Keep this separate from `HTTP_SERVER_MAX_CONCURRENT_REQUESTS`: the
+/// proxy and the main API server have different workloads and admission gates.
+pub static SITE_PROXY_MAX_CONCURRENT_REQUESTS: LazyLock<usize> =
+    LazyLock::new(|| env_config("SITE_PROXY_MAX_CONCURRENT_REQUESTS", 4));
 
 /// Max number of user writes in a transaction. Make sure to also increase
 /// `MAX_INSERT_SIZE` in mysql/src/lib.rs and postgres/src/lib.rs.
@@ -1213,17 +1230,7 @@ pub static MYSQL_MAX_CHUNK_BYTES: LazyLock<usize> =
 pub static MYSQL_MAX_FILL_CHUNK_ROWS: LazyLock<usize> =
     LazyLock::new(|| env_config("MYSQL_MAX_FILL_CHUNK_ROWS", 1024));
 
-/// Page size to fall back to when Vitess rejects large result sets.
-/// Vitess limits query results to 64MiB. As documents can be up to 1MiB (plus
-/// some overhead) and system documents can be larger still, we may need to fall
-/// back to a much smaller page size if we hit the limit while loading
-/// documents. If the fallback page size still fails, we'll try page size 1
-/// before giving up.
-pub static MYSQL_FALLBACK_PAGE_SIZE: LazyLock<u32> =
-    LazyLock::new(|| env_config("MYSQL_FALLBACK_PAGE_SIZE", 5));
-
-/// Timeout for all operations on MySQL connections, Vitess timeout is 20s so
-/// set lower than that
+/// Timeout for all operations on MySQL connections
 pub static MYSQL_TIMEOUT: LazyLock<u64> = LazyLock::new(|| env_config("MYSQL_TIMEOUT_SECONDS", 19));
 
 /// Maximum number of connections to MySQL
@@ -1850,7 +1857,8 @@ pub static MAX_ECHO_BYTES: LazyLock<usize> =
 pub static MAX_USER_MODULES: LazyLock<usize> =
     LazyLock::new(|| env_config("MAX_USER_MODULES", 4096));
 
-/// Percentage of request traces that should sampled.
+/// Fraction of request traces to sample, overriding the built-in sampling
+/// rules.
 ///
 /// Sampling config is a JSON object with the following format:
 /// {
@@ -1875,17 +1883,8 @@ pub static MAX_USER_MODULES: LazyLock<usize> =
 /// and then stringify it at the end.
 ///
 /// See `fastrace_helpers.rs` for more examples
-pub static REQUEST_TRACE_SAMPLE_CONFIG: LazyLock<SamplingConfig> = LazyLock::new(|| {
-    env_config(
-        "REQUEST_TRACE_SAMPLE_CONFIG",
-        prod_override(
-            SamplingConfig::default(),
-            r#"{"defaultFraction":0.00001,"routeOverrides":[{"routeRegexp":"/api/push_config","fraction":0.1}, {"routeRegexp":"conductor/load-instance","fraction":0.01}, {"routeRegexp":"usage_tracking_worker/send_usage","fraction":0.01}, {"routeRegexp":"commit","fraction":0.01}]}"#
-                .parse()
-                .unwrap(),
-        ),
-    )
-});
+pub static REQUEST_TRACE_SAMPLE_CONFIG: LazyLock<SamplingConfig> =
+    LazyLock::new(|| env_config("REQUEST_TRACE_SAMPLE_CONFIG", "{}".parse().unwrap()));
 
 /// Size of the cache for access token authentication
 pub static AUTH_CACHE_SIZE: LazyLock<u64> = LazyLock::new(|| env_config("AUTH_CACHE_SIZE", 1000));
@@ -2040,6 +2039,17 @@ pub static EXPORT_WORKER_PAGE_SIZE: LazyLock<usize> =
 pub static EXPORT_PROGRESS_UPDATE_INTERVAL: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("EXPORT_PROGRESS_UPDATE_INTERVAL_SECS", 5)));
 
+/// Whether to ask glibc to release unused allocator pages after a successful
+/// snapshot export. This is disabled by default because `malloc_trim` pauses
+/// allocation while it walks allocator arenas and is only available on glibc.
+pub static EXPORT_MALLOC_TRIM_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_config("EXPORT_MALLOC_TRIM_ENABLED", false));
+
+/// Optional self-hosted periodic cleanup. Zero disables it; positive intervals
+/// must be at least 60 seconds. Independent of the post-export cleanup flag.
+pub static ALLOCATOR_MALLOC_TRIM_INTERVAL_SECS: LazyLock<u64> =
+    LazyLock::new(|| env_config("ALLOCATOR_MALLOC_TRIM_INTERVAL_SECS", 0));
+
 /// Whether or not a service should propagate all upstream traces or perform its
 /// own sampling
 pub static PROPAGATE_UPSTREAM_TRACES: LazyLock<bool> =
@@ -2112,17 +2122,6 @@ pub static ENV_VAR_TOTAL_SIZE_LIMIT: LazyLock<usize> =
 /// If set, disable the /metrics endpoint
 pub static DISABLE_METRICS_ENDPOINT: LazyLock<bool> =
     LazyLock::new(|| env_config("DISABLE_METRICS_ENDPOINT", false));
-
-/// When using the S3 storage provider with expiring AWS credentials, the
-/// duration before credential expiration that the AWS client should refresh
-/// those credentials.
-///
-/// Note that the AWS SDK automatically jitters the refresh so the final
-/// validity can actually be as little as half this value.
-///
-/// This ensures that presigned URLs (e.g. for node executor) stay valid.
-pub static AWS_S3_MIN_IDENTITY_VALIDITY: LazyLock<Duration> =
-    LazyLock::new(|| Duration::from_secs(env_config("AWS_S3_MIN_IDENTITY_VALIDITY_SECS", 1230)));
 
 /// If set, skip stripping PII from errors before they are reported. Useful for
 /// local debugging where the operator wants to see the original error contents.

@@ -14,9 +14,10 @@ So Yogi's `convex-generated/*.d.ts` re-export `backend_v3/convex/_generated/*`
 rather than copying the files with rewritten module imports. A client that
 copies them instead must install this package at the same version.
 
-The `bulk/convex-npm` branch starts at the upstream commit that released the
-version in `package.json`. It is separate from the backend runtime fork on
-`main`, which versions independently.
+The package builds from the fork's `main`, the Bulk line it shares with the
+runtime image. `main` merges upstream at its npm releases, so the package is
+upstream's release of the version in `package.json` plus the patches below.
+`BULK_FORK.md` describes the line, the versions and the upstream sync.
 
 ## Patches
 
@@ -25,7 +26,7 @@ version in `package.json`. It is separate from the backend runtime fork on
 | Segmented `api.d.ts`: one `ApiFromModules` chunk per top-level folder, nested folders split again past 400 modules. Upstream's single chunk collapses to `never` near 1,950 modules in TypeScript 6 and 7 (TypeScript 5.0 does not). CommonJS codegen's `api_cjs.d.cts` is the same text, so it is segmented too. Static codegen is unpatched (see below).                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `src/cli/codegen_templates/segmented_api.ts`, `api.ts`, `component_api.ts` | `bulk-tests/segmented_api.test.ts` compares with upstream's shape on a small fixture. `bulk-tests/segmented_api_scale.test.ts` type-checks 2,621- and 4,021-module projects. |
 | Paged function spec: `npx convex function-spec`, the MCP `functionSpec` tool and `npx convex run`'s function list read `_system/cli/modules:apiSpecPage` a page at a time (Bulk runtime fork) and fall back to `apiSpec` when the backend lacks it, or for a component. One `apiSpec` response for Bulk's app is over the system result size and nesting limits. Output is unchanged.                                                                                                                                                                                                                                                                                                                                                                                                                        | `src/cli/lib/functionSpec.ts`, `run.ts`, `mcp/tools/functionSpec.ts`       | `bulk-tests/function_spec.test.ts`. The runtime fork's `npm-packages/system-udfs/scripts/api-spec-scale-test.mjs` covers the backend side.                                   |
 | MCP `functionSpec` filters: optional `identifierPrefix` (matches identifiers with or without `.js`, and HTTP route paths), `includeValidators: false` (identifiers, types and visibility only), `validatorFormat: "compact"` (TypeScript-like validator strings such as `{ id: Id<"users">, n?: int64 }`) and `maxCharacters` (default 80,000, about 20k tokens, under Claude Code's default 25k-token MCP output limit). Over the cap the tool returns an error with the compact and no-validator sizes and the largest narrower prefixes. With a prefix, the backend reads only the matching modules (`apiSpecPage`'s `pathPrefix`, from the part before `:`, or `http.js` for a route path), instead of the whole spec (about 40 MB and 15 s for Bulk's app). Small apps get the same output as upstream. | `src/cli/lib/mcp/tools/functionSpec.ts`                                    | `bulk-tests/mcp_function_spec.test.ts`                                                                                                                                       |
-| Release version `<upstream>-bulk.<n>`. `src/index.ts` keeps the upstream version, which is what the CLI and clients report to the backend.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `scripts/version-check.mjs`                                                | —                                                                                                                                                                            |
+| Release version `<upstream>-bulk.<n>`, set at pack time. `package.json` and `src/index.ts` keep the upstream version, which is what the CLI and clients report to the backend, so upstream release merges never conflict there. `version-check.mjs` accepts `<src/index.ts version>-bulk.<n>` in the packed `package.json`; the release workflow checks the tag against `main` and the merged upstream release (`node bulk/upstream.mjs status --check-release`).                                                                                                                                                                                                                                                                                                                                            | `scripts/version-check.mjs`                                                | —                                                                                                                                                                            |
 
 ### CommonJS and static codegen
 
@@ -56,6 +57,10 @@ output grows with the size of the validators, which the fixtures keep small: an
 app with large `args` or `returns` validators gets a larger file, but no
 type-level limit. Like upstream, static `api` drops a top-level folder that has
 no public functions instead of keeping it as `{}`.
+
+`bulk/patches.txt` at the repository root lists every file each patch changes,
+and `node bulk/upstream.mjs inventory` prints the package's current diff from
+upstream by patch. A patch adds its files there in the same pull request.
 
 ### What the scale tests check
 
@@ -91,18 +96,55 @@ time and 70% more memory at 4,000 modules).
 
 ## Release
 
-1. Run `pnpm install --frozen-lockfile --filter "convex..."` in `npm-packages`,
-   then `pnpm run typecheck` and `pnpm exec vitest run bulk-tests` here.
-2. Push `bulk/convex-npm`, then tag the commit
-   `convex-npm/v<package.json version>-bulk.<n>` and push the tag.
-   `.github/workflows/bulk_release_convex_npm.yml` tests, packs and publishes
-   `@bulk-platform/convex` to GitHub Packages with dist-tag `latest`. Packing
-   builds the package with `uv run --script scripts/build.py` (since upstream
-   1.48.0), so a local `npm pack` needs `uv` too.
+1. Merge the change, or the upstream sync pull request, into `main`.
+   `bulk_checks.yml` has run the type check, the build and `bulk-tests` on it.
+   To run them locally: `pnpm install --frozen-lockfile --filter "convex..."` in
+   `npm-packages`, then `pnpm run typecheck` and
+   `pnpm exec vitest run bulk-tests` here.
+2. Tag the commit on `main` with an annotated tag
+   `convex-npm/v<package.json version>-bulk.<n>` and push the tag:
+
+   ```bash
+   git fetch origin
+   git tag -a convex-npm/v1.49.0-bulk.1 origin/main -m "@bulk-platform/convex 1.49.0-bulk.1"
+   git push origin convex-npm/v1.49.0-bulk.1
+   ```
+
+   `.github/workflows/bulk_release_convex_npm.yml` checks that the tag is on
+   `main` and names `package.json`'s version, that `package.json` is the newest
+   upstream release `main` has merged, that `main` has no upstream npm-package
+   commits after that release, and that `bulk/patches.txt` is current. It then
+   tests, packs and publishes `@bulk-platform/convex` to GitHub Packages with
+   dist-tag `latest`. Packing builds the package with
+   `uv run --script scripts/build.py` (since upstream 1.48.0), so a local
+   `npm pack` needs `uv` too.
+
 3. In `bulk_v3/backend_v3`, bump the alias in `package.json`, run
    `pnpm install`, regenerate `convex/_generated` with
    `pnpm exec convex codegen` and run `pnpm run sync-types:all`. Keep Yogi's
    public `convex` at the same upstream version.
+
+`<n>` starts at 1 for each upstream release. `node bulk/upstream.mjs status`
+shows what a release from `HEAD` would contain.
+
+When `main` has merged upstream past a release (to take a runtime fix early),
+the package would ship upstream npm changes that are in no upstream release, and
+the release check fails, listing them. Release after the next upstream release
+is merged, or, after reading the listed commits, add a line
+`Allow-Unreleased-Upstream: yes` to the tag message:
+
+```bash
+git tag -a convex-npm/v1.49.0-bulk.1 origin/main -m "@bulk-platform/convex 1.49.0-bulk.1
+
+Allow-Unreleased-Upstream: yes"
+```
+
+`main` is at that point now: it merged upstream 26f96d6f3, one commit after
+1.49.0, which changes the generated management API types
+(`src/cli/generatedApi.ts`).
+
+A fix for an older line goes on a `bulk/convex-npm-<version>` maintenance branch
+and is tagged there.
 
 The first publish links the package to this repository, so it takes the
 repository's visibility. A public package cannot be made private later.
@@ -128,8 +170,12 @@ project that installs the package has this `.npmrc`:
   (`RUN --mount=type=secret,id=npm_token NODE_AUTH_TOKEN=$(cat /run/secrets/npm_token) npm ci`),
   never as a build argument.
 
-## Moving to a newer upstream release
+## Taking a newer upstream release
 
-Create a new branch from the upstream `npm release version X.Y.Z` commit,
-cherry-pick the Bulk commits from `bulk/convex-npm`, run the tests above, and
-release `X.Y.Z-bulk.1`. Keep the runtime image fork on `main` separate.
+`.github/workflows/bulk_upstream_sync.yml` opens a pull request that merges each
+new upstream npm release into `main` and runs the checks above on the merged
+tree (`BULK_FORK.md`, "Upstream sync"). After it merges, release
+`<new version>-bulk.1`. There is nothing to cherry-pick: the patches are already
+in `main`'s history, and an upstream change to a patched file shows up as a
+conflict or under "Upstream commits that change Bulk-patched files" in the pull
+request.

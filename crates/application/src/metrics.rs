@@ -1,21 +1,16 @@
-use std::time::{
-    SystemTime,
-    UNIX_EPOCH,
-};
-
+use common::types::Timestamp;
 use errors::ErrorMetadataAnyhowExt as _;
 use metrics::{
     log_counter_with_labels,
     log_distribution_with_labels,
-    log_gauge_with_labels,
     register_convex_counter,
-    register_convex_gauge,
     register_convex_histogram,
     StaticMetricLabel,
     StatusTimer,
     STATUS_LABEL,
 };
 use model::source_packages::types::PackageSize;
+use streaming_export::SyncStatus;
 
 register_convex_counter!(
     EXTERNAL_DEPS_PACKAGES_TOTAL,
@@ -118,87 +113,28 @@ pub fn log_s3_export_worker_failed(e: &anyhow::Error) {
     );
 }
 
-register_convex_gauge!(
-    S3_EXPORT_NEXT_SYNC_DUE_TIMESTAMP_SECONDS,
-    "Unix time by which a deployment's S3 export is due to sync again",
-    &["instance_name"]
+register_convex_histogram!(
+    S3_EXPORT_LAG_SECONDS,
+    "Lag between the latest database timestamp and the consistent snapshot exported by an S3 sync \
+     page",
 );
 
-register_convex_gauge!(
+register_convex_histogram!(
     S3_EXPORT_SNAPSHOT_SYNCED_TABLES,
-    "Tables finished so far by a deployment's initial S3 export snapshot",
-    &["instance_name"]
+    "Tables synced in the initial snapshot, observed after each S3 export snapshot page",
 );
 
-/// One deployment's S3 export gauges. Dropping this removes the series, so a
-/// deployment that leaves this process does not look stalled.
-pub struct S3ExportGauges {
-    instance_name: String,
-}
-
-impl S3ExportGauges {
-    pub fn new(instance_name: String) -> Self {
-        Self { instance_name }
+pub fn log_s3_export_progress(status: &SyncStatus, latest_ts: Timestamp) {
+    match status {
+        SyncStatus::Snapshotting { progress } => metrics::log_distribution(
+            &S3_EXPORT_SNAPSHOT_SYNCED_TABLES,
+            progress.num_tables_synced as f64,
+        ),
+        SyncStatus::Stale { ts } | SyncStatus::UpToDate { ts } => metrics::log_distribution(
+            &S3_EXPORT_LAG_SECONDS,
+            latest_ts.secs_since_f64(*ts).max(0.0),
+        ),
     }
-
-    fn labels(&self) -> Vec<StaticMetricLabel> {
-        vec![StaticMetricLabel::new(
-            "instance_name",
-            self.instance_name.clone(),
-        )]
-    }
-
-    /// Sets the due time only while the series is unset. A retry after a
-    /// failed page keeps the earlier due time, so an export that keeps failing
-    /// becomes overdue.
-    pub fn start(&self, now: SystemTime) {
-        let gauge =
-            S3_EXPORT_NEXT_SYNC_DUE_TIMESTAMP_SECONDS.with_label_values(&[&self.instance_name]);
-        if gauge.get() == 0.0 {
-            gauge.set(unix_seconds(now));
-        }
-    }
-
-    pub fn set_next_sync_due(&self, due: SystemTime) {
-        log_gauge_with_labels(
-            &S3_EXPORT_NEXT_SYNC_DUE_TIMESTAMP_SECONDS,
-            unix_seconds(due),
-            self.labels(),
-        );
-    }
-
-    /// `None` once the initial snapshot is done.
-    pub fn set_snapshot_tables_synced(&self, tables: Option<u64>) {
-        match tables {
-            Some(tables) => log_gauge_with_labels(
-                &S3_EXPORT_SNAPSHOT_SYNCED_TABLES,
-                tables as f64,
-                self.labels(),
-            ),
-            None => {
-                let _ =
-                    S3_EXPORT_SNAPSHOT_SYNCED_TABLES.remove_label_values(&[&self.instance_name]);
-            },
-        }
-    }
-
-    pub fn clear(&self) {
-        let _ =
-            S3_EXPORT_NEXT_SYNC_DUE_TIMESTAMP_SECONDS.remove_label_values(&[&self.instance_name]);
-        self.set_snapshot_tables_synced(None);
-    }
-}
-
-impl Drop for S3ExportGauges {
-    fn drop(&mut self) {
-        self.clear();
-    }
-}
-
-fn unix_seconds(time: SystemTime) -> f64 {
-    time.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
 }
 
 // Joins the `app_metrics_seed_*` family (conductor emits the rest) so it

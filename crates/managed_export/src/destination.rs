@@ -24,19 +24,32 @@ use aws_sdk_glue::types::{
 };
 use aws_sdk_s3::{
     config::{
+        http::HttpResponse,
         BehaviorVersion,
         Region,
     },
-    error::SdkError,
+    error::{
+        ProvideErrorMetadata,
+        SdkError,
+    },
     primitives::ByteStream,
 };
 use errors::ErrorMetadata;
+use iceberg::spec::{
+    PrimitiveType,
+    Schema,
+    TableMetadata,
+    Type,
+};
 use serde::{
     Deserialize,
     Serialize,
 };
 
-use crate::iceberg::S3Destination;
+use crate::iceberg::{
+    Format,
+    S3Destination,
+};
 
 const EXPORT_ID_PARAMETER: &str = "convex.export-id";
 const PAGE_PARAMETER: &str = "convex.page";
@@ -46,6 +59,10 @@ pub struct ExportState {
     /// The `_log_sinks` document of the export that wrote this state. A
     /// different ID means the export was recreated, so the state is ignored.
     pub export_id: String,
+    /// The format of the export's Iceberg tables, for life. A state from
+    /// before this field is in the JSON format, the only one that existed then.
+    #[serde(default = "default_format")]
+    pub format: Format,
     /// Number of pages committed by this export.
     pub page: u64,
     /// Base64 `SyncCursor` after page `page`. `None` before the first page.
@@ -57,10 +74,16 @@ pub struct ExportState {
     pub retired: BTreeSet<String>,
 }
 
+fn default_format() -> Format {
+    Format::Json
+}
+
 impl ExportState {
+    /// A state with no pages, in the format new exports start in.
     pub fn fresh(export_id: &str) -> Self {
         Self {
             export_id: export_id.to_owned(),
+            format: Format::Typed,
             page: 0,
             cursor: None,
             tables: BTreeMap::new(),
@@ -77,6 +100,7 @@ impl ExportState {
     ) -> Self {
         Self {
             export_id: self.export_id.clone(),
+            format: self.format,
             page: self.page + 1,
             cursor: Some(cursor),
             tables,
@@ -110,7 +134,7 @@ impl ExportStore {
         let credentials = Credentials::new(
             destination.access_key_id.clone(),
             destination.secret_access_key.clone(),
-            None,
+            destination.session_token.clone(),
             None,
             "convex-export",
         );
@@ -151,7 +175,7 @@ impl ExportStore {
             Err(error) if error.as_service_error().is_some_and(|e| e.is_no_such_key()) => {
                 return Ok(None);
             },
-            Err(error) => return Err(error).context("Cannot read the export state"),
+            Err(error) => return Err(aws_error(error, "read the export state")),
         };
         let etag = output.e_tag.clone().context("Export state has no ETag")?;
         let bytes = output.body.collect().await?.into_bytes();
@@ -186,7 +210,7 @@ impl ExportStore {
                     "Another writer changed the export state",
                 ))
             },
-            Err(error) => Err(error).context("Cannot write the export state"),
+            Err(error) => Err(aws_error(error, "write the export state")),
         }
     }
 
@@ -204,19 +228,21 @@ impl ExportStore {
             .into_paginator()
             .send();
         while let Some(page) = pages.next().await {
-            for table in page.context("Cannot list Glue tables")?.table_list() {
+            let page = page.map_err(|e| aws_error(e, "list the Glue tables"))?;
+            for table in page.table_list() {
                 published.insert(table.name().to_owned(), table.clone());
             }
         }
         for (name, location) in &state.tables {
             let Some(current) = published.remove(name) else {
+                let columns = self.read_glue_columns(location).await?;
                 self.glue
                     .create_table()
                     .database_name(&self.database)
-                    .table_input(table_input(name, location, None, state)?)
+                    .table_input(table_input(name, location, None, columns, state)?)
                     .send()
                     .await
-                    .context("Cannot create a Glue table")?;
+                    .map_err(|e| aws_error(e, "create a Glue table"))?;
                 continue;
             };
             let parameters = current.parameters.unwrap_or_default();
@@ -225,16 +251,20 @@ impl ExportStore {
             if previous == Some(location) || state.published(&parameters) {
                 continue;
             }
+            let columns = self.read_glue_columns(location).await?;
             let mut update = self
                 .glue
                 .update_table()
                 .database_name(&self.database)
-                .table_input(table_input(name, location, previous, state)?)
+                .table_input(table_input(name, location, previous, columns, state)?)
                 .skip_archive(true);
             if let Some(version_id) = current.version_id {
                 update = update.version_id(version_id);
             }
-            update.send().await.context("Cannot update a Glue table")?;
+            update
+                .send()
+                .await
+                .map_err(|e| aws_error(e, "update a Glue table"))?;
         }
         for (name, table) in published {
             if table.parameters().is_some_and(|p| state.published(p)) {
@@ -246,9 +276,32 @@ impl ExportStore {
                 .name(name)
                 .send()
                 .await
-                .context("Cannot drop a Glue table")?;
+                .map_err(|e| aws_error(e, "drop a Glue table"))?;
         }
         Ok(())
+    }
+
+    /// The Glue columns for the table whose current metadata file is at
+    /// `metadata_location`. Athena reads the Iceberg schema itself, but the
+    /// Glue console, crawlers and Lake Formation show the Glue columns.
+    async fn read_glue_columns(&self, metadata_location: &str) -> Result<Vec<Column>> {
+        let key = metadata_location
+            .strip_prefix(&format!("s3://{}/", self.bucket))
+            .with_context(|| {
+                format!("Metadata location {metadata_location} is outside the bucket")
+            })?;
+        let output = self
+            .s3
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| aws_error(e, "read a table's metadata"))?;
+        let bytes = output.body.collect().await?.into_bytes();
+        let metadata: TableMetadata =
+            serde_json::from_slice(&bytes).context("Cannot parse a table's metadata")?;
+        glue_columns(metadata.current_schema())
     }
 
     async fn ensure_database(&self) -> Result<()> {
@@ -267,15 +320,75 @@ impl ExportStore {
             {
                 Ok(())
             },
-            Err(error) => Err(error).context("Cannot create the Glue database"),
+            Err(error) => Err(aws_error(error, "create the Glue database")),
         }
     }
+}
+
+/// AWS error codes that mean the customer's bucket, role or region is set up
+/// wrong. Retrying does not fix them; the customer has to.
+const DESTINATION_ERROR_CODES: &[&str] = &[
+    "AccessDenied",
+    "AccessDeniedException",
+    "AuthorizationHeaderMalformed",
+    "NoSuchBucket",
+    "PermanentRedirect",
+];
+
+/// Wraps an S3 or Glue error. An error the customer must fix in AWS becomes a
+/// user error, so the export shows it instead of retrying silently.
+fn aws_error<E>(error: SdkError<E, HttpResponse>, action: &str) -> anyhow::Error
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    let code = error.code().map(str::to_owned);
+    let detail = error.message().map(str::to_owned);
+    let error = anyhow::Error::new(error).context(format!("Cannot {action}"));
+    match code {
+        Some(code) if DESTINATION_ERROR_CODES.contains(&code.as_str()) => {
+            error.context(ErrorMetadata::bad_request(
+                "S3ExportDestinationError",
+                format!(
+                    "AWS did not let Convex {action}: {code}{}",
+                    detail.map(|d| format!(" ({d})")).unwrap_or_default()
+                ),
+            ))
+        },
+        _ => error,
+    }
+}
+
+/// Glue's Hive type names for the primitive types the export writes. Nested
+/// values are stored as JSON strings, so nested types never appear.
+fn glue_columns(schema: &Schema) -> Result<Vec<Column>> {
+    schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| {
+            let kind = match &*field.field_type {
+                Type::Primitive(PrimitiveType::String) => "string",
+                Type::Primitive(PrimitiveType::Long) => "bigint",
+                Type::Primitive(PrimitiveType::Double) => "double",
+                Type::Primitive(PrimitiveType::Boolean) => "boolean",
+                Type::Primitive(PrimitiveType::Binary) => "binary",
+                Type::Primitive(PrimitiveType::Timestamptz) => "timestamp",
+                other => bail!("Column {} has unsupported type {other}", field.name),
+            };
+            Ok(Column::builder()
+                .name(&field.name)
+                .r#type(kind)
+                .set_comment(field.doc.clone())
+                .build()?)
+        })
+        .collect()
 }
 
 fn table_input(
     name: &str,
     metadata_location: &str,
     previous: Option<&str>,
+    columns: Vec<Column>,
     state: &ExportState,
 ) -> Result<TableInput> {
     let location = metadata_location
@@ -291,16 +404,6 @@ fn table_input(
     if let Some(previous) = previous {
         parameters.insert("previous_metadata_location".to_owned(), previous.to_owned());
     }
-    // The columns mirror `change_log_schema`, which never changes.
-    let columns = [
-        ("_id", "string"),
-        ("ts", "bigint"),
-        ("deleted", "boolean"),
-        ("payload", "string"),
-    ]
-    .into_iter()
-    .map(|(name, kind)| Column::builder().name(name).r#type(kind).build())
-    .collect::<Result<Vec<_>, _>>()?;
     Ok(TableInput::builder()
         .name(name)
         .table_type("EXTERNAL_TABLE")

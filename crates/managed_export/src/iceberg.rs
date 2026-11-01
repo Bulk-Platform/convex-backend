@@ -1,25 +1,8 @@
-use std::{
-    collections::HashMap,
-    sync::Arc,
-};
+use std::collections::HashMap;
 
 use anyhow::Result;
-use arrow_iceberg::{
-    ArrayRef,
-    BooleanArray,
-    Int64Array,
-    RecordBatch,
-    StringArray,
-};
 use iceberg::{
-    arrow::schema_to_arrow_schema,
-    spec::{
-        DataFileFormat,
-        NestedField,
-        PrimitiveType,
-        Schema,
-        Type,
-    },
+    spec::DataFileFormat,
     table::Table,
     transaction::{
         ApplyTransactionAction,
@@ -41,7 +24,21 @@ use iceberg::{
     Catalog,
 };
 use parquet_iceberg::file::properties::WriterProperties;
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use strum::{
+    Display,
+    EnumString,
+    IntoStaticStr,
+};
+use value::ConvexObject;
 
+#[path = "columns.rs"]
+pub mod columns;
+#[path = "json.rs"]
+mod json;
 #[path = "iceberg_writer.rs"]
 mod writer;
 pub use writer::{
@@ -50,58 +47,63 @@ pub use writer::{
     SourceTable,
 };
 
-/// One document revision in a table's change log. A `None` payload records a
+/// How a table lays out a document. An export keeps the format it started
+/// with, so its stream never pauses for a format change. New exports start in
+/// `Typed`. The string form is the `convex.porter.encoding` table property and
+/// the `format` field of the export's state.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Display, EnumString, IntoStaticStr, Serialize, Deserialize,
+)]
+#[serde(into = "&'static str", try_from = "String")]
+pub enum Format {
+    /// `_id`, `ts`, `deleted`, and the whole document in a JSON `payload`.
+    #[strum(serialize = "convex-change-log-json-v1")]
+    Json,
+    /// Metadata columns, then one typed column per top-level document field.
+    #[strum(serialize = "convex-change-log-typed-v1")]
+    Typed,
+}
+
+impl TryFrom<String> for Format {
+    type Error = strum::ParseError;
+
+    fn try_from(encoding: String) -> Result<Self, Self::Error> {
+        encoding.parse()
+    }
+}
+
+/// One document revision in a table's change log. A `None` document records a
 /// deletion.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Change {
     pub id: String,
     pub ts: u64,
-    pub payload: Option<String>,
+    pub document: Option<ConvexObject>,
 }
 
-/// Every revision is a row; readers take the latest `ts` per `_id` and skip
-/// deleted rows.
-pub(crate) fn change_log_schema() -> Result<Schema> {
-    Ok(Schema::builder()
-        .with_fields(vec![
-            NestedField::required(1, "_id", Type::Primitive(PrimitiveType::String)).into(),
-            NestedField::required(2, "ts", Type::Primitive(PrimitiveType::Long)).into(),
-            NestedField::required(3, "deleted", Type::Primitive(PrimitiveType::Boolean)).into(),
-            NestedField::optional(4, "payload", Type::Primitive(PrimitiveType::String)).into(),
-        ])
-        .build()?)
-}
-
-/// Appends `changes` to `table` as one snapshot and returns the table with the
-/// bytes of Parquet written. On a conflict the commit reloads the table and
-/// reapplies the append, so concurrent writers both land and a retried page
-/// can repeat rows; readers deduplicate on (`_id`, `ts`).
+/// Appends `changes` to `table` as one snapshot, after adding the columns they
+/// need in the typed format, and returns the table with the bytes of Parquet
+/// written. Every revision is a row; readers take the latest timestamp per
+/// `_id` and skip deleted rows. A retried page can repeat rows, so readers
+/// deduplicate on (`_id`, timestamp).
 #[fastrace::trace]
 pub(crate) async fn append(
     catalog: &dyn Catalog,
     table: &Table,
     changes: &[Change],
     snapshot_properties: &HashMap<String, String>,
+    format: Format,
 ) -> Result<(Table, u64)> {
+    let (table, batch) = match format {
+        Format::Json => (table.clone(), json::batch(changes)?),
+        Format::Typed => {
+            let table = columns::add_columns(catalog, table, changes).await?;
+            let batch = columns::batch(table.metadata().current_schema(), changes)?;
+            (table, batch)
+        },
+    };
+    let table = &table;
     let schema = table.metadata().current_schema().clone();
-    let batch = RecordBatch::try_new(
-        Arc::new(schema_to_arrow_schema(&schema)?),
-        vec![
-            Arc::new(StringArray::from_iter_values(changes.iter().map(|c| &c.id))) as ArrayRef,
-            Arc::new(Int64Array::from(
-                changes
-                    .iter()
-                    .map(|c| i64::try_from(c.ts))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )),
-            Arc::new(BooleanArray::from_iter(
-                changes.iter().map(|c| Some(c.payload.is_none())),
-            )),
-            Arc::new(StringArray::from_iter(
-                changes.iter().map(|c| c.payload.as_deref()),
-            )),
-        ],
-    )?;
     let mut writer =
         DataFileWriterBuilder::new(RollingFileWriterBuilder::new_with_default_file_size(
             ParquetWriterBuilder::new(WriterProperties::default(), schema),

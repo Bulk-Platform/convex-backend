@@ -198,7 +198,7 @@ impl From<HttpRequest> for HttpRequestStream {
     fn from(value: HttpRequest) -> Self {
         let body = value.body.map(|b| {
             Box::pin(futures::stream::once(async move { Ok(b) }))
-                as Pin<Box<dyn Stream<Item = anyhow::Result<bytes::Bytes>> + Sync + Send>>
+                as Pin<Box<dyn Stream<Item = anyhow::Result<bytes::Bytes>> + Send>>
         });
 
         Self {
@@ -234,8 +234,8 @@ pub struct HttpRequestStream {
     /// by inspecting the stream, because the stream may be a full-duplex
     /// body whose first chunk is only produced after the response headers
     /// arrive.
-    pub body: Option<Pin<Box<dyn Stream<Item = anyhow::Result<bytes::Bytes>> + Sync + Send>>>,
-    pub signal: Pin<Box<dyn Future<Output = ()> + Sync + Send + 'static>>,
+    pub body: Option<Pin<Box<dyn Stream<Item = anyhow::Result<bytes::Bytes>> + Send>>>,
+    pub signal: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
 }
 
 impl std::fmt::Debug for HttpRequestStream {
@@ -1089,40 +1089,6 @@ where
             .map(|s| s.to_owned());
         let user_agent = user_agent.map(ClientUserAgent::from);
         Ok(ExtractRequestMetadata(RequestMetadata { ip, user_agent }))
-    }
-}
-
-#[allow(clippy::declare_interior_mutable_const)]
-pub const CONVEX_CHEF_DEPLOY_SECRET_HEADER: HeaderName =
-    HeaderName::from_static("convex-chef-deploy-secret");
-
-pub struct ExtractChefDeploySecret(pub String);
-
-fn chef_deploy_secret_from_req_parts(
-    parts: &mut axum::http::request::Parts,
-) -> anyhow::Result<String> {
-    parts
-        .headers
-        .get(CONVEX_CHEF_DEPLOY_SECRET_HEADER)
-        .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
-        .context(ErrorMetadata::bad_request(
-            "InvalidChefDeploySecret",
-            "convex-chef-deploy-secret header is not set",
-        ))
-}
-
-impl<S> FromRequestParts<S> for ExtractChefDeploySecret
-where
-    S: Send + Sync,
-{
-    type Rejection = HttpResponseError;
-
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        let shared_secret = chef_deploy_secret_from_req_parts(parts)?;
-        Ok(Self(shared_secret))
     }
 }
 

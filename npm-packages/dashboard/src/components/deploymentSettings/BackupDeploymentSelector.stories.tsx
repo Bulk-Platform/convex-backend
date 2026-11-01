@@ -37,6 +37,7 @@ const mockProjects: ProjectResponse[] = [
     teamId: 1,
     teamSlug: "test-team",
     createTime: Date.now() - 30 * 24 * 60 * 60 * 1000,
+    tags: [],
   },
   {
     id: 2,
@@ -45,6 +46,7 @@ const mockProjects: ProjectResponse[] = [
     teamId: 1,
     teamSlug: "test-team",
     createTime: Date.now() - 60 * 24 * 60 * 60 * 1000,
+    tags: [],
   },
 ];
 
@@ -290,6 +292,7 @@ const generateManyProjects = (
       teamId: 1,
       teamSlug: "test-team",
       createTime: Date.now() - index * 24 * 60 * 60 * 1000,
+      tags: [],
     };
   });
 };

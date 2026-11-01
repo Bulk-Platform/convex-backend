@@ -123,7 +123,9 @@ export function S3ExportStatus({ existing }: { existing: S3Export }) {
             </>
           ) : (
             <>
-              {isStarting(existing) ? (
+              {needsRoleArn(existing) ? (
+                <HealthLabel type="pending">Finish AWS setup</HealthLabel>
+              ) : isStarting(existing) ? (
                 <HealthLabel type="pending">Starting first sync</HealthLabel>
               ) : (
                 <HealthIndicator status={existing.status} />
@@ -157,6 +159,11 @@ function S3ExportDetails({ existing }: { existing: S3Export }) {
     <div className="flex flex-col gap-4 py-3 text-xs">
       {status ? (
         <SyncProgress status={status} />
+      ) : needsRoleArn(existing) ? (
+        <p className="font-medium">
+          Waiting for the role ARN. Edit the export to launch the CloudFormation
+          stack and paste it.
+        </p>
       ) : isStarting(existing) ? (
         <div className="flex items-center gap-1.5">
           {/* `Spinner` defaults to `ml-auto` for use as a trailing element. */}
@@ -185,7 +192,7 @@ function S3ExportDetails({ existing }: { existing: S3Export }) {
         <dt className="text-content-secondary">S3 location</dt>
         <dd className="min-w-0 break-all">
           <Link
-            href={`https://s3.console.aws.amazon.com/s3/buckets/${bucket}?region=${region}&prefix=${encodeURIComponent(dataLakePath)}`}
+            href={`https://s3.console.aws.amazon.com/s3/buckets/${bucket}?region=${encodeURIComponent(region)}&prefix=${encodeURIComponent(dataLakePath)}`}
             target="_blank"
             className="inline-flex items-center gap-1"
           >
@@ -196,7 +203,7 @@ function S3ExportDetails({ existing }: { existing: S3Export }) {
         <dt className="text-content-secondary">Glue database</dt>
         <dd className="min-w-0 break-all">
           <Link
-            href={`https://${region}.console.aws.amazon.com/glue/home?region=${region}#/v2/data-catalog/databases/view/${database}`}
+            href={`https://console.aws.amazon.com/glue/home?region=${encodeURIComponent(region)}#/v2/data-catalog/databases/view/${database}`}
             target="_blank"
             className="inline-flex items-center gap-1"
           >
@@ -206,6 +213,16 @@ function S3ExportDetails({ existing }: { existing: S3Export }) {
         </dd>
       </dl>
     </div>
+  );
+}
+
+// A role export the admin has not finished on the AWS side. A failure or a
+// deletion in progress says more, so those statuses win.
+export function needsRoleArn(existing: S3Export) {
+  return (
+    existing.config.roleArn === "" &&
+    existing.status.type !== "failed" &&
+    existing.status.type !== "deleting"
   );
 }
 

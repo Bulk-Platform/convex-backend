@@ -1,4 +1,28 @@
-use std::collections::HashMap;
+use std::{
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
+    sync::atomic::{
+        AtomicUsize,
+        Ordering,
+    },
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use common::shapes::reduced::{
+    ReducedField,
+    ReducedShape,
+};
+use iceberg::{
+    Namespace,
+    TableCommit,
+};
+use tokio::sync::{
+    Notify,
+    Semaphore,
+};
 
 use super::{
     super::tests::{
@@ -33,6 +57,7 @@ async fn open_selecting(
         "convex_chess_wandering_fish_513",
         "memory://warehouse",
         selected,
+        Format::Typed,
     )
     .await
 }
@@ -45,6 +70,261 @@ async fn changes(writer: &IcebergChangeWriter, table: &str) -> Result<Vec<Change
     read(&writer.catalog.load_table(&ident).await?).await
 }
 
+#[derive(Debug)]
+struct BlockingCatalog {
+    inner: Arc<dyn Catalog>,
+    active_loads: AtomicUsize,
+    max_active_loads: AtomicUsize,
+    started: Notify,
+    gate: Semaphore,
+    fail_table: Option<String>,
+}
+
+impl BlockingCatalog {
+    fn new(inner: Arc<dyn Catalog>, fail_table: Option<String>) -> Self {
+        Self {
+            inner,
+            active_loads: AtomicUsize::new(0),
+            max_active_loads: AtomicUsize::new(0),
+            started: Notify::new(),
+            gate: Semaphore::new(0),
+            fail_table,
+        }
+    }
+}
+
+struct ActiveLoad<'a>(&'a AtomicUsize);
+
+impl Drop for ActiveLoad<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Catalog for BlockingCatalog {
+    async fn list_namespaces(
+        &self,
+        parent: Option<&NamespaceIdent>,
+    ) -> iceberg::Result<Vec<NamespaceIdent>> {
+        self.inner.list_namespaces(parent).await
+    }
+
+    async fn create_namespace(
+        &self,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
+    ) -> iceberg::Result<Namespace> {
+        self.inner.create_namespace(namespace, properties).await
+    }
+
+    async fn get_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<Namespace> {
+        self.inner.get_namespace(namespace).await
+    }
+
+    async fn namespace_exists(&self, namespace: &NamespaceIdent) -> iceberg::Result<bool> {
+        self.inner.namespace_exists(namespace).await
+    }
+
+    async fn update_namespace(
+        &self,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
+    ) -> iceberg::Result<()> {
+        self.inner.update_namespace(namespace, properties).await
+    }
+
+    async fn drop_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<()> {
+        self.inner.drop_namespace(namespace).await
+    }
+
+    async fn list_tables(&self, namespace: &NamespaceIdent) -> iceberg::Result<Vec<TableIdent>> {
+        self.inner.list_tables(namespace).await
+    }
+
+    async fn create_table(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> iceberg::Result<Table> {
+        self.inner.create_table(namespace, creation).await
+    }
+
+    async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
+        let active = self.active_loads.fetch_add(1, Ordering::SeqCst) + 1;
+        let _active = ActiveLoad(&self.active_loads);
+        self.max_active_loads.fetch_max(active, Ordering::SeqCst);
+        self.started.notify_one();
+        if self.fail_table.as_deref() == Some(table.name()) {
+            return Err(iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                "injected load failure",
+            ));
+        }
+        let _permit = self.gate.acquire().await.expect("the test gate stays open");
+        self.inner.load_table(table).await
+    }
+
+    async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+        self.inner.drop_table(table).await
+    }
+
+    async fn purge_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+        self.inner.purge_table(table).await
+    }
+
+    async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
+        self.inner.table_exists(table).await
+    }
+
+    async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> iceberg::Result<()> {
+        self.inner.rename_table(src, dest).await
+    }
+
+    async fn register_table(
+        &self,
+        table: &TableIdent,
+        metadata_location: String,
+    ) -> iceberg::Result<Table> {
+        self.inner.register_table(table, metadata_location).await
+    }
+
+    async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
+        self.inner.update_table(commit).await
+    }
+}
+
+#[tokio::test]
+async fn table_appends_overlap_with_bounded_concurrency() -> Result<()> {
+    let concurrency = *S3_EXPORT_MAX_CONCURRENT_TABLE_WRITES;
+    let catalog = memory_catalog().await?;
+    let sources: Vec<_> = (0..2 * concurrency + 3)
+        .map(|i| source(&format!("table_{i:02}")))
+        .collect();
+    open(catalog.clone())
+        .await?
+        .apply(&sources, vec![], BTreeMap::new())
+        .await?;
+    let blocking = Arc::new(BlockingCatalog::new(catalog.clone(), None));
+    let mut writer = open(blocking.clone()).await?;
+    writer.snapshot_properties = HashMap::from([("convex.page".to_owned(), "7".to_owned())]);
+    let entries = sources
+        .iter()
+        .flat_map(|source| {
+            [
+                (source.clone(), change("document", 1, Some("{}"))),
+                (source.clone(), change("document", 2, None)),
+            ]
+        })
+        .collect();
+    let task = tokio::spawn(async move {
+        writer.apply(&[], entries, BTreeMap::new()).await?;
+        Ok::<_, anyhow::Error>(writer)
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let started = blocking.started.notified();
+            if blocking.active_loads.load(Ordering::SeqCst) >= concurrency {
+                break;
+            }
+            started.await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        blocking.max_active_loads.load(Ordering::SeqCst),
+        concurrency
+    );
+    assert!(!task.is_finished());
+    blocking.gate.add_permits(concurrency);
+    let writer = tokio::time::timeout(Duration::from_secs(5), task).await???;
+    assert_eq!(blocking.active_loads.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        blocking.max_active_loads.load(Ordering::SeqCst),
+        concurrency
+    );
+    assert_eq!(writer.locations().len(), sources.len());
+    assert!(writer.bytes_written() > 0);
+    for source in sources {
+        let table = catalog
+            .load_table(&TableIdent::new(
+                writer.namespace.clone(),
+                IcebergChangeWriter::table_name(&source)?,
+            ))
+            .await?;
+        assert_eq!(
+            read(&table).await?,
+            vec![
+                change("document", 1, Some("{}")),
+                change("document", 2, None)
+            ]
+        );
+        assert_eq!(
+            writer.locations()[table.identifier().name()],
+            table.metadata_location_result()?
+        );
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .additional_properties["convex.page"],
+            "7"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_table_cancels_pending_appends_and_preserves_locations() -> Result<()> {
+    let concurrency = *S3_EXPORT_MAX_CONCURRENT_TABLE_WRITES;
+    let catalog = memory_catalog().await?;
+    let sources: Vec<_> = (0..concurrency)
+        .map(|i| source(&format!("table_{i:02}")))
+        .collect();
+    let mut initial = open(catalog.clone()).await?;
+    initial.apply(&sources, vec![], BTreeMap::new()).await?;
+    let blocking = Arc::new(BlockingCatalog::new(
+        catalog.clone(),
+        Some(IcebergChangeWriter::table_name(sources.last().unwrap())?),
+    ));
+    let mut writer = open(blocking.clone()).await?;
+    writer.locations = initial.locations().clone();
+    let error = writer
+        .apply(
+            &[],
+            sources
+                .iter()
+                .map(|source| (source.clone(), change("document", 1, Some("{}"))))
+                .collect(),
+            BTreeMap::new(),
+        )
+        .await
+        .expect_err("one failed table must fail the page");
+    assert!(
+        error.to_string().contains("injected load failure"),
+        "{error:#}"
+    );
+    assert_eq!(
+        blocking.max_active_loads.load(Ordering::SeqCst),
+        concurrency
+    );
+    assert_eq!(blocking.active_loads.load(Ordering::SeqCst), 0);
+    assert_eq!(writer.locations(), initial.locations());
+    assert_eq!(writer.bytes_written(), 0);
+    for source in sources {
+        let table = catalog
+            .load_table(&TableIdent::new(
+                initial.namespace.clone(),
+                IcebergChangeWriter::table_name(&source)?,
+            ))
+            .await?;
+        assert!(read(&table).await?.is_empty());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn truncates_recreate_tables_and_changes_append() -> Result<()> {
     let catalog = memory_catalog().await?;
@@ -53,10 +333,15 @@ async fn truncates_recreate_tables_and_changes_append() -> Result<()> {
         .apply(
             &[source("menu"), source("empty")],
             vec![(source("menu"), change("burger", 10, Some("10")))],
+            BTreeMap::new(),
         )
         .await?;
     writer
-        .apply(&[], vec![(source("menu"), change("burger", 12, None))])
+        .apply(
+            &[],
+            vec![(source("menu"), change("burger", 12, None))],
+            BTreeMap::new(),
+        )
         .await?;
     assert_eq!(
         changes(&writer, "menu").await?,
@@ -71,6 +356,7 @@ async fn truncates_recreate_tables_and_changes_append() -> Result<()> {
         .apply(
             &[source("menu")],
             vec![(source("menu"), change("soup", 5, Some("6")))],
+            BTreeMap::new(),
         )
         .await?;
     assert_eq!(
@@ -83,6 +369,7 @@ async fn truncates_recreate_tables_and_changes_append() -> Result<()> {
         .apply(
             &[],
             vec![(source("menu"), change("burger", 20, Some("12")))],
+            BTreeMap::new(),
         )
         .await?;
     assert_eq!(
@@ -104,6 +391,7 @@ async fn locations_track_every_commit_and_summaries_name_the_page() -> Result<()
         .apply(
             &[source("menu"), source("empty")],
             vec![(source("menu"), change("burger", 10, Some("10")))],
+            BTreeMap::new(),
         )
         .await?;
     for name in ["app__menu", "app__empty"] {
@@ -122,7 +410,9 @@ async fn locations_track_every_commit_and_summaries_name_the_page() -> Result<()
     let after_one_row = writer.bytes_written();
     assert!(after_one_row > 0, "one Parquet file was written");
 
-    writer.apply(&[source("menu")], vec![]).await?;
+    writer
+        .apply(&[source("menu")], vec![], BTreeMap::new())
+        .await?;
     assert_eq!(
         writer.bytes_written(),
         after_one_row,
@@ -146,7 +436,11 @@ async fn names_follow_components_and_keep_case_in_directories() -> Result<()> {
     let mut writer = open(memory_catalog().await?).await?;
     let node = component_source("aggregate/inner", "btreeNode");
     writer
-        .apply(&[source("authRefreshTokens"), node.clone()], vec![])
+        .apply(
+            &[source("authRefreshTokens"), node.clone()],
+            vec![],
+            BTreeMap::new(),
+        )
         .await?;
     assert_eq!(writer.tables.len(), 2);
     for (source, name, location) in [
@@ -172,12 +466,14 @@ async fn names_follow_components_and_keep_case_in_directories() -> Result<()> {
 async fn colliding_sources_fail_before_any_write() -> Result<()> {
     let mut writer = open(memory_catalog().await?).await?;
     let error = writer
-        .apply(&[source("Users"), source("users")], vec![])
+        .apply(&[source("Users"), source("users")], vec![], BTreeMap::new())
         .await
         .expect_err("a colliding page must be rejected");
     assert!(error.to_string().contains("both map to"), "{error:#}");
     assert!(writer.tables.is_empty());
-    writer.apply(&[source("menu")], vec![]).await?;
+    writer
+        .apply(&[source("menu")], vec![], BTreeMap::new())
+        .await?;
     let error = open_selecting(
         writer.catalog.clone(),
         vec![source("Users"), source("users")],
@@ -204,6 +500,7 @@ async fn a_new_table_replaces_a_leftover_with_the_same_name() -> Result<()> {
         .apply(
             &[source("Users")],
             vec![(source("Users"), change("ada", 1, Some("{}")))],
+            BTreeMap::new(),
         )
         .await?;
     for replacement in [source("users"), component_source("app", "users")] {
@@ -212,6 +509,7 @@ async fn a_new_table_replaces_a_leftover_with_the_same_name() -> Result<()> {
             .apply(
                 &[],
                 vec![(replacement.clone(), change("grace", 2, Some("{}")))],
+                BTreeMap::new(),
             )
             .await
             .expect_err("a different source must truncate before reusing a Glue name");
@@ -223,6 +521,7 @@ async fn a_new_table_replaces_a_leftover_with_the_same_name() -> Result<()> {
             .apply(
                 std::slice::from_ref(&replacement),
                 vec![(replacement.clone(), change("grace", 2, Some("{}")))],
+                BTreeMap::new(),
             )
             .await?;
         assert_eq!(writer.tables.keys().collect::<Vec<_>>(), [&replacement]);
@@ -239,7 +538,7 @@ async fn retirement_follows_the_selection() -> Result<()> {
     let catalog = memory_catalog().await?;
     let mut writer = open(catalog).await?;
     writer
-        .apply(&[source("menu"), source("orders")], vec![])
+        .apply(&[source("menu"), source("orders")], vec![], BTreeMap::new())
         .await?;
     let retired = |writer: &IcebergChangeWriter, table: &str| {
         writer.tables[&source(table)]
@@ -268,7 +567,7 @@ async fn foreign_tables_are_checked_when_used_or_reconciled() -> Result<()> {
             &NamespaceIdent::new("convex_chess_wandering_fish_513".to_owned()),
             TableCreation::builder()
                 .name("app__menu".to_owned())
-                .schema(change_log_schema()?)
+                .schema(metadata_schema()?)
                 .build(),
         )
         .await?;
@@ -277,17 +576,22 @@ async fn foreign_tables_are_checked_when_used_or_reconciled() -> Result<()> {
         .apply(
             &[],
             vec![(source("orders"), change("order", 1, Some("{}")))],
+            BTreeMap::new(),
         )
         .await?;
     assert_eq!(changes(&writer, "orders").await?.len(), 1);
 
     let error = writer
-        .apply(&[], vec![(source("menu"), change("burger", 1, Some("{}")))])
+        .apply(
+            &[],
+            vec![(source("menu"), change("burger", 1, Some("{}")))],
+            BTreeMap::new(),
+        )
         .await
         .expect_err("appending to a foreign table must fail");
     assert!(error.to_string().contains("not written by"), "{error:#}");
     let error = writer
-        .apply(&[source("menu")], vec![])
+        .apply(&[source("menu")], vec![], BTreeMap::new())
         .await
         .expect_err("truncating a foreign table must fail");
     assert!(error.to_string().contains("not written by"), "{error:#}");
@@ -304,7 +608,7 @@ async fn a_known_retired_set_loads_only_the_tables_a_page_uses() -> Result<()> {
     let catalog = memory_catalog().await?;
     let mut writer = open(catalog.clone()).await?;
     writer
-        .apply(&[source("menu"), source("orders")], vec![])
+        .apply(&[source("menu"), source("orders")], vec![], BTreeMap::new())
         .await?;
     writer
         .retire_unselected(&[source("menu"), source("orders")])
@@ -332,7 +636,11 @@ async fn a_known_retired_set_loads_only_the_tables_a_page_uses() -> Result<()> {
     };
 
     writer
-        .apply(&[], vec![(source("menu"), change("burger", 1, Some("{}")))])
+        .apply(
+            &[],
+            vec![(source("menu"), change("burger", 1, Some("{}")))],
+            BTreeMap::new(),
+        )
         .await?;
     writer
         .retire_unselected(&[source("menu"), source("orders")])
@@ -348,6 +656,109 @@ async fn a_known_retired_set_loads_only_the_tables_a_page_uses() -> Result<()> {
     assert_eq!(
         writer.tables[&source("orders")].metadata().properties()[RETIRED_PROPERTY],
         "true"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_export_in_the_json_format_keeps_its_payload_column() -> Result<()> {
+    let catalog = memory_catalog().await?;
+    let mut writer = IcebergChangeWriter::open(
+        catalog.clone(),
+        "convex_chess_wandering_fish_513",
+        "memory://warehouse",
+        vec![],
+        Format::Json,
+    )
+    .await?;
+    writer
+        .apply(
+            &[],
+            vec![(source("menu"), change("burger", 10, Some("10")))],
+            BTreeMap::new(),
+        )
+        .await?;
+    let ident = TableIdent::new(
+        writer.namespace.clone(),
+        IcebergChangeWriter::table_name(&source("menu"))?,
+    );
+    let table = catalog.load_table(&ident).await?;
+    assert_eq!(
+        table.metadata().current_schema().as_struct(),
+        json::change_log_schema()?.as_struct()
+    );
+    assert_eq!(
+        table.metadata().properties()[FORMAT_PROPERTY],
+        "convex-change-log-json-v1"
+    );
+    // A typed writer stops at a JSON table instead of appending to it.
+    let mut typed = open(catalog).await?;
+    let error = typed
+        .apply(
+            &[],
+            vec![(source("menu"), change("soup", 11, None))],
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("convex-change-log-json-v1"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_new_table_starts_with_its_seeds() -> Result<()> {
+    let catalog = memory_catalog().await?;
+    let mut writer = open(catalog.clone()).await?;
+    let page = vec![(source("menu"), change("burger", 10, Some("10")))];
+    assert_eq!(
+        writer.new_tables(&[source("empty")], &page)?,
+        BTreeSet::from([source("empty"), source("menu")])
+    );
+    let shape = ReducedShape::Object(BTreeMap::from([(
+        "v".parse()?,
+        ReducedField {
+            optional: false,
+            shape: ReducedShape::Union(BTreeSet::from([ReducedShape::Int64, ReducedShape::String])),
+        },
+    )]));
+    let seeds = BTreeMap::from([
+        (source("menu"), columns::seeds(&shape, |_| None)?),
+        (source("empty"), columns::seeds(&shape, |_| None)?),
+    ]);
+    writer.apply(&[source("empty")], page, seeds).await?;
+    // A truncated table is recreated with its seeds too.
+    let empty = TableIdent::new(
+        writer.namespace.clone(),
+        IcebergChangeWriter::table_name(&source("empty"))?,
+    );
+    let empty = catalog.load_table(&empty).await?;
+    assert!(empty
+        .metadata()
+        .current_schema()
+        .field_by_name("v")
+        .is_some());
+    // The seed typed `v` as JSON before the page's int64 could make it a long.
+    let ident = TableIdent::new(
+        writer.namespace.clone(),
+        IcebergChangeWriter::table_name(&source("menu"))?,
+    );
+    let table = catalog.load_table(&ident).await?;
+    let v = table
+        .metadata()
+        .current_schema()
+        .field_by_name("v")
+        .context("seeded column")?;
+    assert_eq!(v.doc.as_deref(), Some(columns::JSON_DOC));
+    assert_eq!(changes(&writer, "menu").await?.len(), 1);
+    // Known tables are not new again; truncated ones are.
+    let next = vec![(source("menu"), change("soup", 11, Some("\"x\"")))];
+    assert!(writer.new_tables(&[], &next)?.is_empty());
+    assert_eq!(
+        writer.new_tables(&[source("menu")], &[])?,
+        BTreeSet::from([source("menu")])
     );
     Ok(())
 }

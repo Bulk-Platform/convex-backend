@@ -24,6 +24,7 @@ use utoipa::ToSchema;
 use crate::types::AccessToken;
 pub use crate::{
     slugs::{
+        validate_project_tag,
         validate_slug,
         validate_team_slug,
     },

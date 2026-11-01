@@ -41,7 +41,10 @@ use super::sql::{
 };
 use crate::{
     connection::MySqlConnection,
-    metrics,
+    metrics::{
+        self,
+        MaintenanceRoundOutcome,
+    },
     ConvexMySqlPool,
 };
 
@@ -116,6 +119,7 @@ pub struct IndexesLogMaintenance<RT: Runtime> {
 
 impl<RT: Runtime> IndexesLogMaintenance<RT> {
     pub fn new(pool: Arc<ConvexMySqlPool<RT>>, db_name: String, owner: String) -> Self {
+        metrics::initialize_indexes_log_maintenance_rounds(pool.cluster_name());
         Self {
             pool,
             db_name,
@@ -132,6 +136,19 @@ impl<RT: Runtime> IndexesLogMaintenance<RT> {
     /// out, and publish the new ceiling and floor. Returns `None` when
     /// another conductor holds the lease.
     pub async fn run_once(&self, now: Timestamp) -> anyhow::Result<Option<MaintenanceRound>> {
+        let result = self.try_run_once(now).await;
+        metrics::log_indexes_log_maintenance_round(
+            self.pool.cluster_name(),
+            match &result {
+                Ok(Some(_)) => MaintenanceRoundOutcome::Ok,
+                Ok(None) => MaintenanceRoundOutcome::LeaseHeldElsewhere,
+                Err(_) => MaintenanceRoundOutcome::Failed,
+            },
+        );
+        result
+    }
+
+    async fn try_run_once(&self, now: Timestamp) -> anyhow::Result<Option<MaintenanceRound>> {
         let mut conn = self.pool.acquire(CONNECTION_NAME, &self.db_name).await?;
         let row = conn
             .query_optional(READ_STATE, vec![])

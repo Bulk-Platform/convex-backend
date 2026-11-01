@@ -8,7 +8,10 @@ use cmd_util::env::{
 use common::{
     errors::MainError,
     http::ConvexHttpService,
-    knobs::HTTP_SERVER_TIMEOUT_DURATION,
+    knobs::{
+        HTTP_SERVER_TIMEOUT_DURATION,
+        LOCAL_BACKEND_MAX_CONCURRENT_REQUESTS,
+    },
     runtime::Runtime,
     sentry::set_sentry_tags,
     shutdown::ShutdownSignal,
@@ -44,7 +47,6 @@ use local_backend::{
     proxy::dev_site_proxy,
     router::router,
     HttpActionRouteMapper,
-    MAX_CONCURRENT_REQUESTS,
 };
 use runtime::prod::ProdRuntime;
 use tokio::{
@@ -171,11 +173,15 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
     .await?;
     let router = router(st.clone());
     let mut shutdown_rx_ = shutdown_rx.clone();
+    tracing::info!(
+        "Starting main backend HTTP server with max_concurrent_requests={}",
+        *LOCAL_BACKEND_MAX_CONCURRENT_REQUESTS
+    );
     let http_service = ConvexHttpService::new(
         router,
         "backend",
         SERVER_VERSION_STR.to_string(),
-        MAX_CONCURRENT_REQUESTS,
+        *LOCAL_BACKEND_MAX_CONCURRENT_REQUESTS,
         *HTTP_SERVER_TIMEOUT_DURATION,
         HttpActionRouteMapper,
     );

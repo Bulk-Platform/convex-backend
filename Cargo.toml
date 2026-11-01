@@ -5,7 +5,6 @@ exclude = [ "crates/py_client", "crates/python_client_tests" ]
 
 [workspace.dependencies]
 ada-url = "4.0.0"
-aes = "0.8.4"
 ahash = "0.8"
 ai_gateway_jwt = { path = "crates/ai_gateway_jwt" }
 anyhow = "1"
@@ -13,7 +12,6 @@ application = { path = "crates/application" }
 arc-swap = "1.7.1"
 async-broadcast = "0.7.0"
 async-channel = "2.3.1"
-async-compression = { version = "0.4.11", features = [ "tokio", "zstd", "gzip" ] }
 async-recursion = "1.1.1"
 async-trait = "0.1"
 async_lru = { path = "crates/async_lru" }
@@ -27,6 +25,7 @@ aws-lc-rs = { version = "1.18.1", default-features = false, features = [ "aws-lc
 aws-sdk-firehose = { version = "1.72", default-features = false, features = [ "default-https-client", "rt-tokio" ] }
 aws-sdk-s3 = { version = "1.83", default-features = false, features = [ "default-https-client", "rt-tokio", "sigv4a" ] }
 aws-smithy-http = "0.62.0"
+aws-smithy-runtime = "1.14"
 aws-smithy-types-convert = { version = "0.60", features = [ "convert-streams" ] }
 aws-types = "1"
 aws_s3 = { path = "crates/aws_s3" }
@@ -45,7 +44,6 @@ bitvec = "1.0.1"
 byteorder = "1.5.0"
 bytes = "1.6.0"
 bytesize = "2.0.0"
-cbc = "0.1.2"
 cfg-if = "1.0"
 chrono = "0.4.38"
 clap = { version = "^4.1.8", features = [ "derive", "env" ] }
@@ -88,7 +86,6 @@ fastrace = { version = "0.7", features = [ "enable" ] }
 fastrand = "2.3.0"
 file_storage = { path = "crates/file_storage" }
 fivetran_common = { path = "crates/fivetran_common" }
-fivetran_destination = { path = "crates/fivetran_destination" }
 flate2 = { version = "1.1", features = [ "zlib-rs" ] }
 flexbuffers = "25"
 fnv = "1.0.7"
@@ -176,7 +173,7 @@ qdrant_segment = { git = "https://github.com/convex/qdrant", rev = "a5d1b7bc9fd0
 quote = "1.0"
 rand = "0.9"
 rand_chacha = "0.9.0"
-rc-zip = { version = "5", features = [ "deflate", "deflate64", "zstd" ] }
+rc-zip = { version = "5", features = [ "deflate", "deflate64" ] }
 ref-cast = "1.0.20"
 regex = "1"
 reqwest = { version = "0.13", features = [ "json", "query", "stream", "gzip", "rustls" ] }
@@ -284,7 +281,7 @@ strip = "debuginfo"
 v8 = { git = "https://github.com/convex/rusty_v8", rev = "105b32c50433c4cf6eb77fe6a79e93b8637b20e2" }
 prometheus = { git = "https://github.com/convex/rust-prometheus", rev = "367f80d0d3678ed7989814fd5864598746a3b946" }
 tungstenite = { git = "https://github.com/danielsufrindisler/tungstenite-rs", rev = "eda0a0c5c15334feca45aec64af90fded2917cb7" }
-moka = { git = "https://github.com/convex/moka", rev = "abd1f71cfe4bd4ee21ffd772ed33ce9f9329fe04" }
+moka = { git = "https://github.com/convex/moka", rev = "ef75713ad43a39fae18c3c01fa414eefa9439af0" }
 validator_derive = { git = "https://github.com/Keats/validator", rev = "598ad83024529a2ff57da44d398533e3d4528490" }
 tikv-jemalloc-sys = { git = "https://github.com/convex/jemallocator", rev = "d6f82852479c9962239a634688e60a3d1e873ffb" }
 shuttle = { git = "https://github.com/awslabs/shuttle", rev = "91e3cae8f73c2be3934960c46f8494a7ca981867" }

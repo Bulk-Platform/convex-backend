@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.49.0
+
+- New `npx convex plugins install` command, which installs the Convex plugin for
+  Claude Code and Codex on macOS and Linux. It works with the terminal CLIs, the
+  desktop apps and the VS Code extensions. Running it again upgrades the plugin
+  to the latest version.
+- This version drops support for Node.js 20. Please update to Node.js 22 or
+  newer.
+- Adds the `v.function({ fnType, args, returns })` validator, which validates
+  that a value is a well-formed function handle. You can specify `fnType`,
+  `args`, and `returns` for TypeScript typechecking and including type
+  signatures in codegen, but they are not checked when running functions or
+  writing to a table at runtime. The inferred type of `v.function()` is
+  `FunctionHandle_future`, which has the same type semantics as
+  `FunctionReference_future`. When incorporating `v.function()` into your
+  codebase, existing code that uses the `FunctionHandle` type may need to be
+  updated to use `FunctionHandle_future`.
+
 ## 1.48.0
 
 - Convex deployments can now sign their own JWTs with an internally managed
