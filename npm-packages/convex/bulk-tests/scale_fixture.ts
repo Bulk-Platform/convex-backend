@@ -10,6 +10,8 @@ import {
   importPath,
   moduleIdentifier,
 } from "../src/cli/codegen_templates/api.js";
+import { AnalyzedModule } from "../src/cli/lib/deployApi/modules.js";
+import { v } from "../src/values/index.js";
 
 export const packageRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -86,6 +88,69 @@ export const set = mutationGeneric({
 ${sweep}
 export const helper = (s: string) => s.trim();
 `;
+}
+
+/**
+ * The functions the backend reports for {@link scaleModuleSource}'s modules,
+ * as static codegen (`codegen.staticApi`) reads them, with `returns`
+ * validators matching what the handlers return.
+ */
+export function scaleModuleAnalysis(
+  modules: ScaleModule[],
+): Record<string, AnalyzedModule> {
+  const fn = (
+    name: string,
+    udfType: "Query" | "Mutation",
+    kind: "public" | "internal",
+    args: { json: unknown },
+    returns: { json: unknown },
+  ) => ({
+    name,
+    pos: null,
+    udfType,
+    visibility: { kind },
+    args: JSON.stringify(args.json),
+    returns: JSON.stringify(returns.json),
+  });
+  return Object.fromEntries(
+    modules.map(({ path: modulePath, kind, index }) => {
+      const functions = [];
+      if (kind === "mixed") {
+        functions.push(
+          fn(
+            "get",
+            "Query",
+            "public",
+            v.object({ id: v.string(), limit: v.optional(v.number()) }),
+            v.object({ module: v.literal(index), id: v.string() }),
+          ),
+          fn(
+            "set",
+            "Mutation",
+            "public",
+            v.object({
+              id: v.string(),
+              value: v.union(v.literal("a"), v.literal("b")),
+            }),
+            v.boolean(),
+          ),
+        );
+      }
+      functions.push(
+        fn(
+          "sweep",
+          "Query",
+          "internal",
+          v.object({ before: v.number() }),
+          v.object({ swept: v.literal(index) }),
+        ),
+      );
+      return [
+        modulePath.replace(/\.ts$/, ".js"),
+        { functions, httpRoutes: null, cronSpecs: null, sourceMapped: null },
+      ];
+    }),
+  );
 }
 
 /** An `api.d.ts` with upstream's imports for `modulePaths` around `declarations`. */

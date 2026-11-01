@@ -1,16 +1,21 @@
 // Bulk fork: the segmented `api` stays strictly typed far past the module
-// count where upstream's single `ApiFromModules` collapses to `never`.
+// count where upstream's single `ApiFromModules` collapses to `never`, in
+// every file codegen writes it to: `api.d.ts`, `api.ts` and the CommonJS
+// `api_cjs.d.cts`. Static codegen (`codegen.staticApi`) writes explicit
+// `FunctionReference` types instead and has no cliff; it is checked at the
+// same sizes so that turning it on stays safe.
 //
 // Projects are type-checked with TypeScript 7.0.2 and its default checker
-// count, as in Bulk (see scale_fixture.ts). A monolithic control project
-// proves each size is past the cliff, and an `any` control proves the probes
-// catch a loose `api`.
+// count, as in Bulk (see scale_fixture.ts). Monolithic control projects prove
+// each size is past the cliff for both upstream file names, and an `any`
+// control proves the probes catch a loose `api`.
 
 import fs from "fs";
 import os from "os";
 import path from "path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { apiCodegen } from "../src/cli/codegen_templates/api.js";
+import { apiCjsCodegen } from "../src/cli/codegen_templates/api_cjs.js";
 import {
   componentApiDTS,
   componentApiTSWithTypes,
@@ -24,12 +29,15 @@ import {
   checkWithPackageTypeScript,
   monolithicApiDts,
   moduleFiles,
+  scaleModuleAnalysis,
   scaleModules,
   writeProject,
 } from "./scale_fixture.js";
 import {
   NEGATIVE_CASES,
+  ProbeOptions,
   TYPE_ASSERTIONS,
+  negativeCaseError,
   negativeCaseLines,
   negativeProbes,
   positiveProbes,
@@ -56,9 +64,16 @@ function modulesOfSize(size: (typeof SIZES)[number]) {
   return modules;
 }
 
-function probeFiles(modules: ScaleModule[]) {
-  return { ...positiveProbes(modules), ...negativeProbes() };
+function probeFiles(modules: ScaleModule[], options: ProbeOptions = {}) {
+  return {
+    ...positiveProbes(modules, options),
+    ...negativeProbes(options),
+  };
 }
+
+// Where probes import a generated file from: `api_cjs.d.cts` types the
+// `api_cjs.cjs` that CommonJS code requires.
+const CJS = { apiModule: "./_generated/api_cjs.cjs" };
 
 /** Diagnostics outside `probe_negative.ts`, which must be empty. */
 function unexpected(diagnostics: Diagnostic[]) {
@@ -68,7 +83,10 @@ function unexpected(diagnostics: Diagnostic[]) {
 }
 
 /** Each negative case fails exactly once, for its own reason. */
-function expectNegativeCasesFail(diagnostics: Diagnostic[]) {
+function expectNegativeCasesFail(
+  diagnostics: Diagnostic[],
+  options: ProbeOptions = {},
+) {
   const negative = diagnostics.filter(
     (d) => d.file === "convex/probe_negative.ts",
   );
@@ -78,25 +96,72 @@ function expectNegativeCasesFail(diagnostics: Diagnostic[]) {
     const ok =
       found.length === 1 &&
       found[0].code === c.expect &&
-      found[0].message.includes(c.error);
+      found[0].message.includes(negativeCaseError(c, options));
     return { case: c.code, ok, found: found.map((d) => d.message) };
   });
   expect(report.filter((r) => !r.ok)).toEqual([]);
   expect(negative.length).toBe(NEGATIVE_CASES.length);
 }
 
+/** A generated `api` file and how to type-check it. */
+type Output = {
+  file: string;
+  generate: (modules: ScaleModule[]) => string | Promise<string>;
+  probes?: ProbeOptions;
+};
+
+const SEGMENTED: Output[] = [
+  { file: "api.d.ts", generate: (m) => apiCodegen(m.map((x) => x.path)).DTS! },
+  {
+    file: "api.ts",
+    generate: (m) =>
+      apiCodegen(
+        m.map((x) => x.path),
+        { useTypeScript: true },
+      ).TS!,
+  },
+  // `convex codegen --commonjs` and `generateCommonJSApi`. Component codegen
+  // writes the same text as its `api.d.ts` (see `codegen.ts`).
+  {
+    file: "api_cjs.d.cts",
+    generate: (m) => apiCjsCodegen(m.map((x) => x.path)).DTS!,
+    probes: CJS,
+  },
+];
+
+// Static codegen drops top-level folders without public functions from `api`,
+// as upstream's `ApiFromModules` does.
+const STATIC: Output[] = [
+  {
+    file: "api.d.ts",
+    generate: (m) => staticComponentApi(m, false),
+    probes: { emptyTopLevel: "dropped" },
+  },
+  {
+    file: "api.ts",
+    generate: (m) => staticComponentApi(m, true),
+    probes: { emptyTopLevel: "dropped" },
+  },
+];
+
 describe.each(SIZES)("$modules modules", (size) => {
-  test(
-    "upstream's monolithic api collapses to never (control)",
-    () => {
+  test.each([
+    ["api.d.ts", {}],
+    ["api_cjs.d.cts", CJS],
+  ] as const)(
+    "upstream's monolithic %s collapses to never (control)",
+    (fileName, probes) => {
       const modules = modulesOfSize(size);
-      const dir = writeProject(path.join(tmp, `mono-${size.modules}`), {
-        ...moduleFiles(modules),
-        "convex/_generated/api.d.ts": monolithicApiDts(
-          modules.map((m) => m.path),
-        ),
-        ...probeFiles(modules),
-      });
+      const dir = writeProject(
+        path.join(tmp, `mono-${fileName}-${size.modules}`),
+        {
+          ...moduleFiles(modules),
+          [`convex/_generated/${fileName}`]: monolithicApiDts(
+            modules.map((m) => m.path),
+          ),
+          ...probeFiles(modules, probes),
+        },
+      );
       const diagnostics = checkWithBulkTypeScript(dir);
       expect(
         diagnostics.some((d) => d.message.includes("on type 'never'")),
@@ -106,29 +171,27 @@ describe.each(SIZES)("$modules modules", (size) => {
   );
 
   test.each([
-    ["api.d.ts", false],
-    ["api.ts", true],
-  ] as const)(
-    "segmented %s is strictly typed",
-    (fileName, useTypeScript) => {
+    ...SEGMENTED.map((o) => ({ kind: "segmented", ...o })),
+    ...STATIC.map((o) => ({ kind: "static", ...o })),
+  ])(
+    "$kind $file is strictly typed",
+    async ({ kind, ...output }) => {
       const modules = modulesOfSize(size);
-      const generated = apiCodegen(
-        modules.map((m) => m.path),
-        { useTypeScript },
-      );
+      const generated = await output.generate(modules);
+      if (kind === "static") {
+        expect(generated).not.toContain("ApiFromModules");
+      }
       const dir = writeProject(
-        path.join(tmp, `seg-${fileName}-${size.modules}`),
+        path.join(tmp, `${kind}-${output.file}-${size.modules}`),
         {
           ...moduleFiles(modules),
-          [`convex/_generated/${fileName}`]: useTypeScript
-            ? generated.TS!
-            : generated.DTS!,
-          ...probeFiles(modules),
+          [`convex/_generated/${output.file}`]: generated,
+          ...probeFiles(modules, output.probes),
         },
       );
       const diagnostics = checkWithBulkTypeScript(dir);
       expect(unexpected(diagnostics)).toEqual([]);
-      expectNegativeCasesFail(diagnostics);
+      expectNegativeCasesFail(diagnostics, output.probes);
     },
     TIMEOUT,
   );
@@ -194,46 +257,76 @@ ${topLevel
   TIMEOUT,
 );
 
+const crashCtx = {
+  fs: nodeFs,
+  crash: async (args: { printedMessage: string | null }) => {
+    throw new Error(args.printedMessage ?? "crash");
+  },
+} as unknown as Context;
+
+/**
+ * Component codegen (`convex dev` with components) for a root component in
+ * `dir/convex` with `functions` as the backend's analysis.
+ */
+async function componentApi(
+  dir: string,
+  opts: { useTypeScript: boolean; staticApi: boolean; functions?: unknown },
+) {
+  const root = {
+    isRoot: true,
+    path: path.join(dir, "app"),
+    definitionPath: path.join(dir, "app/convex.config.ts"),
+    isRootWithoutConfig: false,
+  };
+  const component = {
+    isRoot: false,
+    path: path.join(dir, "convex"),
+    definitionPath: path.join(dir, "convex/convex.config.ts"),
+    isRootWithoutConfig: false,
+  };
+  const startPush = {
+    analysis: {
+      "../convex": {
+        definition: { childComponents: [] },
+        functions: opts.functions ?? [],
+      },
+    },
+  } as any;
+  const codegenOpts = {
+    staticApi: opts.staticApi,
+    useComponentApiImports: true,
+  };
+  return opts.useTypeScript
+    ? await componentApiTSWithTypes(
+        crashCtx,
+        startPush,
+        root,
+        component,
+        new Map(),
+        codegenOpts,
+      )
+    : await componentApiDTS(
+        crashCtx,
+        startPush,
+        root,
+        component,
+        new Map(),
+        codegenOpts,
+      );
+}
+
+/** Static codegen's `api.d.ts` or `api.ts` for `modules`. */
+function staticComponentApi(modules: ScaleModule[], useTypeScript: boolean) {
+  return componentApi(tmp, {
+    useTypeScript,
+    staticApi: true,
+    functions: scaleModuleAnalysis(modules),
+  });
+}
+
 describe("component api", () => {
   // A component with as many modules as the smaller project, generated by the
-  // component codegen (`convex dev` with components) instead of `apiCodegen`.
-  async function generateComponentApi(dir: string, useTypeScript: boolean) {
-    const ctx = {
-      fs: nodeFs,
-      crash: async (args: { printedMessage: string | null }) => {
-        throw new Error(args.printedMessage ?? "crash");
-      },
-    } as unknown as Context;
-    const root = {
-      isRoot: true,
-      path: path.join(dir, "app"),
-      definitionPath: path.join(dir, "app/convex.config.ts"),
-      isRootWithoutConfig: false,
-    };
-    const component = {
-      isRoot: false,
-      path: path.join(dir, "convex"),
-      definitionPath: path.join(dir, "convex/convex.config.ts"),
-      isRootWithoutConfig: false,
-    };
-    const startPush = {
-      analysis: {
-        "../convex": { definition: { childComponents: [] }, functions: [] },
-      },
-    } as any;
-    const opts = { staticApi: false, useComponentApiImports: true };
-    return useTypeScript
-      ? await componentApiTSWithTypes(
-          ctx,
-          startPush,
-          root,
-          component,
-          new Map(),
-          opts,
-        )
-      : await componentApiDTS(ctx, startPush, root, component, new Map(), opts);
-  }
-
+  // component codegen instead of `apiCodegen`.
   test.each([
     ["api.d.ts", false],
     ["api.ts", true],
@@ -246,7 +339,10 @@ describe("component api", () => {
         ...moduleFiles(modules),
         "convex/convex.config.ts": `export default {};\n`,
       });
-      const generated = await generateComponentApi(dir, useTypeScript);
+      const generated = await componentApi(dir, {
+        useTypeScript,
+        staticApi: false,
+      });
       expect(generated).not.toContain("fullApi:");
       expect(generated).toMatch(/fullApi\$\d+: ApiFromModules/);
       writeProject(dir, {
