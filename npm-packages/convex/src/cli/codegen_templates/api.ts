@@ -1,5 +1,6 @@
 import { header } from "./common.js";
 import { segmentedApiDeclarations } from "./segmented_api.js";
+import { AnalyzedModule } from "../lib/deployApi/modules.js";
 
 export function importPath(modulePath: string) {
   // Replace backslashes with forward slashes.
@@ -78,9 +79,13 @@ export function moduleIdentifier(modulePath: string) {
 
 export function apiCodegen(
   modulePaths: string[],
-  opts?: { useTypeScript?: boolean },
+  opts?: {
+    useTypeScript?: boolean;
+    functions?: Record<string, AnalyzedModule> | undefined;
+  },
 ) {
   const useTypeScript = opts?.useTypeScript ?? false;
+  const functions = opts?.functions;
   const imports = modulePaths
     .map(
       (modulePath) =>
@@ -96,7 +101,7 @@ export function apiCodegen(
 import type { ApiFromModules, FilterApi, FunctionReference } from "convex/server";
 ${imports}
 
-${segmentedApiDeclarations(modulePaths, { useTypeScript: false })}
+${segmentedApiDeclarations(modulePaths, { useTypeScript: false, functions })}
 `;
 
     const apiJS = `${header("Generated `api` utility.")}
@@ -124,7 +129,7 @@ import type { ApiFromModules, FilterApi, FunctionReference } from "convex/server
 import { anyApi } from "convex/server";
 ${imports}
 
-${segmentedApiDeclarations(modulePaths, { useTypeScript: true })}
+${segmentedApiDeclarations(modulePaths, { useTypeScript: true, functions })}
 `;
     return {
       TS: apiTS,

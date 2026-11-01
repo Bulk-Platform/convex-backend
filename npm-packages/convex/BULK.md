@@ -55,8 +55,7 @@ TypeScript 7.0.2 on the scale fixtures (whole project, probes included):
 The CommonJS file checks in the same time and memory as `api.d.ts`. Static
 output grows with the size of the validators, which the fixtures keep small: an
 app with large `args` or `returns` validators gets a larger file, but no
-type-level limit. Like upstream, static `api` drops a top-level folder that has
-no public functions instead of keeping it as `{}`.
+type-level limit.
 
 `bulk/patches.txt` at the repository root lists every file each patch changes,
 and `node bulk/upstream.mjs inventory` prints the package's current diff from
@@ -69,13 +68,15 @@ upstream by patch. A patch adds its files there in the same pull request.
 that is also a folder) and type-checks them with `typescript@7.0.2` and its
 default 4 checkers, as Bulk does. It runs `tsc` through `npx` (set `BULK_TSC` to
 a local binary to skip the download). For `api.d.ts` and `api.ts` from
-`apiCodegen`, `api_cjs.d.cts` from `apiCjsCodegen` (imported as
-`./_generated/api_cjs.cjs`), static codegen's `api.d.ts` and `api.ts`, and both
-dynamic component codegen outputs, the probes in `bulk-tests/probes.ts` assert:
+`apiCodegen` with the fixture's analysis, `api_cjs.d.cts` from component codegen
+(imported as `./_generated/api_cjs.cjs`), static codegen's `api.d.ts` and
+`api.ts`, and both dynamic component codegen outputs, the probes in
+`bulk-tests/probes.ts` assert:
 
 - exact `FunctionReference`, `FunctionArgs` and `FunctionReturnType` types
   through `api.<folder>.<file>.<fn>` and `internal.…`, in every chunk;
-- the exact key sets at the root, in the split folder and below it;
+- the exact key sets at the root (upstream's: no `api.ops`), in the split folder
+  and below it;
 - that misspelled paths, internal functions through `api`, public functions
   through `internal`, helpers and wrong arguments fail, each with its own error,
   behind `@ts-expect-error`.
@@ -83,16 +84,23 @@ dynamic component codegen outputs, the probes in `bulk-tests/probes.ts` assert:
 Two controls keep the probes honest: upstream's single `ApiFromModules` must
 collapse to `never` at each size, as `api.d.ts` and as `api_cjs.d.cts`, and an
 `api` typed as `any` must fail the probes. A TypeScript 5 run checks the
-segmented types equal upstream's at 2,621 modules.
+segmented types and key sets equal upstream's at 2,621 modules.
 
-### The one difference from upstream
+### Top-level keys come from the push analysis
 
-A top-level folder or root module with no functions of a visibility stays on
-that object as `{}`: for example `api.jobsInternal` when it only has internal
-functions. Upstream drops the key. Any access below it (`api.jobsInternal.x`)
-fails as before. Wrapping the root in `FilterApi` would drop these keys too, but
-makes TypeScript resolve every chunk on first use of `api` (about 35% more check
-time and 70% more memory at 4,000 modules).
+Upstream's `FilterApi` over the whole tree drops a top-level folder or root
+module with no functions of a visibility, for example `api.jobsInternal` when
+that folder only has internal functions. A type that decides those keys has to
+resolve every chunk on first use of `api`: wrapping the root in `FilterApi`, a
+key-remapping mapped type or an intersection of per-key conditionals each cost
+83–138% more check time and 82–106% more memory on the scale fixtures. So
+codegen decides them instead. Component codegen, which `convex dev`,
+`convex deploy` and `convex codegen` run for every app, has each function's
+visibility from the push analysis and leaves those keys out, so the key sets
+match upstream's at the same cost as before. A folder's first function of a
+visibility shows up on that object at the next codegen, as a new module does.
+`apiCodegen` and `apiCjsCodegen` without an analysis (`--system-udfs` only) keep
+such keys as `{}`.
 
 ## Release
 

@@ -6,9 +6,15 @@
 // budget. Past roughly 1,950 modules the type collapses to `never`. Chunking
 // keeps the same types (each chunk is still `ApiFromModules` + `FilterApi`)
 // while TypeScript only resolves the chunks a file actually uses.
+//
+// Upstream's `FilterApi` over the whole tree also drops top-level folders and
+// modules without functions of a visibility. Doing that in the type would
+// resolve every chunk on first use of `api`, so codegen drops them instead,
+// from the function visibilities in the push analysis.
 
 import { importPath, moduleIdentifier } from "./api.js";
 import { apiComment } from "./common.js";
+import { AnalyzedModule } from "../lib/deployApi/modules.js";
 
 /** Folders with more modules than this are split again by their subfolders. */
 export const MAX_MODULES_PER_API_CHUNK = 400;
@@ -29,7 +35,16 @@ type ApiChildren = Map<string, ApiNode>;
 
 export function segmentedApiDeclarations(
   modulePaths: string[],
-  opts: { useTypeScript: boolean; maxModulesPerChunk?: number | undefined },
+  opts: {
+    useTypeScript: boolean;
+    maxModulesPerChunk?: number | undefined;
+    /**
+     * The analyzed modules of a push, keyed by module path (`foo/bar.js`).
+     * Without them, a top-level entry with no functions of a visibility stays
+     * on that object as `{}`.
+     */
+    functions?: Record<string, AnalyzedModule> | undefined;
+  },
 ): string {
   const maxModules = opts.maxModulesPerChunk ?? MAX_MODULES_PER_API_CHUNK;
   const chunks: Chunk[] = [];
@@ -67,6 +82,9 @@ export function segmentedApiDeclarations(
     opts.useTypeScript
       ? `const ${nameAndType} = anyApi as any;`
       : `declare const ${nameAndType};`;
+  // Chunks are only used in types. Ambient, an unused one (a folder without
+  // functions) passes `noUnusedLocals` in `api.ts`.
+  const declareChunk = (nameAndType: string) => `declare const ${nameAndType};`;
   const lines = [
     `type ${SEGMENT_TYPE}<T, Path extends string[]> = Path extends [infer Head extends string, ...infer Rest extends string[]] ? (Head extends keyof T ? ${SEGMENT_TYPE}<T[Head], Rest> : {}) : T;`,
   ];
@@ -77,7 +95,7 @@ export function segmentedApiDeclarations(
           `  "${importPath(modulePath)}": typeof ${moduleIdentifier(modulePath)},`,
       )
       .join("\n");
-    lines.push(declareConst(`${chunk.name}: ApiFromModules<{\n${entries}\n}>`));
+    lines.push(declareChunk(`${chunk.name}: ApiFromModules<{\n${entries}\n}>`));
   }
   for (const [name, visibility] of [
     ["api", "public"],
@@ -86,11 +104,37 @@ export function segmentedApiDeclarations(
     lines.push(apiComment(name, visibility));
     // The root stays a plain object type so TypeScript resolves each
     // top-level folder only when it is used.
+    const entries = opts.functions
+      ? withFunctions(root, opts.functions, visibility)
+      : root;
     lines.push(
-      `export ${declareConst(`${name}: ${objectType(root, visibility)}`)}`,
+      `export ${declareConst(`${name}: ${objectType(entries, visibility)}`)}`,
     );
   }
   return lines.join("\n");
+}
+
+/**
+ * The top-level entries with a function of `visibility` in `functions`. A
+ * function without a visibility counts for both, so an entry is never dropped
+ * that the module types could keep.
+ */
+function withFunctions(
+  root: ApiChildren,
+  functions: Record<string, AnalyzedModule>,
+  visibility: Visibility,
+): ApiChildren {
+  const keys = new Set<string>();
+  for (const [modulePath, module] of Object.entries(functions)) {
+    if (
+      module.functions.some(
+        (f) => !f.visibility || f.visibility.kind === visibility,
+      )
+    ) {
+      keys.add(importPath(modulePath).split("/")[0]);
+    }
+  }
+  return new Map([...root].filter(([key]) => keys.has(key)));
 }
 
 /**

@@ -110,7 +110,7 @@ export async function componentApiDTS(
   if (opts.staticApi) {
     apiLines = codegenStaticApiObjects(ctx, analysis);
   } else {
-    apiLines = codegenDynamicApiObjects(ctx, componentDirectory);
+    apiLines = codegenDynamicApiObjects(ctx, componentDirectory, analysis);
   }
   for await (const line of apiLines) {
     lines.push(line);
@@ -272,7 +272,7 @@ export async function componentApiTSWithTypes(
   if (opts.staticApi) {
     apiLines = codegenStaticApiObjectsTS(ctx, analysis);
   } else {
-    apiLines = codegenDynamicApiObjectsTS(ctx, componentDirectory);
+    apiLines = codegenDynamicApiObjectsTS(ctx, componentDirectory, analysis);
   }
   for await (const line of apiLines) {
     lines.push(line);
@@ -348,6 +348,7 @@ async function* codegenStaticApiObjectsTS(
 async function* codegenDynamicApiObjects(
   ctx: Context,
   componentDirectory: ComponentDirectory,
+  analysis: EvaluatedComponentDefinition,
 ) {
   const absModulePaths = await entryPoints(ctx, componentDirectory.path);
   const modulePaths = absModulePaths
@@ -365,12 +366,16 @@ async function* codegenDynamicApiObjects(
       FunctionReference,
     } from "convex/server";
   `;
-  yield segmentedApiDeclarations(modulePaths, { useTypeScript: false });
+  yield segmentedApiDeclarations(modulePaths, {
+    useTypeScript: false,
+    functions: analysis.functions,
+  });
 }
 
 async function* codegenDynamicApiObjectsTS(
   ctx: Context,
   componentDirectory: ComponentDirectory,
+  analysis: EvaluatedComponentDefinition,
 ) {
   const absModulePaths = await entryPoints(ctx, componentDirectory.path);
   const modulePaths = absModulePaths
@@ -389,7 +394,10 @@ async function* codegenDynamicApiObjectsTS(
     } from "convex/server";
     import { anyApi, componentsGeneric } from "convex/server";
   `;
-  yield segmentedApiDeclarations(modulePaths, { useTypeScript: true });
+  yield segmentedApiDeclarations(modulePaths, {
+    useTypeScript: true,
+    functions: analysis.functions,
+  });
 }
 
 interface ApiTree {

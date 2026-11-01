@@ -286,10 +286,12 @@ export function checkWithBulkTypeScript(projectDir: string): Diagnostic[] {
 export function checkWithPackageTypeScript(
   projectDir: string,
   entries: string[],
+  options: ts.CompilerOptions = {},
 ): Diagnostic[] {
   const program = ts.createProgram(
     entries.map((entry) => path.join(projectDir, entry)),
     {
+      ...options,
       strict: true,
       noEmit: true,
       skipLibCheck: true,
