@@ -17,12 +17,6 @@ type Concrete<T> = IsAny<T> extends true ? false : IsNever<T> extends true ? fal
 export type ProbeOptions = {
   /** Where probes import `api` and `internal` from. */
   apiModule?: string;
-  /**
-   * How a top-level folder without public functions (`ops/`) appears on
-   * `api`: `"kept"` as `{}` (segmented codegen, see BULK.md) or `"dropped"`
-   * (upstream and static codegen).
-   */
-  emptyTopLevel?: "kept" | "dropped";
 };
 
 const prelude = ({ apiModule = "./_generated/api" }: ProbeOptions = {}) =>
@@ -140,7 +134,6 @@ export function positiveProbes(
 
 /** The exact key sets at the root, in the split `big/` folder and below it. */
 function keyProbes(modules: ScaleModule[], options: ProbeOptions) {
-  const kept = (options.emptyTopLevel ?? "kept") === "kept";
   const lines = [prelude(options)];
   const prefixes = [
     [],
@@ -153,21 +146,15 @@ function keyProbes(modules: ScaleModule[], options: ProbeOptions) {
   prefixes.forEach((prefix, i) => {
     for (const visibility of ["public", "internal"] as const) {
       const root = visibility === "public" ? "api" : "internal";
-      let keys = expectedKeys(modules, prefix, visibility);
+      const keys = expectedKeys(modules, prefix, visibility);
       const target =
         prefix.length === 0
           ? `typeof ${root}`
           : `typeof ${accessPath(root, prefix.join("/"))}`;
-      if (prefix.length === 0 && visibility === "public" && kept) {
-        // Top-level folders without public functions stay on `api` as `{}`
-        // (see BULK.md); everything below the top level matches upstream.
-        keys = [...keys, ...topLevelWithoutPublic(modules)];
-      }
       if (prefix[0] === "ops" && visibility === "public") {
+        // `ops/` has no public functions, so `api` has no `ops` key.
         lines.push(
-          kept
-            ? `export type K${i}${root} = Expect<Equal<${target}, {}>>;`
-            : `export type K${i}${root} = Expect<Equal<"ops" extends keyof typeof api ? true : false, false>>;`,
+          `export type K${i}${root} = Expect<Equal<"ops" extends keyof typeof api ? true : false, false>>;`,
         );
         continue;
       }
@@ -177,14 +164,6 @@ function keyProbes(modules: ScaleModule[], options: ProbeOptions) {
     }
   });
   return lines.join("\n") + "\n";
-}
-
-function topLevelWithoutPublic(modules: ScaleModule[]) {
-  const all = new Set(
-    modules.map((m) => m.path.replace(/\.ts$/, "").split("/")[0]),
-  );
-  const withPublic = new Set(expectedKeys(modules, [], "public"));
-  return [...all].filter((k) => !withPublic.has(k));
 }
 
 /**
@@ -227,7 +206,7 @@ export const NEGATIVE_CASES: { code: string; expect: string; error: string }[] =
     {
       code: `export const e = api.ops.m0.sweep;`,
       expect: "TS2339",
-      error: "Property 'm0' does not exist",
+      error: "Property 'ops' does not exist",
     },
     {
       code: `export const e = api.big.s0.m1.get;`,
@@ -273,7 +252,7 @@ export function negativeProbes(options: ProbeOptions = {}) {
       prelude(options) +
       NEGATIVE_CASES.map(
         (c, i) =>
-          `// @ts-expect-error ${negativeCaseError(c, options)}\n${c.code.replace("const e", `const e${i}`)}`,
+          `// @ts-expect-error ${c.error}\n${c.code.replace("const e", `const e${i}`)}`,
       ).join("\n") +
       "\n",
     "convex/probe_negative.ts":
@@ -283,24 +262,6 @@ export function negativeProbes(options: ProbeOptions = {}) {
       ).join("\n") +
       "\n",
   };
-}
-
-/**
- * Negative cases that fail on a different property when `ProbeOptions`
- * has `emptyTopLevel: "dropped"`.
- */
-const DROPPED_ERRORS: Record<string, string> = {
-  "export const e = api.ops.m0.sweep;": "Property 'ops' does not exist",
-};
-
-/** The error fragment a negative case must produce under `options`. */
-export function negativeCaseError(
-  c: (typeof NEGATIVE_CASES)[number],
-  options: ProbeOptions = {},
-) {
-  return (
-    (options.emptyTopLevel === "dropped" && DROPPED_ERRORS[c.code]) || c.error
-  );
 }
 
 /** 1-based line of each negative case in `probe_negative.ts`. */

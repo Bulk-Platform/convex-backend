@@ -15,7 +15,6 @@ import os from "os";
 import path from "path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { apiCodegen } from "../src/cli/codegen_templates/api.js";
-import { apiCjsCodegen } from "../src/cli/codegen_templates/api_cjs.js";
 import {
   componentApiDTS,
   componentApiTSWithTypes,
@@ -37,7 +36,6 @@ import {
   NEGATIVE_CASES,
   ProbeOptions,
   TYPE_ASSERTIONS,
-  negativeCaseError,
   negativeCaseLines,
   negativeProbes,
   positiveProbes,
@@ -83,10 +81,7 @@ function unexpected(diagnostics: Diagnostic[]) {
 }
 
 /** Each negative case fails exactly once, for its own reason. */
-function expectNegativeCasesFail(
-  diagnostics: Diagnostic[],
-  options: ProbeOptions = {},
-) {
+function expectNegativeCasesFail(diagnostics: Diagnostic[]) {
   const negative = diagnostics.filter(
     (d) => d.file === "convex/probe_negative.ts",
   );
@@ -96,52 +91,60 @@ function expectNegativeCasesFail(
     const ok =
       found.length === 1 &&
       found[0].code === c.expect &&
-      found[0].message.includes(negativeCaseError(c, options));
+      found[0].message.includes(c.error);
     return { case: c.code, ok, found: found.map((d) => d.message) };
   });
   expect(report.filter((r) => !r.ok)).toEqual([]);
   expect(negative.length).toBe(NEGATIVE_CASES.length);
 }
 
-/** A generated `api` file and how to type-check it. */
+/**
+ * A generated `api` file and how to type-check it. `generate` runs after the
+ * modules are written to `dir`, which component codegen reads.
+ */
 type Output = {
   file: string;
-  generate: (modules: ScaleModule[]) => string | Promise<string>;
+  generate: (modules: ScaleModule[], dir: string) => string | Promise<string>;
   probes?: ProbeOptions;
 };
 
+// Segmented codegen gets the push analysis, as `convex dev`, `deploy` and
+// `codegen` give it, and drops top-level folders without public functions
+// from `api` like upstream.
 const SEGMENTED: Output[] = [
-  { file: "api.d.ts", generate: (m) => apiCodegen(m.map((x) => x.path)).DTS! },
+  {
+    file: "api.d.ts",
+    generate: (m) =>
+      apiCodegen(
+        m.map((x) => x.path),
+        { functions: scaleModuleAnalysis(m) },
+      ).DTS!,
+  },
   {
     file: "api.ts",
     generate: (m) =>
       apiCodegen(
         m.map((x) => x.path),
-        { useTypeScript: true },
+        { useTypeScript: true, functions: scaleModuleAnalysis(m) },
       ).TS!,
   },
-  // `convex codegen --commonjs` and `generateCommonJSApi`. Component codegen
+  // `convex codegen --commonjs` and `generateCommonJSApi`: component codegen
   // writes the same text as its `api.d.ts` (see `codegen.ts`).
   {
     file: "api_cjs.d.cts",
-    generate: (m) => apiCjsCodegen(m.map((x) => x.path)).DTS!,
+    generate: (m, dir) =>
+      componentApi(dir, {
+        useTypeScript: false,
+        staticApi: false,
+        functions: scaleModuleAnalysis(m),
+      }),
     probes: CJS,
   },
 ];
 
-// Static codegen drops top-level folders without public functions from `api`,
-// as upstream's `ApiFromModules` does.
 const STATIC: Output[] = [
-  {
-    file: "api.d.ts",
-    generate: (m) => staticComponentApi(m, false),
-    probes: { emptyTopLevel: "dropped" },
-  },
-  {
-    file: "api.ts",
-    generate: (m) => staticComponentApi(m, true),
-    probes: { emptyTopLevel: "dropped" },
-  },
+  { file: "api.d.ts", generate: (m) => staticComponentApi(m, false) },
+  { file: "api.ts", generate: (m) => staticComponentApi(m, true) },
 ];
 
 describe.each(SIZES)("$modules modules", (size) => {
@@ -177,21 +180,21 @@ describe.each(SIZES)("$modules modules", (size) => {
     "$kind $file is strictly typed",
     async ({ kind, ...output }) => {
       const modules = modulesOfSize(size);
-      const generated = await output.generate(modules);
+      const dir = writeProject(
+        path.join(tmp, `${kind}-${output.file}-${size.modules}`),
+        moduleFiles(modules),
+      );
+      const generated = await output.generate(modules, dir);
       if (kind === "static") {
         expect(generated).not.toContain("ApiFromModules");
       }
-      const dir = writeProject(
-        path.join(tmp, `${kind}-${output.file}-${size.modules}`),
-        {
-          ...moduleFiles(modules),
-          [`convex/_generated/${output.file}`]: generated,
-          ...probeFiles(modules, output.probes),
-        },
-      );
+      writeProject(dir, {
+        [`convex/_generated/${output.file}`]: generated,
+        ...probeFiles(modules, output.probes),
+      });
       const diagnostics = checkWithBulkTypeScript(dir);
       expect(unexpected(diagnostics)).toEqual([]);
-      expectNegativeCasesFail(diagnostics, output.probes);
+      expectNegativeCasesFail(diagnostics);
     },
     TIMEOUT,
   );
@@ -230,9 +233,9 @@ test(
     const probe = `import type * as mono from "./_generated/api_mono";
 import { api, internal } from "./_generated/api";
 ${TYPE_ASSERTIONS}
-export type ApiKeys = Expect<Equal<keyof typeof mono.api | "ops", keyof typeof api>>;
+export type ApiKeys = Expect<Equal<keyof typeof mono.api, keyof typeof api>>;
 export type InternalKeys = Expect<Equal<keyof typeof mono.internal, keyof typeof internal>>;
-export type Ops = Expect<Equal<(typeof api)["ops"], {}>>;
+export type Ops = Expect<Equal<"ops" extends keyof typeof api ? true : false, false>>;
 ${topLevel
   .map((k) =>
     [
@@ -246,7 +249,9 @@ ${topLevel
 `;
     const dir = writeProject(path.join(tmp, "equal"), {
       ...moduleFiles(modules),
-      "convex/_generated/api.d.ts": apiCodegen(paths).DTS!,
+      "convex/_generated/api.d.ts": apiCodegen(paths, {
+        functions: scaleModuleAnalysis(modules),
+      }).DTS!,
       "convex/_generated/api_mono.d.ts": monolithicApiDts(paths),
       "convex/probe_equal.ts": probe,
     });
@@ -342,6 +347,7 @@ describe("component api", () => {
       const generated = await componentApi(dir, {
         useTypeScript,
         staticApi: false,
+        functions: scaleModuleAnalysis(modules),
       });
       expect(generated).not.toContain("fullApi:");
       expect(generated).toMatch(/fullApi\$\d+: ApiFromModules/);
