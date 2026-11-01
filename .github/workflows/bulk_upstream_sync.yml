@@ -1,0 +1,218 @@
+name: Bulk upstream sync
+
+# Opens a pull request that merges upstream convex/convex-backend into main.
+# The scheduled run takes the latest upstream npm release (its
+# `npm release version X.Y.Z` commit on upstream main); a manual run can take
+# upstream main or any upstream main commit instead. The merged tree runs
+# bulk_checks.yml first, and the pull request reports the result, conflicts
+# and the upstream commits that change Bulk-patched files. See BULK_FORK.md,
+# "Upstream sync".
+#
+# Pushing a merge that changes .github/workflows needs the
+# BULK_UPSTREAM_SYNC_TOKEN secret (a token with contents, pull-requests and
+# workflows write on this repository). With it, the pull request also runs
+# its own checks. Without it the workflow uses GITHUB_TOKEN, which needs
+# "Allow GitHub Actions to create and approve pull requests" in the
+# repository's Actions settings.
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+    inputs:
+      target:
+        description:
+          "`release` (latest upstream npm release), `main` (upstream main) or an
+          upstream main commit SHA"
+        type: string
+        default: release
+      dry_run:
+        description:
+          Merge and test, then print the pull request in the run summary instead
+          of pushing
+        type: boolean
+        default: false
+
+concurrency:
+  group: bulk-upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_URL: https://github.com/convex/convex-backend.git
+  GIT_AUTHOR_NAME: github-actions[bot]
+  GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+  GIT_COMMITTER_NAME: github-actions[bot]
+  GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+
+jobs:
+  plan:
+    name: Find the upstream merge
+    if: github.repository == 'Bulk-Platform/convex-backend'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      base: ${{ steps.base.outputs.base }}
+      changed: ${{ steps.merge.outputs.changed }}
+      conflicts: ${{ steps.merge.outputs.conflicts }}
+      target: ${{ steps.merge.outputs.target }}
+      branch: ${{ steps.merge.outputs.branch }}
+      exists: ${{ steps.exists.outputs.exists }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Fetch upstream main
+        run:
+          git fetch --no-tags "$UPSTREAM_URL"
+          +refs/heads/main:refs/remotes/upstream/main
+
+      - id: base
+        run: echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # A trial merge, never pushed: decides whether there is anything to do
+      # and whether it conflicts.
+      - name: Merge upstream
+        id: merge
+        env:
+          TARGET: ${{ inputs.target || 'release' }}
+        run: |
+          set -euo pipefail
+          node bulk/upstream.mjs merge --target "$TARGET" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # One branch per upstream target. If it exists, its pull request is
+      # open or was handled, and may hold a resolved merge, so leave it.
+      - name: Check for an existing sync branch
+        id: exists
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          BRANCH: ${{ steps.merge.outputs.branch }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$BRANCH already exists; leaving it and its pull request alone."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  checks:
+    name: Test the merged tree
+    needs: plan
+    if:
+      needs.plan.outputs.changed == 'true' && needs.plan.outputs.conflicts ==
+      'false' && (needs.plan.outputs.exists == 'false' || inputs.dry_run)
+    uses: ./.github/workflows/bulk_checks.yml
+    with:
+      ref: ${{ needs.plan.outputs.base }}
+      merge_upstream: ${{ needs.plan.outputs.target }}
+
+  pull-request:
+    name: Open the sync pull request
+    needs: [plan, checks]
+    if:
+      always() && needs.plan.outputs.changed == 'true' &&
+      (needs.plan.outputs.exists == 'false' || inputs.dry_run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.BULK_UPSTREAM_SYNC_TOKEN || github.token }}
+      HAS_SYNC_TOKEN: ${{ secrets.BULK_UPSTREAM_SYNC_TOKEN != '' }}
+      DRY_RUN: ${{ inputs.dry_run || false }}
+      BASE: ${{ needs.plan.outputs.base }}
+      TARGET: ${{ needs.plan.outputs.target }}
+      BRANCH: ${{ needs.plan.outputs.branch }}
+      CHECKS: ${{ needs.checks.result }}
+      RUN_URL:
+        ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{
+        github.run_id }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ needs.plan.outputs.base }}
+          fetch-depth: 0
+          token: ${{ secrets.BULK_UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Fetch upstream main
+        run:
+          git fetch --no-tags "$UPSTREAM_URL"
+          +refs/heads/main:refs/remotes/upstream/main
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          set -euo pipefail
+          git switch -c "$BRANCH"
+          node bulk/upstream.mjs merge --target "$TARGET" --commit-conflicts \
+            --body "$RUNNER_TEMP/body.md"
+          {
+            echo
+            echo "### Checks"
+            echo
+            case "$CHECKS" in
+              success)
+                echo "\`bulk_checks.yml\` passed on the merged tree: patch inventory, type check, build, \`bulk-tests\` (with the TypeScript 7 scale tests at 2,621 and 4,021 modules) and the system-udfs function spec tests. [Run]($RUN_URL)"
+                ;;
+              skipped)
+                echo "Not run: the merge has conflicts. Pushing the resolved merge runs \`bulk_checks.yml\` on this pull request."
+                ;;
+              *)
+                echo "**\`bulk_checks.yml\` did not pass on the merged tree ($CHECKS).** [Run]($RUN_URL)"
+                ;;
+            esac
+          } >> "$RUNNER_TEMP/body.md"
+
+      - name: Print the pull request (dry run)
+        if: env.DRY_RUN == 'true'
+        env:
+          TITLE: ${{ steps.merge.outputs.title }}
+        run: |
+          {
+            echo "## Dry run: would push \`$BRANCH\` and open"
+            echo
+            echo "**$TITLE**"
+            echo
+            cat "$RUNNER_TEMP/body.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push and open the pull request
+        if: env.DRY_RUN != 'true'
+        env:
+          TITLE: ${{ steps.merge.outputs.title }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          TOUCHES_WORKFLOWS: ${{ steps.merge.outputs.touches_workflows }}
+        run: |
+          set -euo pipefail
+          if [[ "$TOUCHES_WORKFLOWS" == true && "$HAS_SYNC_TOKEN" != true ]]; then
+            echo "::error::This upstream merge changes .github/workflows, which GITHUB_TOKEN cannot push. Set BULK_UPSTREAM_SYNC_TOKEN, or run the merge locally (BULK_FORK.md, \"Upstream sync\")."
+            exit 1
+          fi
+          git push origin "HEAD:refs/heads/$BRANCH"
+          draft=()
+          if [[ "$CONFLICTS" == true || "$CHECKS" != success ]]; then
+            draft=(--draft)
+          fi
+          gh pr create --base main \
+            --head "$BRANCH" --title "$TITLE" \
+            --body-file "$RUNNER_TEMP/body.md" "${draft[@]}"

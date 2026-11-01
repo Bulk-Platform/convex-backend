@@ -1,0 +1,70 @@
+# Bulk patch inventory: every path where the Bulk line (`main`) differs from
+# the upstream commit it last merged belongs to an entry here.
+#
+# `node bulk/upstream.mjs inventory` lists the Bulk-only diff by entry, and
+# `--check` (run by bulk_checks.yml) fails when a changed path matches no entry
+# or an entry matches no changed path. Add or remove lines in the same pull
+# request as the patch, and describe the patch in the document named after it.
+#
+# [Patch name] document that describes it
+# path glob (`*` within a directory, `**` across directories)
+
+[Fork tooling, CI and docs] BULK_FORK.md
+AGENTS.md
+BULK_FORK.md
+README.md
+bulk/**
+.github/workflows/bulk_*.yml
+# Upstream-only jobs (CLA, AWS runners) skip the fork; Prettier sets up Node.
+.github/workflows/build_local_backend.yml
+.github/workflows/cla.yml
+.github/workflows/prettier.yml
+
+[Runtime: HTTP listener concurrency knobs] BULK_FORK.md
+crates/common/src/knobs.rs
+crates/local_backend/src/lib.rs
+crates/local_backend/src/main.rs
+crates/local_backend/src/proxy.rs
+self-hosted/advanced/knobs.md
+self-hosted/docker/docker-compose.yml
+
+[Runtime: export memory fix from upstream PR #436] BULK_FORK.md
+crates/application/src/exports/mod.rs
+crates/application/src/exports/worker.rs
+crates/exports/src/export_storage.rs
+crates/storage/src/lib.rs
+
+[Runtime: glibc malloc_trim after exports and on a timer] BULK_FORK.md
+Cargo.lock
+crates/application/Cargo.toml
+crates/application/src/allocator.rs
+crates/application/src/lib.rs
+crates/application/src/exports/metrics.rs
+crates/application/src/exports/worker.rs
+
+[Runtime: paged function spec (apiSpecPage)] BULK_FORK.md
+npm-packages/system-udfs/convex/_system/cli/functionSpecPage.ts
+npm-packages/system-udfs/convex/_system/cli/functionSpecPage.test.ts
+npm-packages/system-udfs/convex/_system/cli/modules.ts
+npm-packages/system-udfs/scripts/api-spec-scale-test.mjs
+
+[npm: segmented api.d.ts and codegen] npm-packages/convex/BULK.md
+# The whole codegen_templates folder, so codegen patches (CommonJS, static)
+# land without editing this file.
+npm-packages/convex/src/cli/codegen_templates/*
+npm-packages/convex/bulk-tests/probes.ts
+npm-packages/convex/bulk-tests/scale_fixture.ts
+npm-packages/convex/bulk-tests/segmented_api*.test.ts
+npm-packages/convex/bulk-tests/tsconfig.json
+npm-packages/convex/eslint.config.mjs
+
+[npm: paged function spec and MCP functionSpec filters] npm-packages/convex/BULK.md
+npm-packages/convex/src/cli/lib/functionSpec.ts
+npm-packages/convex/src/cli/lib/run.ts
+npm-packages/convex/src/cli/lib/mcp/tools/functionSpec.ts
+npm-packages/convex/bulk-tests/function_spec.test.ts
+npm-packages/convex/bulk-tests/mcp_function_spec.test.ts
+
+[npm: @bulk-platform/convex release] npm-packages/convex/BULK.md
+npm-packages/convex/BULK.md
+npm-packages/convex/scripts/version-check.mjs
