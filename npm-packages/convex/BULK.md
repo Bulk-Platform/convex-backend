@@ -68,7 +68,9 @@ time and 70% more memory at 4,000 modules).
 2. Push `bulk/convex-npm`, then tag the commit
    `convex-npm/v<package.json version>-bulk.<n>` and push the tag.
    `.github/workflows/bulk_release_convex_npm.yml` tests, packs and publishes
-   `@bulk-platform/convex` to GitHub Packages with dist-tag `latest`.
+   `@bulk-platform/convex` to GitHub Packages with dist-tag `latest`. Packing
+   builds the package with `uv run --script scripts/build.py` (since upstream
+   1.48.0), so a local `npm pack` needs `uv` too.
 3. In `bulk_v3/backend_v3`, bump the alias in `package.json`, run
    `pnpm install`, regenerate `convex/_generated` with
    `pnpm exec convex codegen` and run `pnpm run sync-types:all`. Keep Yogi's
