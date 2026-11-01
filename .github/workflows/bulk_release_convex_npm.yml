@@ -41,6 +41,11 @@ jobs:
           registry-url: https://npm.pkg.github.com
           scope: "@bulk-platform"
 
+      # `npm pack` runs the package build, `uv run --script scripts/build.py`
+      # since upstream 1.48.0.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
       - name: Read release version from tag
         run: |
           set -euo pipefail
