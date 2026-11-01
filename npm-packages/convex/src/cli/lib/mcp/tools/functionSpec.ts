@@ -170,11 +170,12 @@ function shapeEntry(entry: FunctionSpecEntry, shape: Shape): FunctionSpecEntry {
   if (shape.validatorFormat === "json") {
     return entry;
   }
-  return {
-    ...rest,
-    args: compactValidator(args as ValidatorJSON),
-    returns: compactValidator(returns as ValidatorJSON),
-  };
+  // A function without a validator has `null` here; keep it as is.
+  const compact = (validator: unknown) =>
+    validator === null || validator === undefined
+      ? validator
+      : compactValidator(validator as ValidatorJSON);
+  return { ...rest, args: compact(args), returns: compact(returns) };
 }
 
 /**
