@@ -1,18 +1,20 @@
 # Bulk fork of the `convex` npm package
 
 `Bulk-Platform/bulk_v3` installs this package as
-`"convex": "npm:@bulk-platform/convex@<version>"` in `backend_v3`, where the
-Convex CLI runs codegen and deploys. Clients (Yogi, services) keep the public
-`convex` package of the same upstream version; the client runtime is unchanged.
+`"convex": "npm:@bulk-platform/convex@<version>"` everywhere it installs
+`convex`: `backend_v3`, where the Convex CLI runs codegen and deploys, and the
+clients (Yogi, the MCP and search services, the backup image). The client
+runtime is upstream's, unchanged.
 
-A client that type-checks against the backend's modules must take the Convex
-types from one copy of the package. TypeScript merges two copies only when their
-name and version match, and with `ApiFromModules` from the client's `convex`
-applied to modules typed by the backend's `@bulk-platform/convex`, every action
-types as `FunctionReference<"action", "public", DefaultFunctionArgs, unknown>`.
-So Yogi's `convex-generated/*.d.ts` re-export `backend_v3/convex/_generated/*`
-rather than copying the files with rewritten module imports. A client that
-copies them instead must install this package at the same version.
+One package everywhere keeps one copy of the Convex types in a client that
+type-checks against the backend's modules. TypeScript merges two installs only
+when their name and version match; with `ApiFromModules` from a different
+`convex` applied to modules typed by this package, every action types as
+`FunctionReference<"action", "public", DefaultFunctionArgs, unknown>`. Yogi's
+`convex-generated/*.d.ts` still re-export `backend_v3/convex/_generated/*`
+rather than copying the files, so they never go stale. bulk_v3's
+`check-convex-pins` requires the same spec in every manifest, lockfile and
+Dockerfile.
 
 The package builds from the fork's `main`, the Bulk line it shares with the
 runtime image. `main` merges upstream at its npm releases, so the package is
@@ -127,10 +129,13 @@ such keys as `{}`.
    `uv run --script scripts/build.py` (since upstream 1.48.0), so a local
    `npm pack` needs `uv` too.
 
-3. In `bulk_v3/backend_v3`, bump the alias in `package.json`, run
-   `pnpm install`, regenerate `convex/_generated` with
-   `pnpm exec convex codegen` and run `pnpm run sync-types:all`. Keep Yogi's
-   public `convex` at the same upstream version.
+3. In `bulk_v3`, bump the alias in every `package.json` that has it
+   (`check-convex-pins` lists any that lag) and their lockfiles: `pnpm install`
+   in `backend_v3` (its workspace includes the services), `npm install` in
+   `app_v3/yogi` and each service, and `pnpm install --lockfile-only` in
+   `app_v3/yogi`. Bump the spec in `backend_v3/Dockerfile.backup`, regenerate
+   `convex/_generated` with `pnpm exec convex codegen` and run
+   `pnpm run sync-types:all`.
 
 `<n>` starts at 1 for each upstream release. `node bulk/upstream.mjs status`
 shows what a release from `HEAD` would contain.
@@ -174,9 +179,17 @@ project that installs the package has this `.npmrc`:
   the package's "Manage Actions access", give the job
   `permissions: packages: read`, and set
   `NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` on install steps.
-- Docker builds: pass the token as a build secret
-  (`RUN --mount=type=secret,id=npm_token NODE_AUTH_TOKEN=$(cat /run/secrets/npm_token) npm ci`),
-  never as a build argument.
+- Docker builds: pass the token as a build secret, never as a build argument:
+  `RUN --mount=type=secret,id=NODE_AUTH_TOKEN,required=true NODE_AUTH_TOKEN="$(cat /run/secrets/NODE_AUTH_TOKEN)" npm ci`,
+  built with `docker build --secret id=NODE_AUTH_TOKEN,env=NODE_AUTH_TOKEN`
+  (`secrets: NODE_AUTH_TOKEN=${{ secrets.GITHUB_TOKEN }}` in
+  `docker/build-push-action`).
+- Optional peers: GitHub Packages drops `peerDependenciesMeta` from the metadata
+  it serves, so the auth peers (`@auth0/auth0-react`, `@clerk/clerk-react`,
+  `@clerk/react`, `react`) look required and npm or pnpm install them. pnpm
+  projects restore the flags with `packageExtensions` in `pnpm-workspace.yaml`;
+  npm projects set `legacy-peer-deps=true` and list the peers they do need as
+  their own dependencies.
 
 ## Taking a newer upstream release
 
