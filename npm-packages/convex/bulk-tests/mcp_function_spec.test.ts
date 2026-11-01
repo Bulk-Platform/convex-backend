@@ -180,6 +180,33 @@ describe("functionSpec MCP tool", () => {
     expect(error).not.toContain("Set identifierPrefix");
     expect(error).toContain("Or raise maxCharacters.");
   });
+
+  // A function without a `returns` validator comes back as `returns: null`,
+  // e.g. @convex-dev/auth's `auth.js:signIn`.
+  test("keeps a missing returns validator as null", async () => {
+    fetchFunctionSpecs.mockResolvedValue(
+      [{ ...fn("auth.js:signIn", "Action"), returns: null }, ...spec].map(
+        (entry) => jsonToConvex(entry),
+      ),
+    );
+    expect(
+      await call({ identifierPrefix: "auth", validatorFormat: "compact" }),
+    ).toEqual([
+      {
+        identifier: "auth.js:signIn",
+        functionType: "Action",
+        visibility: { kind: "public" },
+        args: "{ n: int64 }",
+        returns: null,
+      },
+    ]);
+    const error = await call({ maxCharacters: 500 }).then(
+      () => null,
+      (e: Error) => e.message,
+    );
+    expect(error).toContain('Set validatorFormat: "compact"');
+    expect(error).toMatch(/"auth\.js:": 1 entries/);
+  });
 });
 
 describe("modulePathPrefix", () => {
