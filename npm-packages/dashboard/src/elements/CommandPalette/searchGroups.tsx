@@ -4,6 +4,7 @@ import { useCurrentTeam } from "api/teams";
 import { useInfiniteProjects } from "api/projects";
 import { useInfiniteDeployments } from "api/deployments";
 import { useHasCustomRolePermission } from "api/roles";
+import { PROPOSED_PROJECT_RESOURCE } from "lib/permissions";
 import { useCreateProjectModalRequest } from "hooks/useCreateProjectModal";
 import { permissionDeniedTip } from "elements/permissionDeniedTip";
 import type { ProjectDetails, TeamResponse } from "generatedApi";
@@ -37,7 +38,7 @@ export function SwitchProjectCommands({
   const canCreateCustom = useHasCustomRolePermission(
     team?.id,
     "project:create",
-    { segments: [{ kind: "project", id: 0, slug: "" }] },
+    PROPOSED_PROJECT_RESOURCE,
     true,
   );
 

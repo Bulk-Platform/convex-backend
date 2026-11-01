@@ -59,7 +59,10 @@ The typical approval flow involves four server functions:
    generation pauses and the `tool-approval-request` is persisted in the thread.
 3. **Submit an approval or denial** for each pending tool call.
    `approveToolCall` and `denyToolCall` work from both mutations and actions.
-4. **Continue generation** from the returned message ID.
+4. **Continue generation** by running the same action with the returned message
+   ID as the prompt. Schedule it from the mutation that saves the last pending
+   decision in the step, so continuation does not depend on the client staying
+   connected.
 
 ```ts
 import { approvalAgent } from "../agents/approval";
@@ -80,7 +83,7 @@ export const sendMessage = mutation({
   },
 });
 
-// 2. Generate (stops if approval is needed)
+// 2. Generate (stops if approval is needed). Also continues after approvals.
 export const generateResponse = internalAction({
   args: { promptMessageId: v.string(), threadId: v.string() },
   handler: async (ctx, { promptMessageId, threadId }) => {
@@ -114,22 +117,10 @@ export const submitApproval = mutation({
           approvalId,
           reason,
         });
+    // 4. If no approval request in this step is still undecided, schedule
+    // generateResponse with promptMessageId: messageId. See the example
+    // files below.
     return { messageId };
-  },
-});
-
-// 4. Continue generation from the saved approval decision.
-//    Pass the last approval message ID as promptMessageId so the agent
-//    resumes generation from where the approval was issued.
-export const continueAfterApprovals = internalAction({
-  args: { threadId: v.string(), lastApprovalMessageId: v.string() },
-  handler: async (ctx, { threadId, lastApprovalMessageId }) => {
-    const result = await approvalAgent.streamText(
-      ctx,
-      { threadId },
-      { promptMessageId: lastApprovalMessageId },
-    );
-    await result.consumeStream();
   },
 });
 ```
@@ -190,14 +181,11 @@ Approve/Deny buttons. Tool parts with `state === "approval-requested"` are
 waiting for a decision.
 
 ```tsx
-import { useEffect, useRef } from "react";
 import { useMutation } from "convex/react";
 import { useUIMessages, type UIMessage } from "@convex-dev/agent/react";
 import type { ToolUIPart } from "ai";
 
 function Chat({ threadId }: { threadId: string }) {
-  const lastApprovalMessageIdRef = useRef<string | null>(null);
-
   const { results: messages } = useUIMessages(
     api.chat.approval.listThreadMessages,
     { threadId },
@@ -205,9 +193,6 @@ function Chat({ threadId }: { threadId: string }) {
   );
 
   const submitApproval = useMutation(api.chat.approval.submitApproval);
-  const triggerContinuation = useMutation(
-    api.chat.approval.triggerContinuation,
-  );
 
   const hasPendingApprovals = messages.some((m) =>
     m.parts.some(
@@ -217,18 +202,8 @@ function Chat({ threadId }: { threadId: string }) {
     ),
   );
 
-  // When all approvals are resolved, trigger continuation
-  useEffect(() => {
-    if (!hasPendingApprovals && lastApprovalMessageIdRef.current) {
-      void triggerContinuation({
-        threadId,
-        lastApprovalMessageId: lastApprovalMessageIdRef.current,
-      });
-      lastApprovalMessageIdRef.current = null;
-    }
-  }, [hasPendingApprovals, threadId, triggerContinuation]);
-
   // Render approval buttons for tool parts with state "approval-requested"
+  // and call submitApproval. The server continues generation.
   // ...
 }
 ```

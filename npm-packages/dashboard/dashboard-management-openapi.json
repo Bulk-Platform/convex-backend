@@ -546,6 +546,18 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "tag",
+            "in": "query",
+            "description": "Only return projects with this tag. This parameter can be provided more than once to match projects with any of several tags",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
           }
         ],
         "responses": {
@@ -1617,6 +1629,30 @@
             "in": "path",
             "description": "Team ID",
             "required": true
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Inclusive lower bound in YYYY-MM-DD format, using UTC.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "Inclusive upper bound in YYYY-MM-DD format, using UTC.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -2079,49 +2115,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/TeamCurrentBillingPeriodResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/teams/{team_slug}/usage/get_token_info": {
-      "get": {
-        "operationId": "get_token_info",
-        "parameters": [
-          {
-            "name": "team_slug",
-            "in": "path",
-            "description": "",
-            "required": true
-          },
-          {
-            "name": "from",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            },
-            "style": "form"
-          },
-          {
-            "name": "to",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            },
-            "style": "form"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GetTokenInfoResponse"
                 }
               }
             }
@@ -4917,23 +4910,11 @@
       "GetPricesPlanResponse": {
         "type": "object",
         "required": [
-          "planType",
-          "planVersion"
+          "planType"
         ],
         "properties": {
           "planType": {
             "type": "string"
-          },
-          "planVersion": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "activePhase": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
           }
         }
       },
@@ -5030,49 +5011,6 @@
                 "$ref": "#/components/schemas/SpendingLimitsState"
               }
             ]
-          }
-        }
-      },
-      "GetTokenInfoResponse": {
-        "type": "object",
-        "required": [
-          "tokensUsed",
-          "tokensQuota",
-          "centitokensUsed",
-          "centitokensQuota",
-          "isTeamDisabled",
-          "isPaidPlan",
-          "planType"
-        ],
-        "properties": {
-          "tokensUsed": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "tokensQuota": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "centitokensUsed": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "centitokensQuota": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "isTeamDisabled": {
-            "type": "boolean"
-          },
-          "isPaidPlan": {
-            "type": "boolean"
-          },
-          "planType": {
-            "type": "string"
           }
         }
       },
@@ -6194,6 +6132,27 @@
               "string",
               "null"
             ]
+          },
+          "prodDeploymentReference": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "devDeploymentReference": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
@@ -6570,7 +6529,7 @@
           },
           "resource": {
             "type": "string",
-            "description": "Resource path like `project:*`, `project:slug=my-app`, or\n`project:*:deployment:type=prod`.",
+            "description": "Resource path like `project:*`, `project:slug=my-app`,\n`project:tag=prod`, or `project:*:deployment:type=prod`.",
             "example": "project:*"
           }
         }
@@ -6625,6 +6584,7 @@
           "team:domain:create",
           "team:domain:delete",
           "team:domain:view",
+          "team:projectTags:view",
           "team:token:create",
           "team:token:update",
           "team:token:delete",

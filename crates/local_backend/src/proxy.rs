@@ -15,7 +15,10 @@ use common::{
         HttpResponseError,
         NoopRouteMapper,
     },
-    knobs::HTTP_SERVER_TIMEOUT_DURATION,
+    knobs::{
+        HTTP_SERVER_TIMEOUT_DURATION,
+        SITE_PROXY_MAX_CONCURRENT_REQUESTS,
+    },
 };
 use hyper_util::rt::TokioExecutor;
 
@@ -29,7 +32,11 @@ pub async fn dev_site_proxy(
         return Ok(());
     };
     let addr = SocketAddr::from(addr);
-    tracing::info!("Starting dev site proxy at {:?}...", addr);
+    tracing::info!(
+        "Starting dev site proxy at {:?} with max_concurrent_requests={}...",
+        addr,
+        *SITE_PROXY_MAX_CONCURRENT_REQUESTS,
+    );
 
     async fn proxy_method(
         State(site_forward_prefix): State<String>,
@@ -60,7 +67,7 @@ pub async fn dev_site_proxy(
         Router::new().fallback_service(router),
         "backend_http_proxy",
         "unknown".to_string(),
-        4,
+        *SITE_PROXY_MAX_CONCURRENT_REQUESTS,
         *HTTP_SERVER_TIMEOUT_DURATION,
         NoopRouteMapper,
     );

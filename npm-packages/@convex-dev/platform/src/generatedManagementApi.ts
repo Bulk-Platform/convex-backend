@@ -44,7 +44,7 @@ export interface paths {
         head?: never;
         /**
          * Update project
-         * @description Update a project's name and/or slug. Returns the updated project.
+         * @description Update a project's name, slug, and/or tags. Returns the updated project.
          */
         patch: operations["update project"];
         trace?: never;
@@ -63,6 +63,28 @@ export interface paths {
          *     as `cursor` to fetch the next page.
          */
         get: operations["list projects"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/list_project_tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List project tags
+         * @description List a page of the distinct tags used by a team's projects, ordered by tag
+         *     name. Pass the `nextCursor` from the previous response as `cursor` to fetch
+         *     the next page.
+         */
+        get: operations["list project tags"];
         put?: never;
         post?: never;
         delete?: never;
@@ -858,7 +880,9 @@ export interface paths {
          * Update default environment variables
          * @description Creates, updates, or deletes default environment variables for the specified
          *     project. When `value` is a string, the variable is upserted. When `value` is
-         *     null, the variable is deleted.
+         *     null, the variable is deleted. Each item in `changes` can set
+         *     `applyToExistingDeployments` to true to asynchronously upsert or delete the
+         *     variable on every existing cloud deployment of that item's `deploymentType`.
          */
         post: operations["update default environment variables"];
         delete?: never;
@@ -1104,6 +1128,9 @@ export interface components {
              *     environment variable with the given name and deployment
              *     type if it exists (and do nothing if it doesn’t exist). */
             value?: string | null;
+            /** @description Apply this change to every existing cloud deployment of the selected
+             *     type, overwriting/deleting any existing values. Defaults to false. */
+            applyToExistingDeployments?: boolean;
         };
         DefaultEnvironmentVariableResponse: {
             name: string;
@@ -1291,6 +1318,7 @@ export interface components {
              *     used. */
             deploymentClass?: string | null;
             deploymentRegion?: null | components["schemas"]["RegionName"];
+            tags?: string[] | null;
         };
         PlatformCreateProjectResponse: {
             /** @description Deprecated alias for `id`, kept for backwards compatibility. */
@@ -1551,6 +1579,9 @@ export interface components {
         PlatformUpdateProjectArgs: {
             name?: null | components["schemas"]["ProjectName"];
             slug?: null | components["schemas"]["ProjectSlug"];
+            /** @description Replaces the project's full set of tags; `[]` clears them. If omitted,
+             *     the tags are left unchanged. */
+            tags?: string[] | null;
         };
         PreviewDeploymentIdentifier: string;
         /** Format: int64 */
@@ -1577,8 +1608,23 @@ export interface components {
              *     this project, if one exists (an active local deployment or default
              *     cloud dev deployment). */
             devDeploymentName?: string | null;
+            /** @description The reference of the default production deployment for this project,
+             *     if one exists (e.g. "production"). */
+            prodDeploymentReference?: string | null;
+            /** @description The reference of the requesting member's default development deployment
+             *     for this project, if one exists and is a cloud deployment (e.g.
+             *     "dev/jane-doe"). */
+            devDeploymentReference?: string | null;
+            tags?: string[] | null;
         };
         ProjectSlug: string;
+        ProjectTagResponse: {
+            name: string;
+        };
+        ProjectTagsResponse: {
+            items: components["schemas"]["ProjectTagResponse"][];
+            pagination: components["schemas"]["PaginationMetadata"];
+        };
         ProposedTeamName: string;
         ReferralCode: string;
         /** @enum {string} */
@@ -1592,8 +1638,8 @@ export interface components {
             effect: components["schemas"]["RoleStatementEffect"];
             actions: components["schemas"]["RoleStatementActions"];
             /**
-             * @description Resource path like `project:*`, `project:slug=my-app`, or
-             *     `project:*:deployment:type=prod`.
+             * @description Resource path like `project:*`, `project:slug=my-app`,
+             *     `project:tag=prod`, or `project:*:deployment:type=prod`.
              * @example project:*
              */
             resource: string;
@@ -1602,7 +1648,7 @@ export interface components {
          * @description An action that can be allowed or denied by a custom role statement.
          * @enum {string}
          */
-        RoleStatementAction: "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "project:view" | "project:updateMemberRole" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "defaultEnvironmentVariable:view" | "deployment:create" | "deployment:transfer" | "deployment:receive" | "deployment:updateReference" | "deployment:updateDashboardEditConfirmation" | "deployment:updateExpiresAt" | "deployment:updateSendLogsToClient" | "deployment:updateClass" | "deployment:updateIsDefault" | "deployment:updateType" | "deployment:delete" | "deployment:view" | "deployment:integrations:view" | "deployment:integrations:write" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:customDomain:view" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "member:view" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:changePlan" | "billing:spendingLimit:update" | "billing:view" | "billing:invoices:view" | "team:auditLog:view" | "team:domain:create" | "team:domain:delete" | "team:domain:view" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:view" | "oauthApplication:generateClientSecret" | "team:usage:view" | "deployment:insights:view" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "deployment:backups:view" | "sso:enable" | "sso:disable" | "sso:update" | "sso:view" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "directorySync:view" | "customRole:view" | "integration:view" | "integration:create" | "integration:update" | "integration:delete" | "deployment:deploy" | "deployment:env:view" | "deployment:env:write" | "deployment:pause" | "deployment:unpause" | "deployment:logs:view" | "deployment:metrics:view" | "deployment:data:view" | "deployment:data:write" | "deployment:backups:download" | "deployment:functions:actAsUser" | "deployment:functions:runInternalQueries" | "deployment:functions:runInternalMutations" | "deployment:functions:runInternalActions" | "deployment:functions:runTestQuery" | "deployment:auditLog:view" | "deployment:usageLimits:view" | "deployment:usageLimits:write" | "deployment:usage:view" | "deployment:aiGateway:use";
+        RoleStatementAction: "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "project:view" | "project:updateMemberRole" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "defaultEnvironmentVariable:view" | "deployment:create" | "deployment:transfer" | "deployment:receive" | "deployment:updateReference" | "deployment:updateDashboardEditConfirmation" | "deployment:updateExpiresAt" | "deployment:updateSendLogsToClient" | "deployment:updateClass" | "deployment:updateIsDefault" | "deployment:updateType" | "deployment:delete" | "deployment:view" | "deployment:integrations:view" | "deployment:integrations:write" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:customDomain:view" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "member:view" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:changePlan" | "billing:spendingLimit:update" | "billing:view" | "billing:invoices:view" | "team:auditLog:view" | "team:domain:create" | "team:domain:delete" | "team:domain:view" | "team:projectTags:view" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:view" | "oauthApplication:generateClientSecret" | "team:usage:view" | "deployment:insights:view" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "deployment:backups:view" | "sso:enable" | "sso:disable" | "sso:update" | "sso:view" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "directorySync:view" | "customRole:view" | "integration:view" | "integration:create" | "integration:update" | "integration:delete" | "deployment:deploy" | "deployment:env:view" | "deployment:env:write" | "deployment:pause" | "deployment:unpause" | "deployment:logs:view" | "deployment:metrics:view" | "deployment:data:view" | "deployment:data:write" | "deployment:backups:download" | "deployment:functions:actAsUser" | "deployment:functions:runInternalQueries" | "deployment:functions:runInternalMutations" | "deployment:functions:runInternalActions" | "deployment:functions:runTestQuery" | "deployment:auditLog:view" | "deployment:usageLimits:view" | "deployment:usageLimits:write" | "deployment:usage:view" | "deployment:aiGateway:use";
         RoleStatementActions: components["schemas"]["RoleStatementWildcardAction"] | components["schemas"]["RoleStatementAction"][];
         /**
          * @description Whether a rule grants or revokes access.
@@ -1766,6 +1812,8 @@ export type ProjectId = components['schemas']['ProjectId'];
 export type ProjectName = components['schemas']['ProjectName'];
 export type ProjectResponse = components['schemas']['ProjectResponse'];
 export type ProjectSlug = components['schemas']['ProjectSlug'];
+export type ProjectTagResponse = components['schemas']['ProjectTagResponse'];
+export type ProjectTagsResponse = components['schemas']['ProjectTagsResponse'];
 export type ProposedTeamName = components['schemas']['ProposedTeamName'];
 export type ReferralCode = components['schemas']['ReferralCode'];
 export type RegionName = components['schemas']['RegionName'];
@@ -1872,6 +1920,8 @@ export interface operations {
                 limit?: number;
                 /** @description Search query to filter projects by name or slug (case-insensitive) */
                 q?: string;
+                /** @description Only return projects with this tag. This parameter can be provided more than once to match projects with any of several tags */
+                tag?: string[];
             };
             header?: never;
             path: {
@@ -1888,6 +1938,33 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PlatformPaginatedProjectsResponse"];
+                };
+            };
+        };
+    };
+    "list project tags": {
+        parameters: {
+            query?: {
+                /** @description Cursor for pagination */
+                cursor?: string;
+                /** @description Maximum number of tags to return (default: 100, max: 100) */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Team ID */
+                team_id: components["schemas"]["TeamId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectTagsResponse"];
                 };
             };
         };

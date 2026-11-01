@@ -1,8 +1,9 @@
 name: Release Bulk Convex npm package
 
 # Publishes npm-packages/convex as @bulk-platform/convex to GitHub Packages.
-# Push a tag `convex-npm/v<upstream version>-bulk.<n>` on the bulk/convex-npm
-# branch, for example `convex-npm/v1.46.0-bulk.1`. See npm-packages/convex/BULK.md.
+# Push a tag `convex-npm/v<upstream version>-bulk.<n>` on a commit on main, for
+# example `convex-npm/v1.49.0-bulk.1`, where <upstream version> is the upstream
+# npm release main has merged. See npm-packages/convex/BULK.md, "Release".
 on:
   push:
     tags:
@@ -28,6 +29,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # The release checks need main and the upstream history.
+          fetch-depth: 0
 
       - name: Set up pnpm
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
@@ -56,6 +60,39 @@ jobs:
             exit 1
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      # The package must be an upstream npm release plus the Bulk patches:
+      # package.json matches the newest upstream release merged, and no
+      # upstream npm-package commit after that release is included, unless the
+      # annotated tag message has an `Allow-Unreleased-Upstream: yes` line.
+      - name: Check the release commit
+        working-directory: .
+        run: |
+          set -euo pipefail
+          on_line="$(git branch -r --contains "$GITHUB_SHA" --format='%(refname:short)' |
+            grep -E '^origin/(main|bulk/convex-npm-.+)$' || true)"
+          if [[ -z "$on_line" ]]; then
+            echo "$GITHUB_REF_NAME must tag a commit on main or a bulk/convex-npm-* maintenance branch" >&2
+            exit 1
+          fi
+          # actions/checkout stores the tag as a lightweight tag.
+          git fetch --force --no-tags origin "+refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          git fetch --no-tags https://github.com/convex/convex-backend.git \
+            +refs/heads/main:refs/remotes/upstream/main
+          allow=()
+          if git tag -l --format='%(contents)' "$GITHUB_REF_NAME" |
+            grep -Eiq '^Allow-Unreleased-Upstream:[[:space:]]*yes[[:space:]]*$'; then
+            allow=(--allow-unreleased)
+          fi
+          {
+            echo "## @bulk-platform/convex@$VERSION"
+            echo
+            echo '```'
+            node bulk/upstream.mjs status --check-release "${allow[@]}"
+            echo '```'
+            node bulk/upstream.mjs inventory --markdown
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          node bulk/upstream.mjs inventory --check > /dev/null
 
       - name: Install dependencies
         working-directory: npm-packages

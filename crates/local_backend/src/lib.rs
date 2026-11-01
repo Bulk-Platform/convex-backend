@@ -30,6 +30,7 @@ use common::{
         RouteMapper,
     },
     knobs::{
+        ALLOCATOR_MALLOC_TRIM_INTERVAL_SECS,
         DOCUMENT_RETENTION_RATE_LIMIT,
         INDEX_CACHE_SIZE,
         NODE_ACTION_USER_TIMEOUT,
@@ -118,8 +119,6 @@ pub mod streaming_import;
 pub mod subs;
 pub mod usage_limits;
 
-pub const MAX_CONCURRENT_REQUESTS: usize = 128;
-
 #[derive(Clone)]
 pub struct LocalAppState {
     // Origin for the server (e.g. http://127.0.0.1:3210, https://demo.convex.cloud)
@@ -160,6 +159,8 @@ pub async fn make_app(
     zombify_rx: async_broadcast::Receiver<()>,
     preempt_tx: ShutdownSignal,
 ) -> anyhow::Result<LocalAppState> {
+    let trim_interval =
+        application::allocator::periodic_trim_interval(*ALLOCATOR_MALLOC_TRIM_INTERVAL_SECS)?;
     let key_broker = config.key_broker()?;
     let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
     let searcher: Arc<dyn Searcher> = in_process_searcher.clone();
@@ -275,7 +276,6 @@ pub async fn make_app(
         QueryCache::new(*UDF_CACHE_MAX_SIZE),
         fetch_client,
         proxied_sentry_transport_factory(config.convex_http_proxy.clone(), config.name()),
-        config.local_log_sink.clone(),
         preempt_tx.clone(),
         Arc::new(InProcessExportProvider),
         deleted_tablet_receiver,
@@ -290,6 +290,21 @@ pub async fn make_app(
 
     let origin = config.convex_origin_url()?;
     let instance_name = config.name();
+
+    if let Some(interval) = trim_interval {
+        let trim_runtime = runtime.clone();
+        runtime.spawn_background("periodic_allocator_cleanup", async move {
+            loop {
+                // Delay the first pass and wait after completion, avoiding a
+                // burst of catch-up passes when an allocator operation is slow.
+                trim_runtime.wait(interval).await;
+                application::allocator::trim_allocator(
+                    application::allocator::TrimReason::Periodic,
+                )
+                .await;
+            }
+        });
+    }
 
     if !config.disable_beacon {
         let beacon_future = beacon::start_beacon(
@@ -314,6 +329,28 @@ pub async fn make_app(
 
 #[derive(Clone)]
 pub struct HttpActionRouteMapper;
+
+#[cfg(test)]
+mod allocator_tests {
+    use std::time::Duration;
+
+    use application::allocator::periodic_trim_interval;
+
+    #[test]
+    fn periodic_cleanup_is_explicit_and_bounded() {
+        assert_eq!(periodic_trim_interval(0).unwrap(), None);
+        assert!(periodic_trim_interval(1).is_err());
+        assert!(periodic_trim_interval(59).is_err());
+        assert_eq!(
+            periodic_trim_interval(60).unwrap(),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            periodic_trim_interval(300).unwrap(),
+            Some(Duration::from_secs(300))
+        );
+    }
+}
 
 impl RouteMapper for HttpActionRouteMapper {
     fn map_route(&self, route: String) -> String {

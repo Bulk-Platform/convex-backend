@@ -6,6 +6,13 @@
 </picture>
 </p>
 
+> **Bulk Platform fork:** This repository is the production fork of
+> [`convex/convex-backend`](https://github.com/convex/convex-backend). Bulk
+> keeps a small patch set and publishes an immutable backend image and the
+> `@bulk-platform/convex` npm package from this fork's `main`. Read
+> [BULK_FORK.md](./BULK_FORK.md) before upgrading, releasing, or changing
+> runtime behavior.
+
 [Convex](https://convex.dev) is the open-source reactive database designed to
 make life easy for web app developers, whether human or LLM. Fetch data and
 perform business logic with strong consistency by writing pure TypeScript.

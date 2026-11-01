@@ -225,21 +225,6 @@ impl<'a, RT: Runtime> LogSinksModel<'a, RT> {
         Ok(id.developer_id)
     }
 
-    // It's generally not safe to delete an existing sink without marking it
-    // Tombstoned first since the LogManager will not know to remove the sink.
-    // However, we can do this during startup before the LogManager has started
-    // (like when adding a local log sink)
-    pub async fn add_on_startup(&mut self, config: SinkConfig) -> anyhow::Result<()> {
-        // Search for matching provider
-        if let Some(sink) = self.get_by_provider(config.sink_type()).await? {
-            SystemMetadataModel::new_global(self.tx)
-                .delete(sink.id())
-                .await?;
-        };
-        self.add_or_update(config).await?;
-        Ok(())
-    }
-
     pub async fn clear(&mut self) -> anyhow::Result<()> {
         let providers = self.get_all().await?;
 

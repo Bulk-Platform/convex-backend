@@ -14,6 +14,7 @@ use common::{
     },
     errors::report_error,
     execution_context::ExecutionId,
+    knobs::EXPORT_MALLOC_TRIM_ENABLED,
     runtime::Runtime,
     types::UdfIdentifier,
     RequestId,
@@ -52,12 +53,24 @@ use usage_tracking::{
 use value::ResolvedDocumentId;
 
 use crate::{
+    allocator::{
+        trim_allocator,
+        TrimReason,
+    },
     exports::metrics::log_export_failed,
     metrics::log_worker_starting,
 };
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(900); // 15 minutes
+
+async fn maybe_trim_allocator_after_export() {
+    if !*EXPORT_MALLOC_TRIM_ENABLED {
+        return;
+    }
+
+    trim_allocator(TrimReason::Export).await;
+}
 
 #[derive(thiserror::Error, Debug)]
 #[error("Export canceled")]
@@ -165,6 +178,7 @@ impl<RT: Runtime> ExportWorker<RT> {
         loop {
             match self.export_and_mark_complete(export.clone()).await {
                 Ok(()) => {
+                    maybe_trim_allocator_after_export().await;
                     return Ok(());
                 },
                 Err(mut e) => {

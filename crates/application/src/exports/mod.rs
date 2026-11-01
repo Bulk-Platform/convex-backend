@@ -1,2 +1,2 @@
-mod metrics;
+pub(crate) mod metrics;
 pub mod worker;

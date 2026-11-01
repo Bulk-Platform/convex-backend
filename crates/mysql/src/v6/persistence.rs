@@ -25,7 +25,6 @@ use common::{
         lease_lost_error,
     },
     interval::Interval,
-    knobs::MYSQL_FALLBACK_PAGE_SIZE,
     persistence::{
         ConflictStrategy,
         DocumentLogEntry,
@@ -99,7 +98,6 @@ use crate::{
         ApproxSize,
     },
     connection::{
-        is_message_too_large_error,
         MySqlConnection,
         MySqlTransaction,
     },
@@ -428,7 +426,7 @@ impl<RT: Runtime> Reader<RT> {
         include_previous_revision: bool,
         range: TimestampRange,
         order: Order,
-        mut page_size: u32,
+        page_size: u32,
         retention_validator: Arc<dyn RetentionValidator>,
     ) {
         anyhow::ensure!(page_size > 0);
@@ -464,26 +462,9 @@ impl<RT: Runtime> Reader<RT> {
                 params.push(Value::Bytes(tablet_id.0.into()));
             }
             params.push(Value::Int(i64::from(page_size)));
-            let rows = match connection
+            let rows = connection
                 .query_collect(&query, params, page_size as usize, Ok)
-                .await
-            {
-                Ok(rows) => rows,
-                Err(ref error) if is_message_too_large_error(error).is_some() => {
-                    if page_size == 1 {
-                        anyhow::bail!(
-                            "Failed to load a V6 document within the Vitess message limit"
-                        );
-                    }
-                    page_size = if page_size <= *MYSQL_FALLBACK_PAGE_SIZE {
-                        1
-                    } else {
-                        *MYSQL_FALLBACK_PAGE_SIZE
-                    };
-                    continue;
-                },
-                Err(error) => return Err(error),
-            };
+                .await?;
             drop(connection);
             retention_validator
                 .validate_document_snapshot(range.min_timestamp_inclusive())
@@ -568,7 +549,7 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
         }
         let cluster_name = self.inner.pool.cluster_name();
         self.lease
-            .transact(async |tx| {
+            .transact("write", async |tx| {
                 for chunk in fill_chunks(document_updates) {
                     let query = match conflict_strategy {
                         ConflictStrategy::Error => documents::insert_chunk(chunk.len()),
@@ -624,7 +605,7 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
         let cluster_name = self.inner.pool.cluster_name();
         for chunk in fill_chunks(&rows) {
             self.lease
-                .transact(async |tx| {
+                .transact("write_index_backfill", async |tx| {
                     self.inner
                         .engine
                         .write_backfill_chunk(tx, chunk, cluster_name)
@@ -665,7 +646,7 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
             Value::Bytes(serde_json::to_vec(&value)?),
         ];
         self.lease
-            .transact(async |tx| {
+            .transact("write_persistence_global", async |tx| {
                 tx.exec_drop(super::WRITE_PERSISTENCE_GLOBAL, params)
                     .await?;
                 Ok(())
@@ -739,7 +720,7 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
             }
         });
         self.lease
-            .transact(async |tx| {
+            .transact("delete_documents", async |tx| {
                 let mut deleted = 0;
                 for chunk in fill_chunks(&document_ids) {
                     let mut params = vec![self.inner.deployment_id.into()];
@@ -765,7 +746,7 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
         chunk_size: usize,
     ) -> anyhow::Result<usize> {
         self.lease
-            .transact(async |tx| {
+            .transact("delete_tablet_documents", async |tx| {
                 Ok(tx
                     .exec_iter(
                         documents::delete_tablet_chunk(),
@@ -846,9 +827,7 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
         let min_queried_ts = ids.iter().map(|(_, ts)| *ts).min();
         let ids: Vec<_> = ids.into_iter().collect();
         let mut result = BTreeMap::new();
-        let mut remaining: &[(InternalDocumentId, Timestamp)] = &ids;
-        let mut fallback_chunk_size = None;
-        while !remaining.is_empty() {
+        for chunk in smart_chunks(&ids) {
             // Acquired per chunk so a long lookup does not pin a connection
             // across yield points.
             let mut connection = self
@@ -856,7 +835,6 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
                 .pool
                 .acquire("v6_previous_revision", &self.inner.db_name)
                 .await?;
-            let chunk = next_chunk(remaining, fallback_chunk_size);
             let mut params = Vec::with_capacity(chunk.len() * 5);
             for (id, query_ts) in chunk {
                 params.extend([
@@ -867,7 +845,7 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
                     Value::Int(i64::from(*query_ts)),
                 ]);
             }
-            let rows = match connection
+            let rows = connection
                 .query_collect(
                     &documents::previous_revision_chunk(chunk.len()),
                     params,
@@ -877,21 +855,11 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
                         anyhow::Ok((Timestamp::try_from(query_ts)?, row_to_document(&row)?))
                     },
                 )
-                .await
-            {
-                Ok(rows) => rows,
-                Err(ref error) if is_message_too_large_error(error).is_some() => {
-                    fallback_chunk_size =
-                        Some(smaller_chunk(fallback_chunk_size.unwrap_or(chunk.len()))?);
-                    continue;
-                },
-                Err(error) => return Err(error),
-            };
+                .await?;
             for (query_ts, entry) in rows {
                 metrics::log_prev_revisions_row_read(self.inner.pool.cluster_name());
                 result.insert((entry.id, query_ts), entry);
             }
-            remaining = &remaining[chunk.len()..];
         }
         // Validate the snapshots read at, not the revisions found: a previous
         // revision may legitimately predate the retention floor.
@@ -913,15 +881,12 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
         let min_queried_ts = ids.iter().map(|query| query.ts).min();
         let ids: Vec<_> = ids.into_iter().collect();
         let mut result = BTreeMap::new();
-        let mut remaining: &[DocumentPrevTsQuery] = &ids;
-        let mut fallback_chunk_size = None;
-        while !remaining.is_empty() {
+        for chunk in smart_chunks(&ids) {
             let mut connection = self
                 .inner
                 .pool
                 .acquire("v6_exact_revision", &self.inner.db_name)
                 .await?;
-            let chunk = next_chunk(remaining, fallback_chunk_size);
             let mut params = Vec::with_capacity(1 + chunk.len() * 3);
             params.push(self.inner.deployment_id.into());
             // Several queries can ask for the same revision at different
@@ -939,23 +904,14 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
                     .or_default()
                     .push(*query);
             }
-            let rows = match connection
+            let rows = connection
                 .query_collect(
                     &documents::exact_revision_chunk(chunk.len()),
                     params,
                     chunk.len(),
                     |row| row_to_document(&row),
                 )
-                .await
-            {
-                Ok(rows) => rows,
-                Err(ref error) if is_message_too_large_error(error).is_some() => {
-                    fallback_chunk_size =
-                        Some(smaller_chunk(fallback_chunk_size.unwrap_or(chunk.len()))?);
-                    continue;
-                },
-                Err(error) => return Err(error),
-            };
+                .await?;
             for entry in rows {
                 for query in queries_by_revision
                     .get(&(entry.id, entry.ts))
@@ -965,7 +921,6 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
                     result.insert(*query, entry.clone());
                 }
             }
-            remaining = &remaining[chunk.len()..];
         }
         // As in `previous_revisions`, validate the snapshots read at.
         if let Some(min_queried_ts) = min_queried_ts {
@@ -1123,27 +1078,33 @@ impl<RT: Runtime> Lease<RT> {
         })
     }
 
-    pub(crate) async fn transact<F, T>(&self, f: F) -> anyhow::Result<T>
+    /// `op` names the persistence operation on the commit metric.
+    pub(crate) async fn transact<F, T>(&self, op: &'static str, f: F) -> anyhow::Result<T>
     where
         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
     {
-        self.transact_with_isolation(None, f).await
+        self.transact_with_isolation(op, None, f).await
     }
 
     /// Like [`Self::transact`], but runs at READ COMMITTED instead of the
     /// InnoDB session default (REPEATABLE READ). Index retention deletes use
     /// this so their DELETEs take only record locks, sparing concurrent index
     /// writers the next-key/gap locks REPEATABLE READ adds.
-    pub(crate) async fn transact_read_committed<F, T>(&self, f: F) -> anyhow::Result<T>
+    pub(crate) async fn transact_read_committed<F, T>(
+        &self,
+        op: &'static str,
+        f: F,
+    ) -> anyhow::Result<T>
     where
         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
     {
-        self.transact_with_isolation(Some(IsolationLevel::ReadCommitted), f)
+        self.transact_with_isolation(op, Some(IsolationLevel::ReadCommitted), f)
             .await
     }
 
     async fn transact_with_isolation<F, T>(
         &self,
+        op: &'static str,
         isolation: Option<IsolationLevel>,
         f: F,
     ) -> anyhow::Result<T>
@@ -1168,7 +1129,7 @@ impl<RT: Runtime> Lease<RT> {
             }
             timer.finish();
             let value = f(&mut tx).await?;
-            let timer = metrics::commit_timer(self.pool.cluster_name());
+            let timer = metrics::commit_timer(self.pool.cluster_name(), op);
             tx.commit().await?;
             timer.finish();
             Ok(value)
@@ -1190,28 +1151,6 @@ fn deployment_id_from_options(
         "MySQL V6 is only supported by the multitenant V6 driver"
     );
     deployment_id.try_into()
-}
-
-/// The chunk size to retry with after a chunk exceeded the server's message
-/// limit, following the same two steps as the V5 driver.
-fn smaller_chunk(current: usize) -> anyhow::Result<usize> {
-    anyhow::ensure!(
-        current > 1,
-        "a single-row chunk exceeds the MySQL message limit"
-    );
-    let fallback = usize::try_from(*MYSQL_FALLBACK_PAGE_SIZE)?;
-    Ok(if current <= fallback { 1 } else { fallback })
-}
-
-/// The next chunk of a bulk lookup: `smart_chunks`' first chunk until a
-/// message-limit error imposed a fixed size.
-fn next_chunk<T: ApproxSize>(remaining: &[T], fallback_chunk_size: Option<usize>) -> &[T] {
-    match fallback_chunk_size {
-        Some(max) => &remaining[..remaining.len().min(max)],
-        None => smart_chunks(remaining)
-            .next()
-            .expect("smart_chunks yields a chunk for a non-empty slice"),
-    }
 }
 
 fn row_to_document(row: &Row) -> anyhow::Result<DocumentLogEntry> {
@@ -1237,12 +1176,12 @@ fn row_to_document(row: &Row) -> anyhow::Result<DocumentLogEntry> {
 }
 
 impl<RT: Runtime> crate::v6::backfill::BackfillLease for Lease<RT> {
-    async fn transact_read_committed<F, T>(&self, f: F) -> anyhow::Result<T>
+    async fn transact_read_committed<F, T>(&self, op: &'static str, f: F) -> anyhow::Result<T>
     where
         F: for<'a> AsyncFnOnce(
             &'a mut crate::connection::MySqlTransaction<'_>,
         ) -> anyhow::Result<T>,
     {
-        Lease::transact_read_committed(self, f).await
+        Lease::transact_read_committed(self, op, f).await
     }
 }

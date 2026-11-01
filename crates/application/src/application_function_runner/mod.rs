@@ -795,9 +795,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         }
         let mut tx = self.database.begin_system().await?;
         self.bail_if_backend_not_running(&mut tx).await?;
-        let ai_gateway_disabled = BackendInfoModel::new(&mut tx)
-            .get()
-            .await?
+        let backend_info = BackendInfoModel::new(&mut tx).get().await?;
+        let ai_gateway_disabled = backend_info
+            .as_ref()
             .and_then(|backend_info| backend_info.ai_gateway_disabled)
             .unwrap_or(false);
         if ai_gateway_disabled {
@@ -817,7 +817,19 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  provider directly with your own API key."
             ));
         };
-        minter.mint(&self.deployment, attribution, request_id).await
+        let team_id = backend_info.as_ref().map(|backend_info| backend_info.team);
+        let project_id = backend_info
+            .as_ref()
+            .map(|backend_info| backend_info.project);
+        minter
+            .mint(
+                &self.deployment,
+                team_id,
+                project_id,
+                attribution,
+                request_id,
+            )
+            .await
     }
 
     pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {

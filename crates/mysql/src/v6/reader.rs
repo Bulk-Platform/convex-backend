@@ -13,7 +13,6 @@ use common::{
     },
     interval::Interval,
     knobs::{
-        MYSQL_FALLBACK_PAGE_SIZE,
         MYSQL_MAX_QUERY_BATCH_SIZE,
         MYSQL_MAX_QUERY_DYNAMIC_BATCH_SIZE,
         MYSQL_MIN_QUERY_BATCH_SIZE,
@@ -49,10 +48,7 @@ use super::{
     PersistenceDeploymentId,
 };
 use crate::{
-    connection::{
-        is_message_too_large_error,
-        is_no_such_table_error,
-    },
+    connection::is_no_such_table_error,
     document_encoding,
     metrics,
     ConvexMySqlPool,
@@ -124,11 +120,9 @@ impl<'a, RT: Runtime> IndexReader<'a, RT> {
                 )
             })?;
             // The size hint makes the common case one query. Later pages grow to
-            // correct for tombstones, long prefixes and a wrong hint, unless a
-            // fallback pinned the size.
+            // correct for tombstones, long prefixes and a wrong hint.
             let mut page_size =
                 size_hint.clamp(*MYSQL_MIN_QUERY_BATCH_SIZE, *MYSQL_MAX_QUERY_BATCH_SIZE);
-            let mut fallback = false;
             let mut buffered_prefix = None;
             let mut buffered = Vec::new();
             let mut refreshed = false;
@@ -163,32 +157,6 @@ impl<'a, RT: Runtime> IndexReader<'a, RT> {
                         stats.sql_statements += 1;
                         self.published.refresh(&mut connection).await?;
                         refreshed = true;
-                        continue;
-                    },
-                    Err(ref error)
-                        if let Some(server_error) = is_message_too_large_error(error) =>
-                    {
-                        anyhow::ensure!(
-                            page_size > 1,
-                            "Failed to load index rows with minimum page size `1`: {}",
-                            server_error.message
-                        );
-                        let fallback_size = usize::try_from(*MYSQL_FALLBACK_PAGE_SIZE)?;
-                        if page_size <= fallback_size {
-                            tracing::warn!(
-                                "Falling back to page size `1` due to repeated server error: {}",
-                                server_error.message
-                            );
-                            page_size = 1;
-                        } else {
-                            tracing::warn!(
-                                "Falling back to page size `{fallback_size}` due to server error: \
-                                 {}",
-                                server_error.message
-                            );
-                            page_size = fallback_size;
-                        }
-                        fallback = true;
                         continue;
                     },
                     Err(error) => return Err(error),
@@ -325,7 +293,7 @@ impl<'a, RT: Runtime> IndexReader<'a, RT> {
                     Order::Asc => lower = Bound::Excluded(cursor),
                     Order::Desc => upper = Bound::Excluded(cursor),
                 }
-                if page_size < *MYSQL_MAX_QUERY_DYNAMIC_BATCH_SIZE && !fallback {
+                if page_size < *MYSQL_MAX_QUERY_DYNAMIC_BATCH_SIZE {
                     page_size = (page_size * 2).min(*MYSQL_MAX_QUERY_DYNAMIC_BATCH_SIZE);
                 }
             }

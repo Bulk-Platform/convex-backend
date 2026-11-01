@@ -4,18 +4,25 @@ import { Tooltip } from "@ui/Tooltip";
 import { Spinner } from "@ui/Spinner";
 import { formatBytes, formatNumberCompact } from "@common/lib/format";
 import { UsageSummaryRow } from "hooks/usageMetrics";
+import { useLaunchDarkly } from "hooks/useLaunchDarkly";
 import { formatQuantity } from "./lib/formatQuantity";
 import { ReactNode } from "react";
 import { TeamEntitlementsResponse } from "generatedApi";
+
 import {
   QuestionMarkCircledIcon,
   CrossCircledIcon,
   ChevronRightIcon,
+  ExclamationTriangleIcon,
 } from "@radix-ui/react-icons";
 import { cn } from "@ui/cn";
 import { useRouter } from "next/router";
 import { Donut } from "@ui/Donut";
 import { Loading } from "@ui/Loading";
+import { formatDistanceToNowStrict } from "date-fns";
+import type { UsagePricing } from "./lib/usagePrices";
+import { getUsageSpend, formatSpend } from "./lib/usageSpend";
+import type { UsageSpend } from "./lib/usageSpend";
 
 const BUSINESS_METRIC_TO_SECTION: Record<string, string> = {
   functionCalls: "functionCalls",
@@ -54,8 +61,11 @@ type BusinessMetricKey =
 
 type Section = {
   metric: BusinessMetricKey;
-  // TODO: Remove string fallback once teamMaxSearchQueries is in generated types
-  entitlement?: keyof TeamEntitlementsResponse | string;
+  entitlement?: {
+    [K in keyof TeamEntitlementsResponse]: TeamEntitlementsResponse[K] extends number
+      ? K
+      : never;
+  }[keyof TeamEntitlementsResponse];
   format: (value: number) => string;
   detail: string;
   title: string;
@@ -234,6 +244,8 @@ export function BusinessPlanSummary({
   entitlements,
   hasSubscription = false,
   showEntitlements = false,
+  pricing = { status: "unavailable", reason: "unsupported-period" },
+  spendApplicable = true,
 }: {
   summary?: UsageSummaryRow[];
   error?: any;
@@ -243,8 +255,19 @@ export function BusinessPlanSummary({
   entitlements?: TeamEntitlementsResponse;
   hasSubscription?: boolean;
   showEntitlements?: boolean;
+  pricing?: UsagePricing;
+  spendApplicable?: boolean;
 }) {
   const router = useRouter();
+  const { dashboardShowCashUsage } = useLaunchDarkly();
+  const showSpend = dashboardShowCashUsage && pricing.status !== "unavailable";
+  const gridColumns = hasSubscription
+    ? showSpend
+      ? "grid-cols-[4fr_3fr_2fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_2fr_auto]"
+      : "grid-cols-[4fr_3fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_auto]"
+    : showSpend
+      ? "grid-cols-[5fr_4fr_2fr_auto]"
+      : "grid-cols-[5fr_4fr_auto]";
   const activeSections = isBusinessPlan ? businessSections : selfServeSections;
 
   // Deployment counts live on the summary rows but are team-wide (the gauge has
@@ -316,9 +339,7 @@ export function BusinessPlanSummary({
         <div
           className={cn(
             "grid items-center gap-2 rounded-t border-b px-4 py-2 text-sm text-content-secondary",
-            hasSubscription
-              ? "grid-cols-[4fr_3fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_auto]"
-              : "grid-cols-[5fr_4fr_auto]",
+            gridColumns,
           )}
         >
           <div>Resource</div>
@@ -350,6 +371,18 @@ export function BusinessPlanSummary({
               </Tooltip>
             </div>
           )}
+          {showSpend && (
+            <span className="flex items-center gap-1">
+              Spend
+              {pricing.status === "ready" && (
+                <Tooltip
+                  tip={`Spend is only available for time ranges starting after the previous change to prices (${formatDistanceToNowStrict(pricing.period.start, { addSuffix: true })}).`}
+                >
+                  <QuestionMarkCircledIcon />
+                </Tooltip>
+              )}
+            </span>
+          )}
           <span className="invisible flex items-center gap-1 text-xs">
             <span className="hidden whitespace-nowrap sm:inline">
               View breakdown by day
@@ -380,9 +413,7 @@ export function BusinessPlanSummary({
               !aiCostFailed;
             const entitlement =
               section.entitlement && entitlements
-                ? ((entitlements as Record<string, unknown>)[
-                    section.entitlement
-                  ] as number | undefined)
+                ? entitlements[section.entitlement]
                 : undefined;
 
             const includedAmount = section.allOnDemand
@@ -402,6 +433,15 @@ export function BusinessPlanSummary({
                 ? includedAmount
                 : metric;
 
+            const spend =
+              showSpend && pricing.status === "ready" && spendApplicable
+                ? section.metric === "aiGatewayCost"
+                  ? aiCostFailed || aiGatewayCost === undefined
+                    ? undefined
+                    : { amount: aiGatewayCost, missingDimensions: [] }
+                  : getUsageSpend(summary, section.metric, pricing.period)
+                : undefined;
+
             return (
               <Button
                 key={index}
@@ -411,9 +451,7 @@ export function BusinessPlanSummary({
                 }}
                 className={cn(
                   "group grid min-h-10 items-center gap-2 rounded-sm px-4 py-2 text-left transition-colors hover:bg-background-primary focus-visible:bg-background-primary focus-visible:outline-2 focus-visible:outline-border-selected",
-                  hasSubscription
-                    ? "grid-cols-[4fr_3fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_auto]"
-                    : "grid-cols-[5fr_4fr_auto]",
+                  gridColumns,
                 )}
               >
                 <div className="flex items-center gap-2">
@@ -498,6 +536,29 @@ export function BusinessPlanSummary({
                     )}
                   </div>
                 )}
+                {showSpend && (
+                  <div className="animate-fadeInFromLoading tabular-nums">
+                    {!spendApplicable ||
+                    section.metric === "deploymentCount" ? (
+                      <span className="text-content-secondary">–</span>
+                    ) : pricing.status === "error" || aiCostFailed ? (
+                      <span className="text-content-secondary">
+                        Unavailable
+                      </span>
+                    ) : pricing.status === "loading" || aiCostPending ? (
+                      <Loading fullHeight={false} className="h-4 w-16" />
+                    ) : (
+                      <SpendValue
+                        spend={spend}
+                        sectionTitle={section.title}
+                        showUnavailableWarning={
+                          pricing.status === "ready" &&
+                          section.metric !== "aiGatewayCost"
+                        }
+                      />
+                    )}
+                  </div>
+                )}
                 <span className="flex items-center gap-1 text-xs text-content-secondary">
                   <span className="hidden whitespace-nowrap opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100 sm:inline">
                     View breakdown by day
@@ -510,6 +571,78 @@ export function BusinessPlanSummary({
         )}
       </div>
     </Sheet>
+  );
+}
+
+function SpendValue({
+  spend,
+  sectionTitle,
+  showUnavailableWarning,
+}: {
+  spend: UsageSpend | undefined;
+  sectionTitle: string;
+  showUnavailableWarning: boolean;
+}) {
+  return (
+    <span className="inline-flex items-center gap-1 whitespace-nowrap">
+      {spend === undefined || spend.missingDimensions.length > 0 ? (
+        <span className="text-content-secondary">–</span>
+      ) : (
+        formatSpend(spend.amount)
+      )}
+      {spend === undefined
+        ? showUnavailableWarning && <SpendWarning sectionTitle={sectionTitle} />
+        : spend.missingDimensions.length > 0 && (
+            <SpendWarning
+              sectionTitle={sectionTitle}
+              missingDimensions={spend.missingDimensions}
+            />
+          )}
+    </span>
+  );
+}
+
+function SpendWarning({
+  sectionTitle,
+  missingDimensions,
+}: {
+  sectionTitle: string;
+  missingDimensions?: string[];
+}) {
+  return (
+    <Tooltip
+      aria-label={
+        missingDimensions
+          ? "Incomplete billing information"
+          : "Missing billing information"
+      }
+      className="inline-flex shrink-0 items-center text-content-warning"
+      tip={
+        missingDimensions ? (
+          <div className="space-y-2 p-1 text-left">
+            <p>
+              Spend unavailable: billing information is missing for some
+              metrics, deployment classes, or regions.
+            </p>
+            <div>
+              <p className="mb-1 font-semibold">Missing billing information</p>
+              <ul className="list-none space-y-1 text-content-secondary">
+                {missingDimensions.map((dimension) => (
+                  <li key={dimension}>{dimension}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        ) : (
+          <p className="p-1 text-left">
+            Spend unavailable: {sectionTitle} spend cannot be calculated from
+            the available billing information.
+          </p>
+        )
+      }
+    >
+      <ExclamationTriangleIcon className="size-4" />
+    </Tooltip>
   );
 }
 

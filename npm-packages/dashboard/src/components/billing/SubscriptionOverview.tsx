@@ -36,6 +36,7 @@ import { Callout } from "@ui/Callout";
 import { formatUsd } from "@common/lib/utils";
 import { planNameMap } from "components/billing/planCards/PlanCard";
 import startCase from "lodash/startCase";
+import isEqual from "lodash/isEqual";
 import { BillingContactInputs } from "./BillingContactInputs";
 import { CreateSubscriptionSchema } from "./UpgradePlanContent";
 import { PaymentDetailsForm } from "./PaymentDetailsForm";
@@ -599,26 +600,53 @@ function BillingAddressForm({
     false,
   );
   const canUpdate = isTeamAdmin || canUpdateCustom;
+  const canUpdateContactCustom = useHasCustomRolePermission(
+    team.id,
+    "billing:contact:update",
+    BILLING_RESOURCE,
+    false,
+  );
+  const canUpdateContact = isTeamAdmin || canUpdateContactCustom;
 
   const updateBillingAddress = useUpdateBillingAddress(team.id);
-  const formState = useFormik<{ billingAddress?: Address }>({
+  const updateBillingContact = useUpdateBillingContact(team.id);
+  const formState = useFormik<{ billingAddress?: Address; name: string }>({
     initialValues: {
       billingAddress: subscription.billingAddress || undefined,
+      name: billingContact.name,
     },
     onSubmit: async (v) => {
-      if (v.billingAddress) {
-        await updateBillingAddress({ billingAddress: v.billingAddress });
-        await formState.setTouched({});
-        setShowForm(false);
+      if (!v.billingAddress) {
+        return;
       }
+      // The name field on the address form is the billing contact's name,
+      // which is stored on the customer rather than on the address.
+      if (v.name !== formState.initialValues.name) {
+        await updateBillingContact({
+          name: v.name,
+          email: billingContact.email,
+        });
+      }
+      if (!isEqual(v.billingAddress, formState.initialValues.billingAddress)) {
+        await updateBillingAddress({ billingAddress: v.billingAddress });
+      }
+      await formState.setTouched({});
+      setShowForm(false);
     },
     enableReinitialize: true,
   });
+  const nameChanged = formState.values.name !== formState.initialValues.name;
 
   const { setFieldValue } = formState;
   const setBillingAddress = useCallback(
     async (address?: Address) => {
       await setFieldValue("billingAddress", address);
+    },
+    [setFieldValue],
+  );
+  const setName = useCallback(
+    async (name: string) => {
+      await setFieldValue("name", name);
     },
     [setFieldValue],
   );
@@ -691,6 +719,7 @@ function BillingAddressForm({
               <Elements stripe={stripePromise} options={options}>
                 <BillingAddressInputs
                   onChangeAddress={setBillingAddress}
+                  onChangeName={setName}
                   existingBillingAddress={
                     subscription.billingAddress || undefined
                   }
@@ -729,14 +758,21 @@ function BillingAddressForm({
               disabled={
                 !formState.dirty ||
                 !formState.values.billingAddress ||
-                canUpdate !== true
+                canUpdate !== true ||
+                (nameChanged && canUpdateContact !== true)
               }
               tip={
-                canUpdate === false &&
-                permissionDeniedTip(
-                  "You do not have permission to update the billing address.",
-                  "billing:address:update",
-                )
+                canUpdate === false
+                  ? permissionDeniedTip(
+                      "You do not have permission to update the billing address.",
+                      "billing:address:update",
+                    )
+                  : nameChanged &&
+                    canUpdateContact === false &&
+                    permissionDeniedTip(
+                      "You do not have permission to update the billing contact name.",
+                      "billing:contact:update",
+                    )
               }
               loading={formState.isSubmitting}
             >
@@ -847,14 +883,18 @@ function UpdatePaymentMethod({
     },
     [onSave, updatePaymentMethod],
   );
-  const { stripePromise, options, retrieveSetupIntent, confirmSetup } =
-    useStripePaymentSetup(team, undefined, updatePaymentMethodCb);
+  const { stripePromise, options, confirmSetup } = useStripePaymentSetup(
+    team,
+    undefined,
+    updatePaymentMethodCb,
+  );
+  const { preAuthorizePaymentMethodChange } = useLaunchDarkly();
 
   return options.clientSecret ? (
     <Elements stripe={stripePromise} options={options}>
       <PaymentDetailsForm
-        retrieveSetupIntent={retrieveSetupIntent}
         confirmSetup={confirmSetup}
+        showCardHoldNote={preAuthorizePaymentMethodChange}
       />
     </Elements>
   ) : null;

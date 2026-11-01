@@ -1213,22 +1213,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/teams/{team_slug}/usage/get_token_info": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_token_info"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/teams/{team_id}/oauth_apps": {
         parameters: {
             query?: never;
@@ -2300,10 +2284,6 @@ export interface components {
         };
         GetPricesPlanResponse: {
             planType: string;
-            /** Format: int64 */
-            planVersion: number;
-            /** Format: int64 */
-            activePhase?: number | null;
         };
         GetPricesResponse: {
             currency: string;
@@ -2329,19 +2309,6 @@ export interface components {
             /** Format: int64 */
             warningThresholdCents?: number | null;
             state?: null | components["schemas"]["SpendingLimitsState"];
-        };
-        GetTokenInfoResponse: {
-            /** Format: int64 */
-            tokensUsed: number;
-            /** Format: int64 */
-            tokensQuota: number;
-            /** Format: int64 */
-            centitokensUsed: number;
-            /** Format: int64 */
-            centitokensQuota: number;
-            isTeamDisabled: boolean;
-            isPaidPlan: boolean;
-            planType: string;
         };
         GroupRoleMappingResponse: {
             role: components["schemas"]["Role"];
@@ -2688,6 +2655,9 @@ export interface components {
             createTime: number;
             prodDeploymentName?: string | null;
             devDeploymentName?: string | null;
+            prodDeploymentReference?: string | null;
+            devDeploymentReference?: string | null;
+            tags?: string[] | null;
         };
         /** @description Summary of a project WorkOS environment for list responses - slimmer than
          *     full environment details, uses workos_ prefix for consistency with
@@ -2791,8 +2761,8 @@ export interface components {
             effect: components["schemas"]["RoleStatementEffect"];
             actions: components["schemas"]["RoleStatementActions"];
             /**
-             * @description Resource path like `project:*`, `project:slug=my-app`, or
-             *     `project:*:deployment:type=prod`.
+             * @description Resource path like `project:*`, `project:slug=my-app`,
+             *     `project:tag=prod`, or `project:*:deployment:type=prod`.
              * @example project:*
              */
             resource: string;
@@ -2801,7 +2771,7 @@ export interface components {
          * @description An action that can be allowed or denied by a custom role statement.
          * @enum {string}
          */
-        RoleStatementAction: "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "project:view" | "project:updateMemberRole" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "defaultEnvironmentVariable:view" | "deployment:create" | "deployment:transfer" | "deployment:receive" | "deployment:updateReference" | "deployment:updateDashboardEditConfirmation" | "deployment:updateExpiresAt" | "deployment:updateSendLogsToClient" | "deployment:updateClass" | "deployment:updateIsDefault" | "deployment:updateType" | "deployment:delete" | "deployment:view" | "deployment:integrations:view" | "deployment:integrations:write" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:customDomain:view" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "member:view" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:changePlan" | "billing:spendingLimit:update" | "billing:view" | "billing:invoices:view" | "team:auditLog:view" | "team:domain:create" | "team:domain:delete" | "team:domain:view" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:view" | "oauthApplication:generateClientSecret" | "team:usage:view" | "deployment:insights:view" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "deployment:backups:view" | "sso:enable" | "sso:disable" | "sso:update" | "sso:view" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "directorySync:view" | "customRole:view" | "integration:view" | "integration:create" | "integration:update" | "integration:delete" | "deployment:deploy" | "deployment:env:view" | "deployment:env:write" | "deployment:pause" | "deployment:unpause" | "deployment:logs:view" | "deployment:metrics:view" | "deployment:data:view" | "deployment:data:write" | "deployment:backups:download" | "deployment:functions:actAsUser" | "deployment:functions:runInternalQueries" | "deployment:functions:runInternalMutations" | "deployment:functions:runInternalActions" | "deployment:functions:runTestQuery" | "deployment:auditLog:view" | "deployment:usageLimits:view" | "deployment:usageLimits:write" | "deployment:usage:view" | "deployment:aiGateway:use";
+        RoleStatementAction: "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "project:view" | "project:updateMemberRole" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "defaultEnvironmentVariable:view" | "deployment:create" | "deployment:transfer" | "deployment:receive" | "deployment:updateReference" | "deployment:updateDashboardEditConfirmation" | "deployment:updateExpiresAt" | "deployment:updateSendLogsToClient" | "deployment:updateClass" | "deployment:updateIsDefault" | "deployment:updateType" | "deployment:delete" | "deployment:view" | "deployment:integrations:view" | "deployment:integrations:write" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:customDomain:view" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "member:view" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:changePlan" | "billing:spendingLimit:update" | "billing:view" | "billing:invoices:view" | "team:auditLog:view" | "team:domain:create" | "team:domain:delete" | "team:domain:view" | "team:projectTags:view" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:view" | "oauthApplication:generateClientSecret" | "team:usage:view" | "deployment:insights:view" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "deployment:backups:view" | "sso:enable" | "sso:disable" | "sso:update" | "sso:view" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "directorySync:view" | "customRole:view" | "integration:view" | "integration:create" | "integration:update" | "integration:delete" | "deployment:deploy" | "deployment:env:view" | "deployment:env:write" | "deployment:pause" | "deployment:unpause" | "deployment:logs:view" | "deployment:metrics:view" | "deployment:data:view" | "deployment:data:write" | "deployment:backups:download" | "deployment:functions:actAsUser" | "deployment:functions:runInternalQueries" | "deployment:functions:runInternalMutations" | "deployment:functions:runInternalActions" | "deployment:functions:runTestQuery" | "deployment:auditLog:view" | "deployment:usageLimits:view" | "deployment:usageLimits:write" | "deployment:usage:view" | "deployment:aiGateway:use";
         RoleStatementActions: components["schemas"]["RoleStatementWildcardAction"] | components["schemas"]["RoleStatementAction"][];
         /**
          * @description Whether a rule grants or revokes access.
@@ -3148,7 +3118,6 @@ export type GetPricesResponse = components['schemas']['GetPricesResponse'];
 export type GetProjectEnvironmentResponse = components['schemas']['GetProjectEnvironmentResponse'];
 export type GetProjectEnvironmentsResponse = components['schemas']['GetProjectEnvironmentsResponse'];
 export type GetSpendingLimitsResponse = components['schemas']['GetSpendingLimitsResponse'];
-export type GetTokenInfoResponse = components['schemas']['GetTokenInfoResponse'];
 export type GroupRoleMappingResponse = components['schemas']['GroupRoleMappingResponse'];
 export type HasAssociatedWorkOsTeamResponse = components['schemas']['HasAssociatedWorkOSTeamResponse'];
 export type HasFailedPaymentResponse = components['schemas']['HasFailedPaymentResponse'];
@@ -3768,6 +3737,8 @@ export interface operations {
                 limit?: number;
                 /** @description Search query to filter projects by name or slug (case-insensitive) */
                 q?: string;
+                /** @description Only return projects with this tag. This parameter can be provided more than once to match projects with any of several tags */
+                tag?: string[];
             };
             header?: never;
             path: {
@@ -4612,7 +4583,12 @@ export interface operations {
     };
     get_prices: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Inclusive lower bound in YYYY-MM-DD format, using UTC. */
+                from?: string | null;
+                /** @description Inclusive upper bound in YYYY-MM-DD format, using UTC. */
+                to?: string | null;
+            };
             header?: never;
             path: {
                 /** @description Team ID */
@@ -4941,30 +4917,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TeamCurrentBillingPeriodResponse"];
-                };
-            };
-        };
-    };
-    get_token_info: {
-        parameters: {
-            query?: {
-                from?: string;
-                to?: string;
-            };
-            header?: never;
-            path: {
-                team_slug: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GetTokenInfoResponse"];
                 };
             };
         };

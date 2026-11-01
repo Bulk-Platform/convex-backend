@@ -21,7 +21,7 @@ use crate::{
 /// Transactions must fence the current writer lease and use READ COMMITTED
 /// so reconciliation can delete stale rows without gap-locking index inserts.
 pub(crate) trait BackfillLease: Sync {
-    async fn transact_read_committed<F, T>(&self, f: F) -> anyhow::Result<T>
+    async fn transact_read_committed<F, T>(&self, op: &'static str, f: F) -> anyhow::Result<T>
     where
         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>;
 }
@@ -54,7 +54,7 @@ impl<RT: Runtime, L: BackfillLease> Backfill<'_, RT, L> {
                     .await?
             };
             self.lease
-                .transact_read_committed(async |tx| {
+                .transact_read_committed("reconcile_index_backfill", async |tx| {
                     self.engine.delete_stale(tx, &page, cluster_name).await
                 })
                 .await?;
@@ -90,7 +90,7 @@ impl<RT: Runtime, L: BackfillLease> Backfill<'_, RT, L> {
     pub(crate) async fn delete_chunk(&self, index: PersistenceIndexId) -> anyhow::Result<u64> {
         let chunk_size = u64::try_from(*INDEX_RETENTION_DELETE_CHUNK)?;
         self.lease
-            .transact_read_committed(async |tx| {
+            .transact_read_committed("delete_index_backfill_markers", async |tx| {
                 tx.exec_iter(
                     sql::DELETE_BACKFILL_MARKERS_CHUNK,
                     vec![

@@ -433,12 +433,13 @@ pub fn lease_precond_timer(cluster_name: &str) -> StatusTimer {
 
 register_convex_histogram!(
     MYSQL_COMMIT_SECONDS,
-    "Time to commit a transaction",
-    &[STATUS_LABEL[0], "cluster_name"]
+    "Time to commit a transaction, by the persistence operation that ran it",
+    &[STATUS_LABEL[0], "cluster_name", "op"]
 );
-pub fn commit_timer(cluster_name: &str) -> StatusTimer {
+pub fn commit_timer(cluster_name: &str, op: &'static str) -> StatusTimer {
     let mut timer = StatusTimer::new(&MYSQL_COMMIT_SECONDS);
     timer.add_label(cluster_name_label(cluster_name));
+    timer.add_label(StaticMetricLabel::new("op", op));
     timer
 }
 
@@ -678,6 +679,37 @@ register_convex_counter!(
      transitions; see the created counter.",
     &["cluster_name"]
 );
+
+register_convex_counter!(
+    INDEXES_LOG_MAINTENANCE_ROUNDS_TOTAL,
+    "V6 index log maintenance rounds by outcome. The gauges above only move on `ok`, so a run of \
+     `failed` is the earliest sign that lookahead will start shrinking.",
+    &["cluster_name", "outcome"]
+);
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr, strum::EnumIter)]
+#[strum(serialize_all = "snake_case")]
+pub enum MaintenanceRoundOutcome {
+    Ok,
+    /// Includes losing the lease between taking it and publishing.
+    Failed,
+    /// Another conductor holds the lease; the steady state for every
+    /// conductor on the cluster but one.
+    LeaseHeldElsewhere,
+}
+pub fn log_indexes_log_maintenance_round(cluster_name: &str, outcome: MaintenanceRoundOutcome) {
+    INDEXES_LOG_MAINTENANCE_ROUNDS_TOTAL
+        .with_label_values(&[cluster_name, outcome.into()])
+        .inc();
+}
+/// Publishes zeroes so the first failed round has a baseline to increase from.
+pub fn initialize_indexes_log_maintenance_rounds(cluster_name: &str) {
+    use strum::IntoEnumIterator as _;
+    for outcome in MaintenanceRoundOutcome::iter() {
+        INDEXES_LOG_MAINTENANCE_ROUNDS_TOTAL
+            .with_label_values(&[cluster_name, outcome.into()])
+            .inc_by(0);
+    }
+}
 
 pub fn log_indexes_log_bucket_created(cluster_name: &str) {
     log_counter_with_labels(
